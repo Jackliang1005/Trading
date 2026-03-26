@@ -1,0 +1,150 @@
+{
+  "feishu": {
+    "enabled": true,
+    "target": "ou_f7d5ef82efd4396dea7a604691c56f75"
+  },
+  "monitor": {
+    "poll_seconds": 60,
+    "cooldown_minutes": 20,
+    "only_trade_hours": true,
+    "t_signal_enabled": true,
+    "t_signal_cooldown_minutes": 30,
+    "t_signal_max_per_day": 4,
+    "dynamic_range_threshold_pct": 8
+  },
+  "stocks": [
+    {
+      "enabled": true,
+      "code": "300475",
+      "name": "香农芯创",
+      "cost_price": 170.582,
+      "base_position": 100,
+      "per_trade_shares": 100,
+      "buy_range": [154.0, 156.2],
+      "sell_range": [158.2, 161.5],
+      "stop_loss": 152.5,
+      "strategy": "顺T优先",
+      "note": "当前离成本较近，优先作为修复账户的主做T票。"
+    },
+    {
+      "enabled": true,
+      "code": "688316",
+      "name": "青云科技-U",
+      "cost_price": 104.888,
+      "base_position": 681,
+      "per_trade_shares": 100,
+      "buy_range": [76.0, 77.2],
+      "sell_range": [78.4, 80.2],
+      "stop_loss": 74.8,
+      "strategy": "轻仓逆T",
+      "allow_rebound_watch_after_stop": true,
+      "rebound_buy_above": 75.2,
+      "note": "波动较大，适合轻仓分段做T，不要连续加仓。"
+    },
+    {
+      "enabled": true,
+      "code": "688327",
+      "name": "云从科技-U",
+      "cost_price": 19.93,
+      "base_position": 3901,
+      "per_trade_shares": 300,
+      "buy_range": [13.4, 13.8],
+      "sell_range": [14.2, 14.8],
+      "stop_loss": 13.1,
+      "strategy": "箱体震荡",
+      "note": "持仓较大，只在箱体边缘做，避免中间位置频繁来回。"
+    },
+    {
+      "enabled": true,
+      "code": "300063",
+      "name": "天龙集团",
+      "cost_price": 16.703,
+      "base_position": 2700,
+      "per_trade_shares": 500,
+      "buy_range": [11.1, 11.4],
+      "sell_range": [11.7, 12.1],
+      "stop_loss": 10.95,
+      "strategy": "箱体震荡",
+      "note": "持仓大、价格低，适合固定股数做日内差价。"
+    },
+    {
+      "enabled": false,
+      "code": "002617",
+      "name": "露笑科技",
+      "cost_price": 22.013,
+      "base_position": 1600,
+      "per_trade_shares": 300,
+      "buy_range": [7.55, 7.8],
+      "sell_range": [8.0, 8.3],
+      "stop_loss": 7.35,
+      "strategy": "观察",
+      "note": "暂不启用，等出现更明确箱体后再纳入。"
+    },
+    {
+      "enabled": true,
+      "code": "000815",
+      "name": "美利云",
+      "cost_price": 69.219,
+      "base_position": 700,
+      "per_trade_shares": 100,
+      "buy_range": [18.3, 18.8],
+      "sell_range": [19.2, 19.8],
+      "stop_loss": 18.0,
+      "strategy": "趋势观察",
+      "watch_mode": "light",
+      "note": "已纳入轻观察模式：保留卖出观察和风险提醒，默认不做逆T低吸，先跟踪趋势延续和流动性。"
+    },
+    {
+      "enabled": false,
+      "code": "300339",
+      "name": "润和软件",
+      "cost_price": 147.261,
+      "base_position": 100,
+      "per_trade_shares": 100,
+      "buy_range": [40.0, 41.2],
+      "sell_range": [42.2, 43.5],
+      "stop_loss": 39.2,
+      "strategy": "观察",
+      "note": "只有100股，提醒意义有限，除非你准备额外腾挪做T仓。"
+    },
+    {
+      "enabled": false,
+      "code": "300822",
+      "name": "贝仕达克",
+      "cost_price": 158.39,
+      "base_position": 100,
+      "per_trade_shares": 100,
+      "buy_range": [14.1, 14.6],
+      "sell_range": [15.0, 15.6],
+      "stop_loss": 13.8,
+      "strategy": "观察",
+      "note": "持仓过小，优先级不高。"
+    },
+    {
+      "enabled": false,
+      "code": "002466",
+      "name": "天齐锂业",
+      "cost_price": 438.903,
+      "base_position": 100,
+      "per_trade_shares": 100,
+      "buy_range": [48.5, 49.8],
+      "sell_range": [50.8, 52.5],
+      "stop_loss": 47.8,
+      "strategy": "观察",
+      "note": "只有100股，做T空间不大，先不纳入默认监控。"
+    },
+    {
+      "enabled": false,
+      "code": "605111",
+      "name": "新洁能",
+      "cost_price": 362.801,
+      "base_position": 100,
+      "per_trade_shares": 100,
+      "buy_range": [40.2, 41.3],
+      "sell_range": [42.0, 43.4],
+      "stop_loss": 39.5,
+      "strategy": "观察",
+      "note": "持仓较小，优先级次于主修复票。"
+    }
+  ]
+}
