@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+trading_core/__pycache__/
+
+*.log
+*.pid
+
+trading_data/monitor_state.json
+trading_data/portfolio_state.json
+trading_data/command_book.json
+trading_data/decision_journal_*.json
+trading_data/trades_*.json
+trading_data/trades_*.csv
+
+.DS_Store
