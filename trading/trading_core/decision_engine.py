@@ -1,0 +1,139 @@
+from typing import Dict, Tuple
+
+from .analysis import detect_panic_rebound
+from .models import (
+    DecisionResult,
+    IntradayAnalysis,
+    LearningProfile,
+    MarketRegimeReport,
+    Playbook,
+    StockRule,
+)
+from .risk_engine import evaluate_risk
+
+
+def _calc_level(score: int) -> str:
+    if score >= 80:
+        return "S"
+    if score >= 65:
+        return "A"
+    if score >= 45:
+        return "B"
+    return "C"
+
+
+def _derive_action(rule: StockRule, playbook: Playbook, analysis: IntradayAnalysis, quote: Dict, market_regime: MarketRegimeReport) -> Tuple[str, str]:
+    price = float(quote.get("price", 0) or 0)
+    near_buy = analysis.t_buy_target > 0 and price <= analysis.t_buy_target * 1.01
+    near_sell = analysis.t_sell_target > 0 and price >= analysis.t_sell_target * 0.99
+    if playbook.name == "trend_sell_rebuy":
+        if near_sell:
+            return "sell", "顺T先卖后买"
+        if near_buy:
+            return "buy", "回落到支撑尝试接回"
+        return "wait", "未到顺T关键位"
+    if playbook.name in ("panic_reverse_t", "reverse_t"):
+        if detect_panic_rebound(rule, quote, type("obj", (), {"regime": market_regime.regime})()):
+            return "buy", "弱市恐慌反抽逆T"
+        if near_buy and market_regime.allow_reverse_t:
+            return "buy", "逆T低吸窗口"
+        if near_sell:
+            return "sell", "逆T反抽到目标位"
+        return "wait", "逆T条件不充分"
+    if playbook.name == "box_range_t":
+        if near_buy:
+            return "buy", "箱体下沿低吸"
+        if near_sell:
+            return "sell", "箱体上沿减仓"
+        return "wait", "仍在箱体中部"
+    if near_sell:
+        return "sell", "观察票只允许减仓"
+    return "wait", "观察票不主动开仓"
+
+
+def make_decision(
+    rule: StockRule,
+    playbook: Playbook,
+    analysis: IntradayAnalysis,
+    quote: Dict,
+    market_regime: MarketRegimeReport,
+    learning: LearningProfile,
+    portfolio_state: Dict,
+    state: Dict,
+) -> DecisionResult:
+    action, action_reason = _derive_action(rule, playbook, analysis, quote, market_regime)
+    score = 30
+    reasons = [action_reason]
+    if analysis.confidence == "高":
+        score += 25
+        reasons.append("分时共振强")
+    elif analysis.confidence == "中":
+        score += 15
+        reasons.append("分时共振中等")
+    if analysis.t_spread_pct >= 2.0:
+        score += 20
+        reasons.append(f"价差{analysis.t_spread_pct:.1f}%")
+    elif analysis.t_spread_pct >= 1.2:
+        score += 10
+        reasons.append(f"价差{analysis.t_spread_pct:.1f}%")
+    if market_regime.regime == "strong" and action == "sell":
+        score -= 8
+        reasons.append("强市减少卖出冲动")
+    if market_regime.regime in ("weak", "panic") and action == "buy":
+        score -= 5
+        reasons.append("弱市买入需更谨慎")
+    if learning.bias == "aggressive":
+        score += 8
+        reasons.append("近端实盘反馈正向")
+    elif learning.bias == "defensive":
+        score -= 10
+        reasons.append("近端实盘反馈偏弱")
+    score = max(0, min(score, 100))
+    risk = evaluate_risk(rule, playbook, market_regime, portfolio_state, state, action, score)
+    execution_price = float(quote.get("price", 0) or 0)
+    trigger_price = analysis.t_buy_target if action == "buy" else (analysis.t_sell_target if action == "sell" else 0.0)
+    target_price = analysis.t_sell_target if action == "buy" else (analysis.t_buy_target if action == "sell" else 0.0)
+    stop_price = rule.stop_loss if action == "buy" else max(analysis.t_sell_target * 1.01, execution_price * 1.01) if action == "sell" and analysis.t_sell_target > 0 else 0.0
+    hold_minutes = 90 if action == "buy" else 60 if action == "sell" else 0
+    level = _calc_level(score)
+    if not risk.allowed:
+        action = "wait"
+    return DecisionResult(
+        action=action,
+        score=score,
+        level=level,
+        reason=" / ".join(reasons + ([risk.reason] if risk.reason else [])),
+        playbook_name=playbook.name,
+        trigger_price=round(trigger_price, 2) if trigger_price else 0.0,
+        execution_price=round(execution_price, 2) if execution_price else 0.0,
+        target_price=round(target_price, 2) if target_price else 0.0,
+        stop_price=round(stop_price, 2) if stop_price else 0.0,
+        hold_minutes=hold_minutes,
+        allow_auto_trade=risk.allow_auto_trade and risk.allowed,
+        risk_flags=risk.risk_flags,
+    )
+
+
+def format_decision_message(rule: StockRule, decision: DecisionResult, market_regime: MarketRegimeReport, learning: LearningProfile) -> str:
+    action_text = {"buy": "T买", "sell": "T卖", "wait": "观望"}.get(decision.action, decision.action)
+    trigger_line = f"{decision.trigger_price:.2f}" if decision.trigger_price else "-"
+    target_line = f"{decision.target_price:.2f}" if decision.target_price else "-"
+    stop_line = f"{decision.stop_price:.2f}" if decision.stop_price else "-"
+    risk_line = ",".join(decision.risk_flags) if decision.risk_flags else "none"
+    return (
+        f"📌 体系化做T决策\n"
+        f"股票：{rule.name} ({rule.code})\n"
+        f"Playbook：{decision.playbook_name}\n"
+        f"市场状态：{market_regime.regime} / 风险{market_regime.risk_level}\n"
+        f"建议动作：{action_text} {rule.per_trade_shares if decision.action in ('buy', 'sell') else 0}股\n"
+        f"触发价：{trigger_line}\n"
+        f"当前执行价：{decision.execution_price:.2f}\n"
+        f"目标价：{target_line}\n"
+        f"失效价：{stop_line}\n"
+        f"评分：{decision.score}/100 ({decision.level})\n"
+        f"原因：{decision.reason}\n"
+        f"预计持有：{decision.hold_minutes}分钟\n"
+        f"自动交易：{'是' if decision.allow_auto_trade else '否'}\n"
+        f"学习：样本{learning.sample_count} 胜率{learning.win_rate:.0%} 均值{learning.avg_profit:.2f}\n"
+        f"风险标记：{risk_line}"
+    )

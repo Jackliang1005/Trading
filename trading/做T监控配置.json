@@ -3,6 +3,16 @@
     "enabled": true,
     "target": "ou_f7d5ef82efd4396dea7a604691c56f75"
   },
+  "qmt2http": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:8085",
+    "api_token": "998811",
+    "timeout": 20,
+    "account_id": "2035032946",
+    "account_type": "STOCK",
+    "code_format": "plain",
+    "auto_trade_enabled": true
+  },
   "monitor": {
     "poll_seconds": 60,
     "cooldown_minutes": 20,
@@ -24,10 +34,12 @@
       "sell_range": [158.2, 161.5],
       "stop_loss": 152.5,
       "strategy": "顺T优先",
+      "allow_market_panic_reverse_t": true,
+      "panic_rebound_pct": 0.9,
       "note": "当前离成本较近，优先作为修复账户的主做T票。"
     },
     {
-      "enabled": true,
+      "enabled": false,
       "code": "688316",
       "name": "青云科技-U",
       "cost_price": 104.888,
@@ -42,7 +54,7 @@
       "note": "波动较大，适合轻仓分段做T，不要连续加仓。"
     },
     {
-      "enabled": true,
+      "enabled": false,
       "code": "688327",
       "name": "云从科技-U",
       "cost_price": 19.93,
@@ -55,7 +67,7 @@
       "note": "持仓较大，只在箱体边缘做，避免中间位置频繁来回。"
     },
     {
-      "enabled": true,
+      "enabled": false,
       "code": "300063",
       "name": "天龙集团",
       "cost_price": 16.703,
@@ -81,7 +93,7 @@
       "note": "暂不启用，等出现更明确箱体后再纳入。"
     },
     {
-      "enabled": true,
+      "enabled": false,
       "code": "000815",
       "name": "美利云",
       "cost_price": 69.219,

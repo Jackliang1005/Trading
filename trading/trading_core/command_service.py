@@ -1,0 +1,445 @@
+import re
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+from .execution import TradingExecutionBook
+from .notifier import send_feishu
+from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG
+from .qmt2http_client import Qmt2HttpClient
+from .recorder import TradingRecorder
+from .review_engine import ReviewEngine
+from .storage import atomic_write_json, load_json
+
+
+DEFAULT_TARGET = "ou_f7d5ef82efd4396dea7a604691c56f75"
+
+
+class TradingCommandService:
+    def __init__(self, base_dir: Path = BASE_DIR):
+        self.base_dir = Path(base_dir)
+        self.config_path = self.base_dir / DEFAULT_CONFIG.name
+        self.daily_plan_path = self.base_dir / DAILY_PLAN_PATH.name
+
+    def load_base_config(self) -> Dict:
+        return load_json(self.config_path, {"stocks": []})
+
+    def load_daily_plan(self) -> Dict:
+        today = datetime.now().strftime("%Y-%m-%d")
+        data = load_json(self.daily_plan_path, {"date": today, "updated_at": "", "source": "feishu-webhook", "stocks": []})
+        if data.get("date") != today:
+            return {"date": today, "updated_at": "", "source": "feishu-webhook", "stocks": []}
+        return data
+
+    def save_daily_plan(self, plan: Dict) -> None:
+        plan["date"] = datetime.now().strftime("%Y-%m-%d")
+        plan["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        atomic_write_json(self.daily_plan_path, plan)
+
+    def get_stock_map(self) -> Dict[str, Dict]:
+        return {str(item["code"]): deepcopy(item) for item in self.load_base_config().get("stocks", [])}
+
+    def get_recorder(self):
+        return TradingRecorder(base_dir=self.base_dir)
+
+    def get_execution_book(self):
+        return TradingExecutionBook(base_dir=self.base_dir)
+
+    def get_review_engine(self):
+        return ReviewEngine(base_dir=self.base_dir)
+
+    def get_qmt2http_config(self) -> Dict:
+        config = self.load_base_config()
+        return config.get("qmt2http", {}) if isinstance(config, dict) else {}
+
+    def get_qmt2http_client(self) -> Qmt2HttpClient:
+        config = self.get_qmt2http_config()
+        if config and not bool(config.get("enabled", True)):
+            raise RuntimeError("qmt2http 交易通道已关闭，请在配置里打开 qmt2http.enabled")
+        return Qmt2HttpClient(config)
+
+    def apply_today_overrides(self, stock: Dict, plan: Dict) -> Dict:
+        result = deepcopy(stock)
+        override = {str(item["code"]): item for item in plan.get("stocks", [])}.get(str(stock["code"]))
+        if override:
+            result.update(override)
+        return result
+
+    def find_or_create_override(self, plan: Dict, stock_code: str, base_stock: Dict) -> Dict:
+        for item in plan["stocks"]:
+            if str(item["code"]) == stock_code:
+                return item
+        item = {"code": stock_code, "name": base_stock.get("name", stock_code)}
+        plan["stocks"].append(item)
+        return item
+
+    @staticmethod
+    def parse_range(text: str, label: str) -> Optional[Tuple[float, float]]:
+        match = re.search(rf"{label}\s*([0-9]+(?:\.[0-9]+)?)\s*[-~到]\s*([0-9]+(?:\.[0-9]+)?)", text)
+        return (float(match.group(1)), float(match.group(2))) if match else None
+
+    @staticmethod
+    def parse_float_field(text: str, label: str) -> Optional[float]:
+        match = re.search(rf"{label}\s*([0-9]+(?:\.[0-9]+)?)", text)
+        return float(match.group(1)) if match else None
+
+    @staticmethod
+    def parse_int_field(text: str, label: str) -> Optional[int]:
+        match = re.search(rf"{label}\s*([0-9]+)", text)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def parse_mode_price(text: str) -> Optional[float]:
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+        return float(match.group(1)) if match else None
+
+    @staticmethod
+    def clear_risk_overrides(override: Dict) -> None:
+        for key in ("preopen_risk_mode", "avoid_reverse_t", "abandon_buy_below", "risk_notes"):
+            override.pop(key, None)
+
+    @staticmethod
+    def format_risk_status(stock: Dict) -> str:
+        return (
+            f" 模式{stock.get('preopen_risk_mode', 'normal') or 'normal'}"
+            f" 禁逆T{'是' if stock.get('avoid_reverse_t') else '否'}"
+            f" 放弃低吸<={stock.get('abandon_buy_below', '-')}"
+        )
+
+    @staticmethod
+    def format_execution_summary(summary: Dict) -> str:
+        lines = [
+            f"执行回执 {summary['date']}",
+            f"总记录{summary.get('total_trades', 0)} 笔",
+            f"买入{summary.get('buy_count', 0)}",
+            f"卖出{summary.get('sell_count', 0)}",
+            f"放弃{summary.get('skip_count', 0)}",
+            f"已实现盈亏{summary.get('total_profit', 0):.2f}元",
+        ]
+        for code, stats in summary.get("stock_stats", {}).items():
+            lines.append(f"{code} {stats.get('name', '')} 记录{stats.get('trades', 0)} 卖出盈亏{stats.get('profit', 0):.2f}元")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_stock_status(stock: Dict) -> str:
+        buy_range = stock.get("buy_range", ["-", "-"])
+        sell_range = stock.get("sell_range", ["-", "-"])
+        return (
+            f"{stock['code']} {stock.get('name', '')} "
+            f"[{'开' if stock.get('enabled', False) else '关'}] "
+            f"买{buy_range[0]}-{buy_range[1]} 卖{sell_range[0]}-{sell_range[1]} "
+            f"止损{stock.get('stop_loss', '-')} 数量{stock.get('per_trade_shares', '-')}"
+            f"{TradingCommandService.format_risk_status(stock)}"
+        )
+
+    @staticmethod
+    def format_decision_review(summary: Dict) -> str:
+        lines = [
+            f"决策日报 {summary.get('date', '')}",
+            f"总决策{summary.get('decision_count', 0)}",
+            f"自动候选{summary.get('auto_trade_candidates', 0)}",
+        ]
+        action_counts = summary.get("action_counts", {})
+        lines.append(
+            f"买入{action_counts.get('buy', 0)} 卖出{action_counts.get('sell', 0)} 观望{action_counts.get('wait', 0)}"
+        )
+        for name, count in summary.get("playbook_counts", {}).items():
+            lines.append(f"{name} {count}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_portfolio_status(state: Dict) -> str:
+        lines = [f"当日仓位状态 {state['date']}"]
+        for code in sorted(state.get("stocks", {})):
+            item = state["stocks"][code]
+            lines.append(
+                f"{code} {item.get('name', '')} "
+                f"底仓{item.get('carry_position', 0)} 当前{item.get('current_position', 0)} "
+                f"今卖{item.get('intraday_sell', 0)} 今买{item.get('intraday_buy', 0)} "
+                f"可卖{item.get('available_to_sell', 0)} 可回补{item.get('available_to_buy_back', 0)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_command_brief(command: Dict) -> str:
+        return (
+            f"{command['id']} {command.get('stock_code', '')} {command.get('stock_name', '')} "
+            f"{'买入' if command.get('action') == 'buy' else '卖出'} "
+            f"{command.get('quantity', 0)}股 @{command.get('price', 0):.2f} "
+            f"[{command.get('status', '')}] {command.get('reason', '')}".strip()
+        )
+
+    def execute_command_via_qmt2http(self, command_id: str) -> str:
+        book = self.get_execution_book()
+        command = book.find_command(command_id)
+        if not command:
+            return f"未找到指令 {command_id}"
+        if command.get("status") in ("executed", "cancelled"):
+            return f"指令已是 {command.get('status')} 状态：\n{self.format_command_brief(command)}"
+        client = self.get_qmt2http_client()
+        try:
+            response = client.place_order(
+                stock_code=command["stock_code"],
+                side=command["action"],
+                price=float(command["price"]),
+                amount=int(command["quantity"]),
+                strategy_name="trading_do_t",
+                order_remark=f"command:{command['id']}",
+            )
+        except Exception as exc:
+            book.mark_command_failed(command["id"], "qmt2http", str(exc))
+            return f"qmt2http 下单失败：{exc}\n{self.format_command_brief(book.find_command(command['id']) or command)}"
+
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        broker_order_id = (
+            data.get("order_id")
+            or data.get("entrust_no")
+            or data.get("order_no")
+            or data.get("合同编号")
+            or ""
+        )
+        submitted = book.mark_command_submitted(
+            command["id"],
+            "qmt2http",
+            broker_order_id=str(broker_order_id),
+            broker_response=response,
+            note="已通过 qmt2http 提交",
+        ) or command
+        return (
+            f"已通过 qmt2http 提交：\n{self.format_command_brief(submitted)}\n"
+            f"券商单号：{submitted.get('broker_order_id') or '-'}"
+        )
+
+    def cancel_command_via_qmt2http(self, command_id: str) -> str:
+        book = self.get_execution_book()
+        command = book.find_command(command_id)
+        if not command:
+            return f"未找到指令 {command_id}"
+        broker_order_id = str(command.get("broker_order_id") or "").strip()
+        if not broker_order_id:
+            return f"指令没有可用的券商单号，无法通过 qmt2http 撤单：\n{self.format_command_brief(command)}"
+        client = self.get_qmt2http_client()
+        try:
+            response = client.cancel_order(broker_order_id)
+        except Exception as exc:
+            return f"qmt2http 撤单失败：{exc}\n{self.format_command_brief(command)}"
+        cancelled = book.update_command_status(
+            command["id"],
+            "cancelled",
+            f"已通过 qmt2http 撤单，券商单号 {broker_order_id}",
+        ) or command
+        return (
+            f"已通过 qmt2http 撤单：\n{self.format_command_brief(cancelled)}\n"
+            f"券商单号：{broker_order_id}\n"
+            f"返回：{response}"
+        )
+
+    def create_and_execute_command(
+        self,
+        stock_code: str,
+        action: str,
+        price: float,
+        quantity: int,
+        reason: str,
+        source: str,
+    ) -> str:
+        command = self.get_execution_book().create_command(
+            stock_code=stock_code,
+            action=action,
+            price=price,
+            quantity=quantity,
+            reason=reason,
+            source=source,
+        )
+        return self.execute_command_via_qmt2http(command["id"])
+
+    def handle_command(self, message: str) -> str:
+        text = re.sub(r"\s+", " ", message.strip())
+        if not text.startswith("T"):
+            raise ValueError("不是交易指令")
+        stock_map = self.get_stock_map()
+        plan = self.load_daily_plan()
+        if text in ("T 状态", "T 列表", "T status", "T list"):
+            lines = [f"今日交易计划 {plan['date']}"]
+            for _, base in stock_map.items():
+                merged = self.apply_today_overrides(base, plan)
+                if merged.get("enabled"):
+                    lines.append(self.format_stock_status(merged))
+            return "\n".join(lines) if len(lines) > 1 else f"今日交易计划 {plan['date']}\n当前没有启用的监控票"
+        if text in ("T 仓位", "T 持仓", "T portfolio"):
+            return self.format_portfolio_status(self.get_execution_book().load_portfolio_state())
+        if text in ("T 指令簿", "T 指令", "T 任务", "T commands"):
+            commands = self.get_execution_book().list_commands(["pending", "acknowledged", "executed"])
+            if not commands:
+                return f"指令簿 {plan['date']}\n当前没有记录。"
+            lines = [f"指令簿 {plan['date']}"]
+            for item in commands[:10]:
+                lines.append(self.format_command_brief(item))
+            return "\n".join(lines)
+        if text in ("T 成交日报", "T 执行日报", "T 回执", "T report"):
+            return self.format_execution_summary(self.get_recorder().get_daily_summary())
+        if text in ("T 决策日报", "T 复盘", "T decision-review"):
+            return self.format_decision_review(self.get_review_engine().build_daily_review())
+        if text in ("T 重置", "T reset"):
+            plan["stocks"] = []
+            self.save_daily_plan(plan)
+            return f"已重置 {plan['date']} 的临时交易计划，监控恢复为基础配置。"
+        matched = re.match(r"T\s*(开启|关闭|on|off)\s*(\d{6})", text, re.IGNORECASE)
+        if matched:
+            code = matched.group(2)
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override["enabled"] = matched.group(1).lower() in ("开启", "on")
+            self.save_daily_plan(plan)
+            return f"已{'开启' if override['enabled'] else '关闭'} {code} {base.get('name', '')} 的今日监控。"
+        matched = re.match(r"T\s*(下达|指令|派单)\s*(买|卖|buy|sell)\s*(\d{6})\s*([0-9]+(?:\.[0-9]+)?)\s*([0-9]+)(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            action = matched.group(2).lower()
+            code = matched.group(3)
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            command = self.get_execution_book().create_command(
+                stock_code=code,
+                action="buy" if action in ("买", "buy") else "sell",
+                price=float(matched.group(4)),
+                quantity=int(matched.group(5)),
+                reason=(matched.group(6) or "").strip(),
+                source="feishu-manual",
+            )
+            return f"已下达执行指令：\n{self.format_command_brief(command)}"
+        matched = re.match(r"T\s*(执行|直连执行)\s*([0-9a-fA-F]{8})", text, re.IGNORECASE)
+        if matched:
+            return self.execute_command_via_qmt2http(matched.group(2).lower())
+        matched = re.match(r"T\s*(撤单|直连撤单)\s*([0-9a-fA-F]{8})", text, re.IGNORECASE)
+        if matched:
+            return self.cancel_command_via_qmt2http(matched.group(2).lower())
+        matched = re.match(r"T\s*(直买|直卖|直接买|直接卖)\s*(\d{6})\s*([0-9]+(?:\.[0-9]+)?)\s*([0-9]+)(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            keyword = matched.group(1)
+            action = "buy" if "买" in keyword else "sell"
+            return self.create_and_execute_command(
+                stock_code=matched.group(2),
+                action=action,
+                price=float(matched.group(3)),
+                quantity=int(matched.group(4)),
+                reason=(matched.group(5) or "").strip() or "飞书直接交易",
+                source="feishu-direct",
+            )
+        matched = re.match(r"T\s*(接单|确认)\s*([0-9a-fA-F]{8})", text, re.IGNORECASE)
+        if matched:
+            command = self.get_execution_book().update_command_status(matched.group(2).lower(), "acknowledged")
+            if not command:
+                return f"未找到指令 {matched.group(2)}"
+            return f"已确认接单：\n{self.format_command_brief(command)}"
+        matched = re.match(r"T\s*(撤销|取消)\s*([0-9a-fA-F]{8})(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            command = self.get_execution_book().update_command_status(matched.group(2).lower(), "cancelled", (matched.group(3) or "").strip())
+            if not command:
+                return f"未找到指令 {matched.group(2)}"
+            return f"已撤销指令：\n{self.format_command_brief(command)}"
+        matched = re.match(r"T\s*(设置|set)\s*(\d{6})\s*(.*)", text, re.IGNORECASE)
+        if matched:
+            code = matched.group(2)
+            body = matched.group(3)
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override["enabled"] = True
+            buy_range = self.parse_range(body, "买")
+            sell_range = self.parse_range(body, "卖")
+            stop_loss = self.parse_float_field(body, "止损")
+            shares = self.parse_int_field(body, "数量")
+            if not any([buy_range, sell_range, stop_loss is not None, shares is not None]):
+                return "未识别到有效参数，示例：T 设置 300475 买154.8-155.6 卖158.2-160 止损153 数量100"
+            if buy_range:
+                override["buy_range"] = [buy_range[0], buy_range[1]]
+            if sell_range:
+                override["sell_range"] = [sell_range[0], sell_range[1]]
+            if stop_loss is not None:
+                override["stop_loss"] = stop_loss
+            if shares is not None:
+                override["per_trade_shares"] = shares
+            self.save_daily_plan(plan)
+            return f"已更新今日计划：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
+        matched = re.match(r"T\s*(防守|谨慎|解除防守|恢复|normal)\s*(\d{6})(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            action = matched.group(1).lower()
+            code = matched.group(2)
+            body = matched.group(3) or ""
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override["enabled"] = True
+            if action == "防守":
+                override["preopen_risk_mode"] = "defensive"
+                override["avoid_reverse_t"] = True
+                price = self.parse_mode_price(body)
+                if price is not None:
+                    override["abandon_buy_below"] = price
+            elif action == "谨慎":
+                override["preopen_risk_mode"] = "cautious"
+                override["avoid_reverse_t"] = False
+            else:
+                self.clear_risk_overrides(override)
+            self.save_daily_plan(plan)
+            return f"已更新风控模式：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
+        matched = re.match(r"T\s*(放弃低吸)\s*(\d{6})\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+        if matched:
+            code = matched.group(2)
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override["enabled"] = True
+            override["abandon_buy_below"] = float(matched.group(3))
+            self.save_daily_plan(plan)
+            return f"已更新：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
+        matched = re.match(r"T\s*(解除放弃)\s*(\d{6})", text, re.IGNORECASE)
+        if matched:
+            code = matched.group(2)
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override.pop("abandon_buy_below", None)
+            self.save_daily_plan(plan)
+            return f"已更新：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
+        matched = re.match(r"T\s*(已买|买入成交)\s*(\d{6})\s*([0-9]+(?:\.[0-9]+)?)\s*([0-9]+)(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            note = (matched.group(5) or "").strip() or "飞书回执买入"
+            trade = self.get_recorder().record_trade(matched.group(2), "buy", float(matched.group(3)), int(matched.group(4)), note)
+            portfolio = self.get_execution_book().record_execution(matched.group(2), "buy", float(matched.group(3)), int(matched.group(4)), note)
+            summary = self.get_recorder().get_daily_summary()
+            return (
+                f"已记录买入成交：{trade['stock_name']} {trade['quantity']}股 @ {trade['price']:.2f}\n"
+                f"仓位：当前{portfolio.get('current_position', 0)} 可卖{portfolio.get('available_to_sell', 0)} 可回补{portfolio.get('available_to_buy_back', 0)}\n"
+                f"今日累计：买入{summary.get('buy_count', 0)} 卖出{summary.get('sell_count', 0)} 放弃{summary.get('skip_count', 0)} 已实现盈亏{summary.get('total_profit', 0):.2f}元"
+            )
+        matched = re.match(r"T\s*(已卖|卖出成交)\s*(\d{6})\s*([0-9]+(?:\.[0-9]+)?)\s*([0-9]+)(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            note = (matched.group(5) or "").strip() or "飞书回执卖出"
+            trade = self.get_recorder().record_trade(matched.group(2), "sell", float(matched.group(3)), int(matched.group(4)), note)
+            portfolio = self.get_execution_book().record_execution(matched.group(2), "sell", float(matched.group(3)), int(matched.group(4)), note)
+            summary = self.get_recorder().get_daily_summary()
+            profit_note = f"，本笔盈亏 {trade.get('profit', 0):.2f}元" if trade.get("profit") else ""
+            return (
+                f"已记录卖出成交：{trade['stock_name']} {trade['quantity']}股 @ {trade['price']:.2f}{profit_note}\n"
+                f"仓位：当前{portfolio.get('current_position', 0)} 可卖{portfolio.get('available_to_sell', 0)} 可回补{portfolio.get('available_to_buy_back', 0)}\n"
+                f"今日累计：买入{summary.get('buy_count', 0)} 卖出{summary.get('sell_count', 0)} 放弃{summary.get('skip_count', 0)} 已实现盈亏{summary.get('total_profit', 0):.2f}元"
+            )
+        matched = re.match(r"T\s*(放弃)\s*(\d{6})(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            event = self.get_recorder().record_skip(matched.group(2), reason=(matched.group(3) or "").strip() or "盘口不成立，放弃执行")
+            summary = self.get_recorder().get_daily_summary()
+            return f"已记录放弃执行：{event['stock_name']}，原因：{event['reason']}\n今日累计：买入{summary.get('buy_count', 0)} 卖出{summary.get('sell_count', 0)} 放弃{summary.get('skip_count', 0)} 已实现盈亏{summary.get('total_profit', 0):.2f}元"
+        return "未识别指令。可用格式：T 状态 / T 仓位 / T 指令簿 / T 下达 卖 300475 158.6 100 / T 执行 1a2b3c4d / T 撤单 1a2b3c4d / T 直买 300475 155.2 100 / T 直卖 300475 158.6 100 / T 接单 1a2b3c4d / T 撤销 1a2b3c4d / T 成交日报 / T 开启 300475 / T 关闭 688316 / T 设置 300475 买154.8-155.6 卖158.2-160 止损153 数量100 / T 防守 300475 151.8 / T 放弃低吸 300475 151.8 / T 已买 300475 155.2 100 / T 已卖 300475 158.6 100 / T 放弃 300475 / T 重置"
+
+    @staticmethod
+    def send_reply(target: str, text: str) -> bool:
+        return send_feishu(target, text, silent=True)
