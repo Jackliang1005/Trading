@@ -5,7 +5,7 @@
   },
   "qmt2http": {
     "enabled": true,
-    "base_url": "http://127.0.0.1:8085",
+    "base_url": "http://150.158.31.115:8085",
     "api_token": "998811",
     "timeout": 20,
     "account_id": "2035032946",

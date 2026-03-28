@@ -4,9 +4,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from .concept_agent import get_weekly_hot_concepts
 from .execution import TradingExecutionBook
 from .notifier import send_feishu
-from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG, FOCUS_LIST_PATH, UNIVERSE_STATE_PATH
+from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG, FOCUS_LIST_PATH, HOT_CONCEPTS_CACHE_PATH, NEWS_SNAPSHOTS_CACHE_PATH, UNIVERSE_STATE_PATH
 from .qmt2http_client import Qmt2HttpClient
 from .recorder import TradingRecorder
 from .review_engine import ReviewEngine
@@ -123,6 +124,10 @@ class TradingCommandService:
             "T 初始持仓",
             "T 观察池",
             "T 今日计划",
+            "T 热门题材",
+            "T 选股日报",
+            "T 信息状态",
+            "T 通道状态",
             "T 指令簿",
             "T 成交日报",
             "T 决策日报",
@@ -288,6 +293,61 @@ class TradingCommandService:
         return "\n".join(lines)
 
     @staticmethod
+    def format_hot_concepts(data: Dict[str, list]) -> str:
+        lines = ["近7天热门题材"]
+        for date_str, items in data.items():
+            if not items:
+                lines.append(f"{date_str} 无数据")
+                continue
+            top_names = [f"{str(item.get('name', '')).strip()}#{idx}" for idx, item in enumerate(items[:5], start=1) if str(item.get("name", "")).strip()]
+            lines.append(f"{date_str} {' / '.join(top_names)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_selection_review(data: Dict) -> str:
+        lines = [f"选股日报 {data.get('updated_at', '')}"]
+        if data.get("latest_hot_concepts_date"):
+            top_names = [f"{str(item.get('name', '')).strip()}#{item.get('rank', '-')}" for item in data.get("latest_hot_concepts", [])[:5] if str(item.get("name", "")).strip()]
+            lines.append(f"最新题材日 {data.get('latest_hot_concepts_date')} {' / '.join(top_names)}")
+        for item in data.get("focus", [])[:5]:
+            lines.append(
+                f"重点 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
+                f"模式{item.get('am_mode', '-')}/{item.get('pm_mode', '-')}"
+            )
+            if item.get("explanation"):
+                lines.append(f"说明 {item.get('explanation')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_info_status(news_cache: Dict, concept_cache: Dict) -> str:
+        lines = ["信息状态"]
+        lines.append(
+            f"新闻缓存 更新时间{news_cache.get('updated_at', '-') or '-'} "
+            f"时段{news_cache.get('refresh_slot', '-') or '-'}"
+        )
+        refresh_slots = concept_cache.get("refresh_slots", {}) if isinstance(concept_cache.get("refresh_slots"), dict) else {}
+        latest_day = next(iter(refresh_slots.keys()), "")
+        latest_slot = refresh_slots.get(latest_day, "-") if latest_day else "-"
+        lines.append(
+            f"题材缓存 更新时间{concept_cache.get('updated_at', '-') or '-'} "
+            f"最新题材日{latest_day or '-'} 时段{latest_slot}"
+        )
+        lines.append("新闻刷新规则 盘前1次 + 开盘/上午中段/上午尾段/下午前段/下午尾段 各1次，同一时段读缓存")
+        lines.append("题材刷新规则 盘前不抢刷今日题材，09:30后按 open/mid_am/late_am/early_pm/late_pm/post_close 分段刷新")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_qmt_status(status: Dict) -> str:
+        lines = ["QMT通道状态"]
+        lines.append(f"可达 {'是' if status.get('reachable') else '否'}")
+        lines.append(f"行情 {'正常' if status.get('market_connected') else '异常'}")
+        lines.append(f"交易 {'正常' if status.get('trade_connected') else '异常'}")
+        lines.append(f"状态 {status.get('status', '-')}")
+        if status.get("reason"):
+            lines.append(f"原因 {status.get('reason')}")
+        return "\n".join(lines)
+
+    @staticmethod
     def format_command_brief(command: Dict) -> str:
         return (
             f"{command['id']} {command.get('stock_code', '')} {command.get('stock_name', '')} "
@@ -399,6 +459,18 @@ class TradingCommandService:
             return self.format_portfolio_status(self.get_execution_book().load_portfolio_state())
         if text in ("T 初始持仓", "T 持仓库", "T initial-portfolio"):
             return self.format_initial_portfolio_db(self.get_execution_book().ensure_initial_portfolio_db())
+        if text in ("T 热门题材", "T 热题材", "T hot-concepts"):
+            return self.format_hot_concepts(get_weekly_hot_concepts())
+        if text in ("T 选股日报", "T 观察池日报", "T selection-review"):
+            today = datetime.now().strftime("%Y-%m-%d")
+            data = load_json(self.base_dir / "trading_data" / f"selection_review_{today}.json", {"updated_at": "", "focus": []})
+            return self.format_selection_review(data)
+        if text in ("T 信息状态", "T 数据状态", "T info-status"):
+            news_cache = load_json(NEWS_SNAPSHOTS_CACHE_PATH, {"updated_at": "", "refresh_slot": ""})
+            concept_cache = load_json(HOT_CONCEPTS_CACHE_PATH, {"updated_at": "", "refresh_slots": {}})
+            return self.format_info_status(news_cache, concept_cache)
+        if text in ("T 通道状态", "T qmt状态", "T qmt-status"):
+            return self.format_qmt_status(self.get_qmt2http_client().probe_status())
         matched = re.match(
             r"T\s*(更新持仓|更新底仓)\s*(\d{6})\s*([0-9]+)\s*([0-9]+(?:\.[0-9]+)?)(?:\s*([0-9]+))?(?:\s*([0-9]+(?:\.[0-9]+)?))?(?:\s*([0-9]+(?:\.[0-9]+)?))?",
             text,

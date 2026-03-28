@@ -23,7 +23,7 @@ class Qmt2HttpClient:
         self.base_url = str(
             config.get("base_url")
             or os.getenv("QMT2HTTP_BASE_URL")
-            or "http://127.0.0.1:8085"
+            or "http://150.158.31.115:8085"
         ).rstrip("/")
         self.api_token = str(config.get("api_token") or os.getenv("QMT2HTTP_API_TOKEN") or "").strip()
         self.timeout = float(config.get("timeout") or os.getenv("QMT2HTTP_TIMEOUT") or 20)
@@ -56,6 +56,28 @@ class Qmt2HttpClient:
 
     def health(self) -> Dict:
         return self._request("GET", "/health")
+
+    def probe_status(self) -> Dict:
+        try:
+            data = self.health()
+        except Exception as exc:
+            return {
+                "reachable": False,
+                "market_connected": False,
+                "trade_connected": False,
+                "status": "down",
+                "reason": str(exc),
+                "raw": {},
+            }
+        payload = data.get("data", {}) if isinstance(data, dict) else {}
+        return {
+            "reachable": True,
+            "market_connected": bool(payload.get("xtdata_connected") or payload.get("xtconn_connected")),
+            "trade_connected": bool(payload.get("trade_connected")),
+            "status": str(payload.get("status", "ok")),
+            "reason": str(payload.get("trade", {}).get("last_error") or data.get("message") or "").strip(),
+            "raw": payload,
+        }
 
     def place_order(
         self,

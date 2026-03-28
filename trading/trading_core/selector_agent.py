@@ -1,10 +1,28 @@
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List
 
 from .budget_agent import allocate_t_budget
+from .concept_agent import build_concept_snapshots, get_weekly_hot_concepts, summarize_hot_concepts
 from .models import MarketRegimeReport, SelectionResult, StockDataSnapshot, StockNewsSnapshot, StockRule
-from .paths import FOCUS_LIST_PATH, UNIVERSE_STATE_PATH
+from .paths import BASE_DIR, FOCUS_LIST_PATH, UNIVERSE_STATE_PATH
 from .storage import atomic_write_json, load_daily_plan, load_json, save_daily_plan
+
+
+def _item_brief(item: Dict) -> str:
+    title = str(item.get("title", "")).strip()
+    source = str(item.get("source", "")).strip()
+    published_at = str(item.get("published_at", "")).strip()
+    parts = [title]
+    meta = " ".join(part for part in [source, published_at] if part)
+    if meta:
+        parts.append(f"({meta})")
+    return " ".join(part for part in parts if part)
+
+
+def _selection_review_path(day: str = "") -> Path:
+    value = day or datetime.now().strftime("%Y-%m-%d")
+    return BASE_DIR / "trading_data" / f"selection_review_{value}.json"
 
 
 def _level(score: int) -> str:
@@ -33,21 +51,35 @@ def _event_weight(rule: StockRule, tag: Dict) -> int:
     strategy = rule.strategy or ""
     tag_name = tag.get("tag", "")
     direction = tag.get("direction", "neutral")
+    base_weight = 0
     if tag_name == "war_risk":
         if "逆T" in strategy or rule.allow_market_panic_reverse_t:
-            return 6 if direction == "negative" else 0
-        return -8 if direction == "negative" else 0
-    if tag_name == "policy_support":
+            base_weight = 6 if direction == "negative" else 0
+        else:
+            base_weight = -8 if direction == "negative" else 0
+    elif tag_name == "policy_support":
         if "顺T" in strategy or "箱体" in strategy:
-            return 8 if direction == "positive" else 0
-        return 4 if direction == "positive" else 0
-    if tag_name == "earnings_pressure":
-        return -10 if direction == "negative" else 0
-    if tag_name == "order_growth":
-        return 6 if direction == "positive" else 0
-    if tag_name == "sector_rotation":
-        return 5 if direction == "positive" else -3
-    return 0
+            base_weight = 8 if direction == "positive" else 0
+        else:
+            base_weight = 4 if direction == "positive" else 0
+    elif tag_name == "earnings_pressure":
+        base_weight = -10 if direction == "negative" else 0
+    elif tag_name == "order_growth":
+        base_weight = 6 if direction == "positive" else 0
+    elif tag_name == "sector_rotation":
+        base_weight = 5 if direction == "positive" else -3
+    if not base_weight:
+        return 0
+    stage = str(tag.get("stage", "")).strip()
+    stage_multiplier = 1.0
+    if stage == "active":
+        stage_multiplier = 0.7
+    elif stage == "cooling":
+        stage_multiplier = 0.35
+    elif stage == "stale":
+        stage_multiplier = 0.0
+    explicit_weight = float(tag.get("weight", stage_multiplier) or 0)
+    return int(round(base_weight * explicit_weight))
 
 
 def _decide_halfday_modes(rule: StockRule, market_regime: MarketRegimeReport, news: StockNewsSnapshot, score: int) -> tuple[str, str]:
@@ -80,8 +112,10 @@ def select_focus_list(
     market_regime: MarketRegimeReport,
     floating_cash_budget: float = 100000.0,
     max_single_t_ratio_of_holding: float = 0.35,
+    now: datetime | None = None,
 ) -> List[SelectionResult]:
     results: List[SelectionResult] = []
+    concept_snapshots = build_concept_snapshots(rules, now=now)
     holding_values = {
         rule.code: float(rule.base_position) * float(data_snapshots[rule.code].price)
         for rule in rules
@@ -90,6 +124,7 @@ def select_focus_list(
     for rule in rules:
         data = data_snapshots[rule.code]
         news = news_snapshots[rule.code]
+        concept = concept_snapshots.get(rule.code, {})
         score = 35
         reasons = []
         if data.amplitude_pct >= 4.0:
@@ -114,7 +149,7 @@ def select_focus_list(
             weighted = _event_weight(rule, tag)
             if weighted:
                 score += weighted
-                reasons.append(f"事件{tag.get('tag')}影响{weighted:+d}")
+                reasons.append(f"事件{tag.get('tag')}[{tag.get('stage', 'fresh')}]影响{weighted:+d}")
         if news.stock_sentiment == "positive":
             reasons.append("个股消息偏正面")
         elif news.stock_sentiment == "negative":
@@ -127,6 +162,45 @@ def select_focus_list(
             reasons.append("宏观事件偏正面")
         elif news.macro_sentiment == "negative":
             reasons.append("宏观事件偏负面")
+        hot_matches = concept.get("hot_matches", [])
+        if hot_matches:
+            concept_weight = min(len(hot_matches), 3) * 6
+            score += concept_weight
+            reasons.append(f"命中热门题材{'/'.join(hot_matches[:3])}")
+        elif concept.get("stock_concepts"):
+            score -= 2
+            reasons.append("未命中当日热门题材")
+        hot_match_ranks = concept.get("hot_match_ranks", [])
+        if hot_match_ranks:
+            best_rank = min(int(item.get("rank", 99) or 99) for item in hot_match_ranks)
+            if best_rank <= 3:
+                score += 8
+                reasons.append(f"命中前3热题材第{best_rank}名")
+            elif best_rank <= 5:
+                score += 5
+                reasons.append(f"命中前5热题材第{best_rank}名")
+            elif best_rank <= 10:
+                score += 2
+                reasons.append(f"命中前10热题材第{best_rank}名")
+            best_stage = str(hot_match_ranks[0].get("stage", "")).strip()
+            best_days = int(hot_match_ranks[0].get("days", 0) or 0)
+            if best_stage == "fresh":
+                score += 6
+                reasons.append(f"题材处于起爆期{best_days}天")
+            elif best_stage == "active":
+                score += 3
+                reasons.append(f"题材处于活跃期{best_days}天")
+            elif best_stage == "cooling":
+                score -= 4
+                reasons.append(f"题材进入降温期{best_days}天")
+            elif best_stage == "stale":
+                score -= 8
+                reasons.append(f"题材偏老化{best_days}天")
+        hot_match_days = int(concept.get("hot_match_days", 0) or 0)
+        if hot_match_days >= 2:
+            persistence_weight = min(hot_match_days, 4) * 2
+            score += persistence_weight
+            reasons.append(f"近7天连续命中热题材{hot_match_days}天")
         if "顺T" in rule.strategy and market_regime.regime == "strong":
             score += 8
             reasons.append("顺T策略匹配强/震荡市")
@@ -149,14 +223,33 @@ def select_focus_list(
         explanation_parts = []
         if news.event_tags:
             explanation_parts.append(
-                "事件标签: " + ",".join(f"{tag['tag']}:{tag['direction']}/{tag['horizon']}" for tag in news.event_tags[:3])
+                "事件标签: " + ",".join(
+                    f"{tag['tag']}:{tag['direction']}/{tag['horizon']}/{tag.get('stage', 'fresh')}/{tag.get('age_hours', 0)}h"
+                    for tag in news.event_tags[:3]
+                )
             )
         if news.stock_items:
-            explanation_parts.append(f"个股: {news.stock_items[0].get('title', '')}")
+            explanation_parts.append(f"个股: {_item_brief(news.stock_items[0])}")
         if news.sector_items:
-            explanation_parts.append(f"板块: {news.sector_items[0].get('title', '')}")
+            explanation_parts.append(f"板块: {_item_brief(news.sector_items[0])}")
         if news.macro_items:
-            explanation_parts.append(f"宏观: {news.macro_items[0].get('title', '')}")
+            explanation_parts.append(f"宏观: {_item_brief(news.macro_items[0])}")
+        if hot_matches:
+            explanation_parts.append("热门题材: " + ",".join(hot_matches[:3]))
+        elif concept.get("top_hot_concepts"):
+            explanation_parts.append("市场热题材: " + ",".join(concept.get("top_hot_concepts", [])[:3]))
+        if hot_match_ranks:
+            explanation_parts.append(
+                "题材排名: " + ",".join(
+                    f"{item.get('concept')}#{item.get('rank')}:{item.get('stage')}/{item.get('days')}d"
+                    for item in hot_match_ranks[:3]
+                )
+            )
+        if concept.get("recent_hot_matches"):
+            latest_match = concept.get("recent_hot_matches", [])[0]
+            explanation_parts.append(
+                f"近7天题材命中: {latest_match.get('date', '')} {'/'.join(latest_match.get('concepts', [])[:3])}"
+            )
         results.append(SelectionResult(
             code=rule.code,
             name=rule.name,
@@ -184,20 +277,43 @@ def select_focus_list(
     )
 
 
-def save_selection_outputs(results: List[SelectionResult]) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def save_selection_outputs(results: List[SelectionResult], now: datetime | None = None) -> None:
+    now_dt = now or datetime.now()
+    now_text = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    weekly_hot_concepts = get_weekly_hot_concepts(now=now_dt)
+    concept_summary = summarize_hot_concepts(weekly_hot_concepts)
     focus_payload = {
-        "updated_at": now,
+        "updated_at": now_text,
         "focus": [item.__dict__ for item in results if item.action == "focus"][:3],
         "watch": [item.__dict__ for item in results if item.action == "watch"][:5],
         "avoid": [item.__dict__ for item in results if item.action == "avoid"][:10],
     }
     universe_payload = {
-        "updated_at": now,
+        "updated_at": now_text,
         "stocks": [item.__dict__ for item in results],
     }
     atomic_write_json(FOCUS_LIST_PATH, focus_payload)
     atomic_write_json(UNIVERSE_STATE_PATH, universe_payload)
+    review_payload = {
+        "updated_at": now_text,
+        "latest_hot_concepts_date": concept_summary.get("latest_date", ""),
+        "latest_hot_concepts": [
+            {
+                "name": item.get("name", ""),
+                "code": item.get("code", ""),
+                "rank": index,
+            }
+            for index, item in enumerate(concept_summary.get("latest_hot_concepts", [])[:10], start=1)
+        ],
+        "weekly_hot_concepts": {
+            date_str: [str(item.get("name", "")).strip() for item in items[:5] if str(item.get("name", "")).strip()]
+            for date_str, items in weekly_hot_concepts.items()
+        },
+        "focus": [item.__dict__ for item in results if item.action == "focus"][:5],
+        "watch": [item.__dict__ for item in results if item.action == "watch"][:8],
+        "avoid": [item.__dict__ for item in results if item.action == "avoid"][:12],
+    }
+    atomic_write_json(_selection_review_path(), review_payload)
 
 
 def sync_selection_to_daily_plan(rules: List[StockRule], results: List[SelectionResult]) -> Dict:
