@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .paths import BASE_DIR, COMMAND_BOOK_PATH, DEFAULT_CONFIG, PORTFOLIO_STATE_PATH
+from .paths import BASE_DIR, COMMAND_BOOK_PATH, DEFAULT_CONFIG, INITIAL_PORTFOLIO_DB_PATH, PORTFOLIO_STATE_PATH
 from .storage import atomic_write_json, load_json
 
 
@@ -12,6 +12,7 @@ class TradingExecutionBook:
     def __init__(self, base_dir: Path = BASE_DIR):
         self.base_dir = Path(base_dir)
         self.config_path = self.base_dir / DEFAULT_CONFIG.name
+        self.initial_portfolio_db_path = self.base_dir / INITIAL_PORTFOLIO_DB_PATH.name
         self.portfolio_path = self.base_dir / PORTFOLIO_STATE_PATH.parent.name / PORTFOLIO_STATE_PATH.name
         self.command_book_path = self.base_dir / COMMAND_BOOK_PATH.parent.name / COMMAND_BOOK_PATH.name
 
@@ -22,7 +23,9 @@ class TradingExecutionBook:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _load_stock_map(self) -> Dict[str, Dict]:
-        data = load_json(self.config_path, {"stocks": []})
+        data = load_json(self.initial_portfolio_db_path, {"stocks": []})
+        if not data.get("stocks"):
+            data = load_json(self.config_path, {"stocks": []})
         result = {}
         for item in data.get("stocks", []):
             code = str(item.get("code", "")).strip()
@@ -32,12 +35,105 @@ class TradingExecutionBook:
                 "code": code,
                 "name": item.get("name", code),
                 "base_position": int(item.get("base_position", 0) or 0),
+                "cost_price": float(item.get("cost_price", 0) or 0),
                 "per_trade_shares": int(item.get("per_trade_shares", 0) or 0),
             }
         return result
 
+    def load_initial_portfolio_db(self) -> Dict:
+        default = {"updated_at": "", "source": "manual", "stocks": []}
+        return load_json(self.initial_portfolio_db_path, default)
+
+    def save_initial_portfolio_db(self, data: Dict) -> None:
+        data["updated_at"] = self._now()
+        atomic_write_json(self.initial_portfolio_db_path, data)
+
+    def ensure_initial_portfolio_db(self) -> Dict:
+        data = self.load_initial_portfolio_db()
+        if data.get("stocks"):
+            return data
+        config = load_json(self.config_path, {"stocks": []})
+        output = {"updated_at": self._now(), "source": DEFAULT_CONFIG.name, "stocks": []}
+        for item in config.get("stocks", []):
+            code = str(item.get("code", "")).strip()
+            if not code:
+                continue
+            output["stocks"].append({
+                "code": code,
+                "name": item.get("name", code),
+                "base_position": int(item.get("base_position", 0) or 0),
+                "cost_price": float(item.get("cost_price", 0) or 0),
+                "enabled": bool(item.get("enabled", False)),
+                "strategy": item.get("strategy", ""),
+            })
+        self.save_initial_portfolio_db(output)
+        return output
+
+    def update_initial_portfolio_entry(
+        self,
+        stock_code: str,
+        base_position: int,
+        cost_price: float,
+        available_position: Optional[int] = None,
+        last_price: Optional[float] = None,
+        break_even_price: Optional[float] = None,
+    ) -> Dict:
+        data = self.ensure_initial_portfolio_db()
+        target = None
+        for item in data.get("stocks", []):
+            if str(item.get("code")) == str(stock_code):
+                target = item
+                break
+        if target is None:
+            target = {
+                "code": str(stock_code),
+                "name": str(stock_code),
+                "enabled": False,
+                "strategy": "观察",
+            }
+            data.setdefault("stocks", []).append(target)
+        target["base_position"] = int(base_position)
+        target["available_position"] = int(available_position if available_position is not None else base_position)
+        target["cost_price"] = float(cost_price)
+        if last_price is not None:
+            target["last_price"] = float(last_price)
+        if break_even_price is not None:
+            target["break_even_price"] = float(break_even_price)
+        self.save_initial_portfolio_db(data)
+        return target
+
+    def rebuild_portfolio_state_from_initial(self) -> Dict:
+        initial = self.ensure_initial_portfolio_db()
+        today = self._today()
+        data = {"date": today, "updated_at": self._now(), "stocks": {}}
+        for item in initial.get("stocks", []):
+            code = str(item.get("code", "")).strip()
+            if not code:
+                continue
+            carry_position = int(item.get("base_position", 0) or 0)
+            available_position = int(item.get("available_position", carry_position) or carry_position)
+            state = {
+                "code": code,
+                "name": item.get("name", code),
+                "base_position": carry_position,
+                "cost_price": float(item.get("cost_price", 0) or 0),
+                "carry_position": carry_position,
+                "intraday_buy": 0,
+                "intraday_sell": 0,
+                "current_position": carry_position,
+                "available_to_sell": available_position,
+                "available_to_buy_back": 0,
+                "last_trade_at": "",
+            }
+            self._refresh_stock_state(state)
+            state["available_to_sell"] = min(state["available_to_sell"], available_position)
+            data["stocks"][code] = state
+        self.save_portfolio_state(data)
+        return data
+
     def load_portfolio_state(self) -> Dict:
         today = self._today()
+        self.ensure_initial_portfolio_db()
         stocks = self._load_stock_map()
         data = load_json(self.portfolio_path, {"date": today, "updated_at": "", "stocks": {}})
         if data.get("date") != today or not isinstance(data.get("stocks"), dict):
@@ -49,6 +145,7 @@ class TradingExecutionBook:
                     "code": code,
                     "name": item["name"],
                     "base_position": item["base_position"],
+                    "cost_price": item.get("cost_price", 0),
                     "carry_position": item["base_position"],
                     "intraday_buy": 0,
                     "intraday_sell": 0,
@@ -60,6 +157,7 @@ class TradingExecutionBook:
             )
             state["name"] = item["name"]
             state["base_position"] = item["base_position"]
+            state["cost_price"] = item.get("cost_price", 0)
             state["carry_position"] = item["base_position"]
             self._refresh_stock_state(state)
         return data

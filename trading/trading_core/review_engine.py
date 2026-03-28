@@ -24,15 +24,21 @@ class ReviewEngine:
         market_regime: MarketRegimeReport,
         decision: DecisionResult,
         quote: Dict,
+        selection: Dict | None = None,
     ) -> None:
         path = self._journal_path()
         data = load_json(path, {"date": datetime.now().strftime("%Y-%m-%d"), "decisions": []})
+        selection = selection or {}
         data.setdefault("decisions", []).append({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "stock_code": rule.code,
             "stock_name": rule.name,
             "playbook": playbook.name,
             "market_regime": market_regime.regime,
+            "selection_action": selection.get("action", ""),
+            "selection_am_mode": selection.get("am_mode", selection.get("selection_am_mode", "")),
+            "selection_pm_mode": selection.get("pm_mode", selection.get("selection_pm_mode", "")),
+            "selection_reason": selection.get("reason", selection.get("selection_reason", "")),
             "price": float(quote.get("price", 0) or 0),
             "change_percent": float(quote.get("change_percent", 0) or 0),
             "action": decision.action,
@@ -68,4 +74,24 @@ class ReviewEngine:
             "action_counts": action_counts,
             "playbook_counts": playbook_counts,
             "auto_trade_candidates": auto_candidates,
+        }
+
+    def build_mode_review(self, day: str = "") -> Dict:
+        path = self._journal_path(day)
+        data = load_json(path, {"date": day or datetime.now().strftime("%Y-%m-%d"), "decisions": []})
+        decisions = data.get("decisions", [])
+        mode_stats: Dict[str, Dict] = {}
+        for item in decisions:
+            for key in ("selection_am_mode", "selection_pm_mode"):
+                mode = item.get(key) or "unknown"
+                stats = mode_stats.setdefault(mode, {"count": 0, "buy": 0, "sell": 0, "wait": 0, "auto": 0})
+                stats["count"] += 1
+                action = item.get("action", "wait")
+                stats[action] = stats.get(action, 0) + 1
+                if item.get("allow_auto_trade"):
+                    stats["auto"] += 1
+        return {
+            "date": data.get("date"),
+            "mode_stats": mode_stats,
+            "decision_count": len(decisions),
         }

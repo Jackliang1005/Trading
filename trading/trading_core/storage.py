@@ -121,6 +121,7 @@ def parse_rules(config: Dict) -> List[StockRule]:
                 rebound_buy_above=float(item.get("rebound_buy_above", 0) or 0),
                 allow_market_panic_reverse_t=bool(item.get("allow_market_panic_reverse_t", True)),
                 panic_rebound_pct=float(item.get("panic_rebound_pct", 0.8) or 0.8),
+                sector_tags=[str(v) for v in item.get("sector_tags", []) if str(v).strip()],
                 enabled=bool(item.get("enabled", True)),
             )
         )

@@ -30,12 +30,21 @@ from .analysis import (
     should_use_dynamic_range,
 )
 from .decision_engine import format_decision_message, make_decision
+from .data_agent import build_stock_data_snapshots
 from .learning import load_learning_profile
 from .market_regime import build_market_regime
+from .news_agent import build_news_snapshots
 from .notifier import send_feishu
 from .paths import DAILY_PLAN_PATH, DEFAULT_CONFIG
 from .playbook import select_playbook
 from .review_engine import ReviewEngine
+from .selector_agent import (
+    format_selection_report,
+    load_selection_map,
+    save_selection_outputs,
+    select_focus_list,
+    sync_selection_to_daily_plan,
+)
 from .command_service import TradingCommandService
 from .storage import load_config, load_daily_plan, load_state, merge_daily_plan, parse_rules, save_daily_plan, save_state
 
@@ -92,6 +101,9 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
     t_signal_max_per_day = int(monitor_cfg.get("t_signal_max_per_day", 4))
     dynamic_range_threshold = float(monitor_cfg.get("dynamic_range_threshold_pct", 8))
     auto_trade_enabled = bool(config.get("qmt2http", {}).get("auto_trade_enabled", False))
+    account_cfg = config.get("account", {})
+    floating_cash_budget = float(account_cfg.get("floating_cash_budget", 100000) or 100000)
+    max_single_t_ratio_of_holding = float(account_cfg.get("max_single_t_ratio_of_holding", 0.35) or 0.35)
     now = datetime.now()
     preopen_mode = in_preopen_hours(now)
     if only_trade_hours and not (in_trade_hours(now) or preopen_mode):
@@ -109,6 +121,28 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         plan_changed = False
         sent_count = 0
         today = now.strftime("%Y-%m-%d")
+        data_snapshots = build_stock_data_snapshots(rules)
+        news_snapshots = build_news_snapshots(rules)
+        selections = select_focus_list(
+            rules,
+            data_snapshots,
+            news_snapshots,
+            market_regime,
+            floating_cash_budget=floating_cash_budget,
+            max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
+        )
+        save_selection_outputs(selections)
+        sync_selection_to_daily_plan(rules, selections)
+        selection_message = format_selection_report(selections)
+        print(selection_message)
+        print("-" * 60)
+        selection_signal_type = f"selection_report_{today}"
+        if should_send_signal(state, "system", selection_signal_type, 99999):
+            delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
+            if delivered:
+                mark_signal_sent(state, "system", selection_signal_type)
+                if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
+                    sent_count += 1
         for rule in rules:
             result = evaluate_preopen_warning(rule, quotes.get(rule.code, {}), fetch_auction_snapshot(rule.code), market)
             if not result:
@@ -133,6 +167,7 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         return 0
     phase = get_analysis_phase(now)
     today_str = now.strftime("%Y-%m-%d")
+    selection_map = load_selection_map()
     yesterday_cache = state.setdefault("yesterday_cache", {})
     if yesterday_cache.get("date") != today_str:
         yesterday_cache.clear()
@@ -147,6 +182,20 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
     review_engine = ReviewEngine(base_dir=config_path.parent)
     portfolio_state = command_service.get_execution_book().load_portfolio_state()
     for rule in rules:
+        selection = selection_map.get(rule.code, {})
+        pool_action = selection.get("action", "focus")
+        am_mode = str(selection.get("am_mode", selection.get("selection_am_mode", "")) or "")
+        pm_mode = str(selection.get("pm_mode", selection.get("selection_pm_mode", "")) or "")
+        day_mode = am_mode if now.hour < 13 else (pm_mode or am_mode)
+        buy_budget = float(selection.get("buy_budget_amount", selection.get("selection_buy_budget_amount", 0)) or 0)
+        sell_budget = float(selection.get("sell_budget_amount", selection.get("selection_sell_budget_amount", 0)) or 0)
+        selection_reason = str(selection.get("reason", selection.get("selection_reason", "")) or "")
+        selection_explanation = str(selection.get("explanation", selection.get("selection_explanation", "")) or "")
+        suggested_buy_shares = int(selection.get("suggested_buy_shares", selection.get("selection_buy_shares", 0)) or 0)
+        suggested_sell_shares = int(selection.get("suggested_sell_shares", selection.get("selection_sell_shares", 0)) or 0)
+        if pool_action == "avoid":
+            print(f"{rule.name}({rule.code}) 今日在回避池，跳过盘中决策")
+            continue
         quote = quotes.get(rule.code)
         if not quote:
             print(f"未获取到 {rule.code} 行情")
@@ -183,10 +232,23 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                 learning=learning,
                 portfolio_state=portfolio_state,
                 state=state,
+                selection_mode=day_mode,
             )
-            review_engine.append_decision(rule, playbook, market_regime, decision, quote)
+            review_engine.append_decision(rule, playbook, market_regime, decision, quote, selection=selection)
             if decision.action in ("buy", "sell") and should_send_t_signal(state, rule.code, t_signal_cooldown, t_signal_max_per_day):
+                trade_shares = suggested_buy_shares if decision.action == "buy" else suggested_sell_shares
+                if trade_shares <= 0:
+                    trade_shares = rule.per_trade_shares
+                active_budget = buy_budget if decision.action == "buy" else sell_budget
                 message = format_decision_message(rule, decision, market_regime, learning)
+                message += (
+                    f"\n观察池分组：{pool_action} / 时段模式：AM {am_mode or '-'} / PM {pm_mode or '-'} / 当前 {day_mode or '-'}"
+                    f" / 买预算：{buy_budget:.0f} / 卖预算：{sell_budget:.0f} / 当前预算：{active_budget:.0f} / 建议做T股数：{trade_shares}"
+                )
+                if selection_reason:
+                    message += f"\n选票原因：{selection_reason}"
+                if selection_explanation:
+                    message += f"\n新闻解释：{selection_explanation}"
                 if is_dynamic:
                     message += "\n补充：当前处于动态区间模式。"
                 print(message)
@@ -196,12 +258,12 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     mark_t_signal_sent(state, rule.code, analysis)
                     if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
                         sent_count += 1
-                if auto_trade_enabled and not dry_run and decision.allow_auto_trade:
+                if auto_trade_enabled and not dry_run and pool_action == "focus" and decision.allow_auto_trade:
                     exec_result = command_service.create_and_execute_command(
                         stock_code=rule.code,
                         action=decision.action,
                         price=decision.execution_price or float(quote["price"]),
-                        quantity=rule.per_trade_shares,
+                        quantity=trade_shares,
                         reason=f"{decision.playbook_name} {decision.level} {phase}",
                         source="decision-engine-auto",
                     )
@@ -234,6 +296,17 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         elif abs(float(quote.get("change_percent", 0))) > 5:
             news_context = search_stock_news(rule.name, "大涨" if float(quote.get("change_percent", 0)) > 0 else "大跌")
         message = format_signal(rule, quote, signal_type, market, news_context)
+        fallback_shares = suggested_buy_shares if signal_type in ("buy", "rebound_buy") else suggested_sell_shares
+        if fallback_shares <= 0:
+            fallback_shares = rule.per_trade_shares
+        message += (
+            f"\n观察池分组：{pool_action} / 时段模式：AM {am_mode or '-'} / PM {pm_mode or '-'} / 当前 {day_mode or '-'}"
+            f" / 买预算：{buy_budget:.0f} / 卖预算：{sell_budget:.0f} / 建议做T股数：{fallback_shares}"
+        )
+        if selection_reason:
+            message += f"\n选票原因：{selection_reason}"
+        if selection_explanation:
+            message += f"\n新闻解释：{selection_explanation}"
         if analysis:
             message += f"\n--- 做T大脑摘要 ---\nVWAP {analysis.vwap:.2f} / T买 {analysis.t_buy_target:.2f} / T卖 {analysis.t_sell_target:.2f} / 价差 {analysis.t_spread_pct:.1f}% / 置信度 {analysis.confidence}"
         print(message)

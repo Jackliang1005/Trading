@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 
 from .execution import TradingExecutionBook
 from .notifier import send_feishu
-from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG
+from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG, FOCUS_LIST_PATH, UNIVERSE_STATE_PATH
 from .qmt2http_client import Qmt2HttpClient
 from .recorder import TradingRecorder
 from .review_engine import ReviewEngine
@@ -52,6 +52,12 @@ class TradingCommandService:
     def get_qmt2http_config(self) -> Dict:
         config = self.load_base_config()
         return config.get("qmt2http", {}) if isinstance(config, dict) else {}
+
+    def load_focus_list(self) -> Dict:
+        return load_json(FOCUS_LIST_PATH, {"updated_at": "", "focus": [], "watch": [], "avoid": []})
+
+    def load_universe_state(self) -> Dict:
+        return load_json(UNIVERSE_STATE_PATH, {"updated_at": "", "stocks": []})
 
     def get_qmt2http_client(self) -> Qmt2HttpClient:
         config = self.get_qmt2http_config()
@@ -108,6 +114,41 @@ class TradingCommandService:
         )
 
     @staticmethod
+    def format_command_help() -> str:
+        lines = [
+            "做T命令列表",
+            "当前推荐命令：",
+            "T 状态",
+            "T 仓位",
+            "T 初始持仓",
+            "T 观察池",
+            "T 今日计划",
+            "T 指令簿",
+            "T 成交日报",
+            "T 决策日报",
+            "T 模式复盘",
+            "T 更新持仓 300475 200 158.6426 200 143.96 158.643",
+            "T 重建持仓",
+            "T 下达 买 300475 155.2 100 原因",
+            "T 执行 任务ID",
+            "T 撤单 任务ID",
+            "T 直买 300475 155.2 100 原因",
+            "T 直卖 300475 158.6 100 原因",
+            "T 接单 任务ID",
+            "T 撤销 任务ID",
+            "兼容旧命令：",
+            "T 开启 300475",
+            "T 关闭 300475",
+            "T 设置 300475 买154.8-155.6 卖158.2-160 止损153 数量100",
+            "T 重置",
+            "说明：以上旧命令仍可用，但当前主流程优先使用 持仓库 -> 观察池 -> 今日计划。",
+            "帮助：",
+            "T 命令",
+            "T 帮助",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
     def format_execution_summary(summary: Dict) -> str:
         lines = [
             f"执行回执 {summary['date']}",
@@ -149,6 +190,70 @@ class TradingCommandService:
         return "\n".join(lines)
 
     @staticmethod
+    def format_mode_review(summary: Dict) -> str:
+        lines = [
+            f"模式复盘 {summary.get('date', '')}",
+            f"总决策{summary.get('decision_count', 0)}",
+        ]
+        for mode, stats in summary.get("mode_stats", {}).items():
+            lines.append(
+                f"{mode} 决策{stats.get('count', 0)} 买{stats.get('buy', 0)} "
+                f"卖{stats.get('sell', 0)} 观望{stats.get('wait', 0)} 自动候选{stats.get('auto', 0)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_focus_list(data: Dict) -> str:
+        lines = [f"做T观察池 {data.get('updated_at', '')}"]
+        for item in data.get("focus", []):
+            lines.append(
+                f"重点 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
+                f"模式{item.get('am_mode', '-')}/{item.get('pm_mode', '-')}"
+                f" 买预算{item.get('buy_budget_amount', 0):.0f} 卖预算{item.get('sell_budget_amount', 0):.0f}"
+                f" 仓位{item.get('suggested_t_ratio', 0):.0%} 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)} "
+                f"{item.get('reason', '')}"
+            )
+            if item.get("explanation"):
+                lines.append(f"说明 {item.get('explanation')}")
+        for item in data.get("watch", [])[:5]:
+            lines.append(
+                f"观察 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
+                f"模式{item.get('am_mode', '-')}/{item.get('pm_mode', '-')}"
+                f" 买预算{item.get('buy_budget_amount', 0):.0f} 卖预算{item.get('sell_budget_amount', 0):.0f}"
+                f" 仓位{item.get('suggested_t_ratio', 0):.0%} 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)} "
+                f"{item.get('reason', '')}"
+            )
+            if item.get("explanation"):
+                lines.append(f"说明 {item.get('explanation')}")
+        for item in data.get("avoid", [])[:3]:
+            lines.append(
+                f"回避 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
+                f"{item.get('reason', '')}"
+            )
+            if item.get("explanation"):
+                lines.append(f"说明 {item.get('explanation')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_selection_plan(plan: Dict) -> str:
+        lines = [f"当日做T计划 {plan.get('date', '')} 来源{plan.get('source', '')}"]
+        for item in plan.get("stocks", []):
+            lines.append(
+                f"{item.get('code')} {item.get('name')} "
+                f"[{'开' if item.get('enabled') else '关'}] "
+                f"action={item.get('selection_action', '-')}"
+                f" mode={item.get('selection_am_mode', '-')}/{item.get('selection_pm_mode', '-')}"
+                f" score={item.get('selection_score', '-')}"
+                f" buy_budget={item.get('selection_buy_budget_amount', 0):.0f}"
+                f" sell_budget={item.get('selection_sell_budget_amount', 0):.0f}"
+                f" ratio={item.get('selection_ratio', 0):.0%}"
+                f" buy_shares={item.get('selection_buy_shares', 0)}"
+                f" sell_shares={item.get('selection_sell_shares', 0)}"
+                f" default_shares={item.get('per_trade_shares', 0)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
     def format_portfolio_status(state: Dict) -> str:
         lines = [f"当日仓位状态 {state['date']}"]
         for code in sorted(state.get("stocks", {})):
@@ -157,7 +262,28 @@ class TradingCommandService:
                 f"{code} {item.get('name', '')} "
                 f"底仓{item.get('carry_position', 0)} 当前{item.get('current_position', 0)} "
                 f"今卖{item.get('intraday_sell', 0)} 今买{item.get('intraday_buy', 0)} "
-                f"可卖{item.get('available_to_sell', 0)} 可回补{item.get('available_to_buy_back', 0)}"
+                f"可卖{item.get('available_to_sell', 0)} 可回补{item.get('available_to_buy_back', 0)} "
+                f"成本{item.get('cost_price', 0)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_initial_portfolio_db(data: Dict) -> str:
+        lines = [f"初始持仓数据库 {data.get('updated_at', '')} 来源{data.get('source', '')}"]
+        overview = data.get("account_overview", {})
+        if overview:
+            lines.append(
+                f"可用{overview.get('available_cash', 0):.2f} "
+                f"可取{overview.get('withdrawable_cash', 0):.2f} "
+                f"冻结{overview.get('frozen_cash', 0):.2f} "
+                f"市值{overview.get('stock_market_value', 0):.2f} "
+                f"总资产{overview.get('total_assets', 0):.2f}"
+            )
+        for item in data.get("stocks", []):
+            lines.append(
+                f"{item.get('code')} {item.get('name')} 底仓{item.get('base_position', 0)} "
+                f"可用{item.get('available_position', item.get('base_position', 0))} "
+                f"成本{item.get('cost_price', 0)} 策略{item.get('strategy', '')}"
             )
         return "\n".join(lines)
 
@@ -260,6 +386,8 @@ class TradingCommandService:
             raise ValueError("不是交易指令")
         stock_map = self.get_stock_map()
         plan = self.load_daily_plan()
+        if text in ("T 命令", "T 帮助", "T help", "T commands-help"):
+            return self.format_command_help()
         if text in ("T 状态", "T 列表", "T status", "T list"):
             lines = [f"今日交易计划 {plan['date']}"]
             for _, base in stock_map.items():
@@ -269,6 +397,36 @@ class TradingCommandService:
             return "\n".join(lines) if len(lines) > 1 else f"今日交易计划 {plan['date']}\n当前没有启用的监控票"
         if text in ("T 仓位", "T 持仓", "T portfolio"):
             return self.format_portfolio_status(self.get_execution_book().load_portfolio_state())
+        if text in ("T 初始持仓", "T 持仓库", "T initial-portfolio"):
+            return self.format_initial_portfolio_db(self.get_execution_book().ensure_initial_portfolio_db())
+        matched = re.match(
+            r"T\s*(更新持仓|更新底仓)\s*(\d{6})\s*([0-9]+)\s*([0-9]+(?:\.[0-9]+)?)(?:\s*([0-9]+))?(?:\s*([0-9]+(?:\.[0-9]+)?))?(?:\s*([0-9]+(?:\.[0-9]+)?))?",
+            text,
+            re.IGNORECASE,
+        )
+        if matched:
+            code = matched.group(2)
+            base_position = int(matched.group(3))
+            cost_price = float(matched.group(4))
+            available_position = int(matched.group(5)) if matched.group(5) else base_position
+            last_price = float(matched.group(6)) if matched.group(6) else None
+            break_even_price = float(matched.group(7)) if matched.group(7) else None
+            entry = self.get_execution_book().update_initial_portfolio_entry(
+                stock_code=code,
+                base_position=base_position,
+                cost_price=cost_price,
+                available_position=available_position,
+                last_price=last_price,
+                break_even_price=break_even_price,
+            )
+            return (
+                f"已更新初始持仓：{entry.get('code')} {entry.get('name')} "
+                f"底仓{entry.get('base_position')} 可用{entry.get('available_position')} "
+                f"成本{entry.get('cost_price')}"
+            )
+        if text in ("T 重建持仓", "T 重建仓位", "T rebuild-portfolio"):
+            state = self.get_execution_book().rebuild_portfolio_state_from_initial()
+            return self.format_portfolio_status(state)
         if text in ("T 指令簿", "T 指令", "T 任务", "T commands"):
             commands = self.get_execution_book().list_commands(["pending", "acknowledged", "executed"])
             if not commands:
@@ -281,6 +439,12 @@ class TradingCommandService:
             return self.format_execution_summary(self.get_recorder().get_daily_summary())
         if text in ("T 决策日报", "T 复盘", "T decision-review"):
             return self.format_decision_review(self.get_review_engine().build_daily_review())
+        if text in ("T 模式复盘", "T mode-review"):
+            return self.format_mode_review(self.get_review_engine().build_mode_review())
+        if text in ("T 观察池", "T 重点票", "T focus"):
+            return self.format_focus_list(self.load_focus_list())
+        if text in ("T 今日计划", "T 选股计划", "T selection-plan"):
+            return self.format_selection_plan(self.load_daily_plan())
         if text in ("T 重置", "T reset"):
             plan["stocks"] = []
             self.save_daily_plan(plan)

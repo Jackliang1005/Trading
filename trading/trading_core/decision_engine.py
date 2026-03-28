@@ -60,8 +60,17 @@ def make_decision(
     learning: LearningProfile,
     portfolio_state: Dict,
     state: Dict,
+    selection_mode: str = "",
 ) -> DecisionResult:
     action, action_reason = _derive_action(rule, playbook, analysis, quote, market_regime)
+    if selection_mode == "sell_only" and action == "buy":
+        action, action_reason = "wait", "今日模式仅允许卖出"
+    elif selection_mode == "reverse_t_only" and action == "sell" and playbook.name == "trend_sell_rebuy":
+        action, action_reason = "wait", "今日模式偏逆T，不做顺T先卖"
+    elif selection_mode == "trend_t_only" and action == "buy" and playbook.name in ("panic_reverse_t", "reverse_t"):
+        action, action_reason = "wait", "今日模式偏顺T，不做逆T低吸"
+    elif selection_mode == "observe_only":
+        action, action_reason = "wait", "今日模式仅观察"
     score = 30
     reasons = [action_reason]
     if analysis.confidence == "高":

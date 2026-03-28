@@ -42,6 +42,7 @@ class StockRule:
     rebound_buy_above: float = 0.0
     allow_market_panic_reverse_t: bool = True
     panic_rebound_pct: float = 0.8
+    sector_tags: List[str] = None
     enabled: bool = True
 
 
@@ -106,3 +107,53 @@ class DecisionResult:
     hold_minutes: int
     allow_auto_trade: bool
     risk_flags: List[str]
+
+
+@dataclass
+class StockDataSnapshot:
+    code: str
+    name: str
+    price: float
+    change_percent: float
+    amount: float
+    high: float
+    low: float
+    open: float
+    pre_close: float
+    amplitude_pct: float
+    main_net_inflow: float
+    flow_bias: str
+
+
+@dataclass
+class StockNewsSnapshot:
+    code: str
+    stock_score: int
+    stock_sentiment: str
+    stock_items: List[Dict]
+    sector_score: int
+    sector_sentiment: str
+    sector_items: List[Dict]
+    macro_score: int
+    macro_sentiment: str
+    macro_items: List[Dict]
+    event_tags: List[Dict]
+
+
+@dataclass
+class SelectionResult:
+    code: str
+    name: str
+    action: str
+    am_mode: str
+    pm_mode: str
+    score: int
+    level: str
+    buy_budget_amount: float
+    sell_budget_amount: float
+    suggested_t_ratio: float
+    suggested_buy_shares: int
+    suggested_sell_shares: int
+    reason: str
+    explanation: str
+    regime: str
