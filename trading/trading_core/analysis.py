@@ -219,6 +219,58 @@ def _weighted_avg(values_weights: List[Tuple[float, float]]) -> float:
     return total_v / total_w if total_w else 0.0
 
 
+def _avg_true_range(bars: List[Dict], period: int = 20) -> float:
+    if not bars:
+        return 0.0
+    subset = bars[-period:] if len(bars) >= period else bars
+    prev_close = subset[0]["open"] or subset[0]["close"]
+    ranges = []
+    for bar in subset:
+        high = float(bar.get("high", 0) or 0)
+        low = float(bar.get("low", 0) or 0)
+        close = float(bar.get("close", 0) or 0)
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        if tr > 0:
+            ranges.append(tr)
+        prev_close = close or prev_close
+    return sum(ranges) / len(ranges) if ranges else 0.0
+
+
+def _classify_intraday_structure(
+    bars: List[Dict],
+    vwap: float,
+    ma20: float,
+    ma60: float,
+    risk_unit: float,
+    quote_close: float,
+    yd_close: float,
+) -> str:
+    if not bars or quote_close <= 0:
+        return "neutral"
+    session_high = max(float(bar.get("high", 0) or 0) for bar in bars)
+    session_low = min(float(bar.get("low", 0) or 0) for bar in bars)
+    day_range = max(session_high - session_low, 0.0)
+    rebound_from_low = quote_close - session_low
+    pullback_from_high = session_high - quote_close
+    risk = risk_unit or max(quote_close * 0.003, 0.01)
+    trend_bias = quote_close - vwap
+    ma_bias = ma20 - ma60 if ma20 > 0 and ma60 > 0 else 0.0
+    if (
+        yd_close > 0
+        and quote_close < yd_close
+        and rebound_from_low >= risk * 1.2
+        and (yd_close - session_low) >= risk * 1.8
+    ):
+        return "panic_rebound"
+    if trend_bias >= risk and ma_bias >= 0 and pullback_from_high <= risk * 0.8:
+        return "trend_up"
+    if trend_bias <= -risk and ma_bias <= 0 and rebound_from_low <= risk * 0.8:
+        return "trend_down"
+    if day_range >= risk * 2.2 and abs(trend_bias) <= risk * 0.8:
+        return "range"
+    return "neutral"
+
+
 def _assess_confidence(values: List[float], threshold_pct: float = 0.5) -> str:
     valid = [v for v in values if v > 0]
     if len(valid) < 2:
@@ -258,19 +310,52 @@ def compute_intraday_analysis(code: str, rule: StockRule, bars: List[Dict], yest
         pp = s1 = r1 = 0.0
     ma20 = _compute_ma(bars, 20)
     ma60 = _compute_ma(bars, 60)
+    risk_unit = _avg_true_range(bars, 20)
+    if risk_unit <= 0:
+        ref_close = bars[-1]["close"]
+        risk_unit = max(ref_close * 0.0035, 0.01)
     recent_support = pivot_lows[-1][0] if pivot_lows else 0.0
     recent_resistance = pivot_highs[-1][0] if pivot_highs else 0.0
-    vwap_lower = vwap * 0.995
-    vwap_upper = vwap * 1.005
+    vwap_lower = vwap - risk_unit * 0.35 if vwap > 0 else 0.0
+    vwap_upper = vwap + risk_unit * 0.35 if vwap > 0 else 0.0
     ma_support = min(ma20, ma60) if ma20 > 0 and ma60 > 0 else (ma20 or ma60)
     ma_resistance = max(ma20, ma60) if ma20 > 0 and ma60 > 0 else (ma20 or ma60)
-    t_buy_target = _weighted_avg([(recent_support, 0.30), (vwap_lower, 0.25), (s1, 0.25), (ma_support, 0.20)])
-    t_sell_target = _weighted_avg([(recent_resistance, 0.30), (vwap_upper, 0.25), (r1, 0.25), (ma_resistance, 0.20)])
+    structure = _classify_intraday_structure(
+        bars=bars,
+        vwap=vwap,
+        ma20=ma20,
+        ma60=ma60,
+        risk_unit=risk_unit,
+        quote_close=bars[-1]["close"],
+        yd_close=yd_close,
+    )
+    if structure == "trend_up":
+        t_buy_target = _weighted_avg([(vwap_lower, 0.45), (ma_support, 0.25), (recent_support, 0.20), (pp, 0.10)])
+        t_sell_target = _weighted_avg([(recent_resistance, 0.35), (vwap_upper + risk_unit * 0.6, 0.35), (r1, 0.30)])
+    elif structure == "trend_down":
+        t_buy_target = _weighted_avg([(recent_support, 0.30), (vwap_lower - risk_unit * 0.4, 0.35), (s1, 0.35)])
+        t_sell_target = _weighted_avg([(vwap_upper, 0.35), (recent_resistance, 0.25), (ma_resistance, 0.20), (pp, 0.20)])
+    elif structure == "panic_rebound":
+        panic_floor = min(filter(lambda x: x > 0, [recent_support, s1, bars[-1]["low"]]), default=0.0)
+        t_buy_target = _weighted_avg([(panic_floor, 0.40), (bars[-1]["close"] - risk_unit * 0.6, 0.35), (vwap_lower, 0.25)])
+        t_sell_target = _weighted_avg([(vwap_upper, 0.35), (pp, 0.30), (recent_resistance, 0.20), (bars[-1]["close"] + risk_unit * 0.8, 0.15)])
+    else:
+        t_buy_target = _weighted_avg([(recent_support, 0.30), (vwap_lower, 0.25), (s1, 0.25), (ma_support, 0.20)])
+        t_sell_target = _weighted_avg([(recent_resistance, 0.30), (vwap_upper, 0.25), (r1, 0.25), (ma_resistance, 0.20)])
+    t_buy_target = max(t_buy_target, 0.0)
+    t_sell_target = max(t_sell_target, 0.0)
+    min_gap = risk_unit * (1.1 if structure in ("trend_up", "range") else 0.9)
+    if t_buy_target > 0 and t_sell_target > 0 and t_sell_target - t_buy_target < min_gap:
+        mid = (t_buy_target + t_sell_target) / 2
+        t_buy_target = max(mid - min_gap / 2, 0.0)
+        t_sell_target = mid + min_gap / 2
     t_spread_pct = (t_sell_target - t_buy_target) / t_buy_target * 100 if t_buy_target > 0 and t_sell_target > t_buy_target else 0.0
     buy_conf = _assess_confidence([v for v in [recent_support, vwap_lower, s1, ma_support] if v > 0])
     sell_conf = _assess_confidence([v for v in [recent_resistance, vwap_upper, r1, ma_resistance] if v > 0])
     conf_rank = {"高": 2, "中": 1, "低": 0}
     overall_conf = buy_conf if conf_rank.get(buy_conf, 0) <= conf_rank.get(sell_conf, 0) else sell_conf
+    intraday_trend_pct = (bars[-1]["close"] - bars[0]["open"]) / bars[0]["open"] * 100 if bars[0]["open"] > 0 else 0.0
+    day_range_pct = (max(bar["high"] for bar in bars) - min(bar["low"] for bar in bars)) / bars[0]["open"] * 100 if bars[0]["open"] > 0 else 0.0
     return IntradayAnalysis(
         vwap=round(vwap, 2),
         pivot_highs=pivot_highs,
@@ -288,6 +373,10 @@ def compute_intraday_analysis(code: str, rule: StockRule, bars: List[Dict], yest
         t_spread_pct=round(t_spread_pct, 1),
         confidence=overall_conf,
         bar_count=len(bars),
+        structure=structure,
+        risk_unit=round(risk_unit, 3),
+        intraday_trend_pct=round(intraday_trend_pct, 2),
+        day_range_pct=round(day_range_pct, 2),
     )
 
 
@@ -298,12 +387,19 @@ def adjust_for_strategy(analysis: IntradayAnalysis, rule: StockRule) -> Intraday
     if (rule.watch_mode or "").lower() == "light":
         analysis.t_buy_target = 0.0
         analysis.confidence = "低"
-    elif "顺T" in strategy and analysis.t_buy_target > analysis.vwap:
-        analysis.t_buy_target = round(analysis.vwap * 0.997, 2)
+    elif "顺T" in strategy:
+        if analysis.structure == "trend_up" and analysis.t_buy_target > 0:
+            analysis.t_buy_target = round(min(analysis.t_buy_target, analysis.vwap - analysis.risk_unit * 0.2), 2)
+        elif analysis.structure not in ("trend_up", "range"):
+            analysis.confidence = rank_conf.get(max(conf_rank.get(analysis.confidence, 0) - 1, 0), "低")
     elif "逆T" in strategy:
         analysis.confidence = rank_conf.get(max(conf_rank.get(analysis.confidence, 0) - 1, 0), "低")
+        if analysis.structure != "panic_rebound":
+            analysis.t_buy_target = round(max(analysis.t_buy_target - analysis.risk_unit * 0.3, 0.0), 2)
     elif "箱体" in strategy and analysis.t_spread_pct < 1.5:
         analysis.confidence = "低"
+    if "箱体" in strategy and analysis.structure != "range":
+        analysis.confidence = rank_conf.get(max(conf_rank.get(analysis.confidence, 0) - 1, 0), "低")
     return analysis
 
 
@@ -374,8 +470,11 @@ def detect_panic_rebound(rule: StockRule, quote: Dict, market: MarketContext) ->
 
 def derive_signal_action(analysis: IntradayAnalysis, rule: StockRule, quote: Dict, market: MarketContext) -> str:
     price = float(quote.get("price", 0) or 0)
-    near_buy = analysis.t_buy_target > 0 and price <= analysis.t_buy_target * 1.01
-    near_sell = analysis.t_sell_target > 0 and price >= analysis.t_sell_target * 0.99
+    risk_band = max(analysis.risk_unit * 0.35, price * 0.002 if price > 0 else 0.0)
+    near_buy = analysis.t_buy_target > 0 and price <= analysis.t_buy_target + risk_band
+    near_sell = analysis.t_sell_target > 0 and price >= analysis.t_sell_target - risk_band
+    if analysis.structure == "trend_down" and near_buy:
+        return "wait"
     if near_buy and not near_sell:
         return "buy"
     if near_sell and not near_buy:
@@ -408,6 +507,18 @@ def opportunity_score(
     elif analysis.t_spread_pct >= 1.2:
         score += 12
         reasons.append(f"预期价差{analysis.t_spread_pct:.1f}%")
+    if analysis.structure == "trend_up":
+        score += 10
+        reasons.append("趋势回踩结构")
+    elif analysis.structure == "range":
+        score += 8
+        reasons.append("箱体回转结构")
+    elif analysis.structure == "panic_rebound":
+        score += 12
+        reasons.append("恐慌反抽结构")
+    elif analysis.structure == "trend_down":
+        score -= 12
+        reasons.append("分时下压结构")
     if action == "buy":
         score += 18
         reasons.append("贴近T买点")
@@ -429,6 +540,9 @@ def opportunity_score(
     elif learning.bias == "defensive":
         score -= 12
         reasons.append(f"近端实盘偏弱({learning.sample_count}笔)")
+    if learning.preferred_structure and learning.preferred_structure == analysis.structure:
+        score += 6
+        reasons.append(f"结构复盘偏好({analysis.structure})")
     score = max(0, min(score, 100))
     level = "S" if score >= 75 else ("A" if score >= 60 else ("B" if score >= 40 else "C"))
     return score, level, " / ".join(reasons) or "等待更优位置", action
@@ -493,6 +607,7 @@ def format_t_signal(
         f"机会评分：{score}/100 ({level})\n"
         f"核心依据：{reason}\n"
         f"VWAP：{analysis.vwap:.2f} / MA20：{analysis.ma20:.2f} / MA60：{analysis.ma60:.2f}\n"
+        f"结构：{analysis.structure} / 波动单位：{analysis.risk_unit:.3f}\n"
         f"建议动作：{action}\n"
         f"{trigger_line}\n"
         f"{target_line}\n"
@@ -500,7 +615,9 @@ def format_t_signal(
         f"当前下单参考：{price:.2f}\n"
         f"自动交易：{auto_line}\n"
         f"{abort_line}\n"
-        f"学习状态：样本{learning.sample_count} 胜率{learning.win_rate:.0%} 单笔均值{learning.avg_profit:.2f}\n"
+        f"学习状态：样本{learning.sample_count} 胜率{learning.win_rate:.0%} 单笔均值{learning.avg_profit:.2f}"
+        f" 风险系数{learning.risk_factor:.2f}"
+        f"{(' 偏好结构' + learning.preferred_structure) if learning.preferred_structure else ''}\n"
         f"{format_market_context(market)}\n"
         f"提示：消息已给出明确买卖点，自动交易仅在高分信号下触发。"
     )

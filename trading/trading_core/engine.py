@@ -328,14 +328,27 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                 portfolio_state=portfolio_state,
                 state=state,
                 selection_mode=day_mode,
+                planned_buy_shares=suggested_buy_shares,
+                planned_sell_shares=suggested_sell_shares,
             )
-            review_engine.append_decision(rule, playbook, market_regime, decision, quote, selection=selection)
+            review_engine.append_decision(
+                rule,
+                playbook,
+                market_regime,
+                decision,
+                quote,
+                selection={
+                    **selection,
+                    "analysis_structure": analysis.structure,
+                    "analysis_risk_unit": analysis.risk_unit,
+                },
+            )
             if decision.action in ("buy", "sell") and should_send_t_signal(state, rule.code, t_signal_cooldown, t_signal_max_per_day):
                 trade_shares = suggested_buy_shares if decision.action == "buy" else suggested_sell_shares
                 if trade_shares <= 0:
                     trade_shares = rule.per_trade_shares
                 active_budget = buy_budget if decision.action == "buy" else sell_budget
-                message = format_decision_message(rule, decision, market_regime, learning)
+                message = format_decision_message(rule, decision, market_regime, learning, analysis)
                 message += (
                     f"\n观察池分组：{pool_action} / 时段模式：AM {am_mode or '-'} / PM {pm_mode or '-'} / 当前 {day_mode or '-'}"
                     f" / 买预算：{buy_budget:.0f} / 卖预算：{sell_budget:.0f} / 当前预算：{active_budget:.0f} / 建议做T股数：{trade_shares}"
@@ -354,7 +367,7 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
                         sent_count += 1
                 if auto_trade_allowed and not dry_run and pool_action == "focus" and decision.allow_auto_trade:
-                    exec_result = command_service.create_and_execute_command(
+                    exec_result = command_service.create_and_execute_command_result(
                         stock_code=rule.code,
                         action=decision.action,
                         price=decision.execution_price or float(quote["price"]),
@@ -362,19 +375,20 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                         reason=f"{decision.playbook_name} {decision.level} {phase}",
                         source="decision-engine-auto",
                     )
-                    stock_intraday = state.setdefault("intraday", {}).setdefault(rule.code, {"date": today_str})
-                    if stock_intraday.get("date") != today_str:
-                        stock_intraday.clear()
-                        stock_intraday["date"] = today_str
-                    last_auto_action = str(stock_intraday.get("last_auto_action", "") or "")
-                    if last_auto_action and last_auto_action != decision.action:
-                        stock_intraday["round_trip_count"] = int(stock_intraday.get("round_trip_count", 0) or 0) + 1
-                    stock_intraday["last_auto_action"] = decision.action
-                    stock_intraday["auto_trade_count"] = int(stock_intraday.get("auto_trade_count", 0) or 0) + 1
-                    print(exec_result)
+                    if exec_result.get("ok"):
+                        stock_intraday = state.setdefault("intraday", {}).setdefault(rule.code, {"date": today_str})
+                        if stock_intraday.get("date") != today_str:
+                            stock_intraday.clear()
+                            stock_intraday["date"] = today_str
+                        last_trade_action = str(stock_intraday.get("last_trade_action", "") or "")
+                        if last_trade_action and last_trade_action != decision.action:
+                            stock_intraday["round_trip_count"] = int(stock_intraday.get("round_trip_count", 0) or 0) + 1
+                        stock_intraday["last_trade_action"] = decision.action
+                        stock_intraday["auto_trade_count"] = int(stock_intraday.get("auto_trade_count", 0) or 0) + 1
+                        auto_trade_count += 1
+                        portfolio_state = command_service.get_execution_book().load_portfolio_state()
+                    print(exec_result["message"])
                     print("-" * 60)
-                    auto_trade_count += 1
-                    portfolio_state = command_service.get_execution_book().load_portfolio_state()
                 continue
         if not signal_type:
             continue

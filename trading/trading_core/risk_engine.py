@@ -15,6 +15,8 @@ def evaluate_risk(
     state: Dict,
     action: str,
     score: int,
+    planned_buy_shares: int = 0,
+    planned_sell_shares: int = 0,
 ) -> RiskDecision:
     flags = []
     if action == "wait":
@@ -37,7 +39,8 @@ def evaluate_risk(
         flags.append("round_trip_limit")
 
     stock_state = _stock_intraday_position(portfolio_state, rule.code)
-    if action == "sell" and int(stock_state.get("available_to_sell", 0) or 0) < int(rule.per_trade_shares):
+    sell_shares = int(planned_sell_shares or rule.per_trade_shares or 0)
+    if action == "sell" and int(stock_state.get("available_to_sell", 0) or 0) < sell_shares:
         return RiskDecision(False, False, "可卖底仓不足，禁止自动卖出", ["insufficient_sellable"])
     if action == "buy" and market_regime.regime == "panic" and not market_regime.allow_reverse_t:
         return RiskDecision(False, False, "恐慌盘未开放逆T", ["panic_reverse_blocked"])

@@ -39,6 +39,8 @@ class ReviewEngine:
             "stock_name": rule.name,
             "playbook": playbook.name,
             "market_regime": market_regime.regime,
+            "analysis_structure": selection.get("analysis_structure", ""),
+            "analysis_risk_unit": float(selection.get("analysis_risk_unit", 0) or 0),
             "selection_action": selection.get("action", ""),
             "selection_am_mode": selection.get("am_mode", selection.get("selection_am_mode", "")),
             "selection_pm_mode": selection.get("pm_mode", selection.get("selection_pm_mode", "")),

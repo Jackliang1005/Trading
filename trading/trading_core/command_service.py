@@ -7,11 +7,11 @@ from typing import Dict, Optional, Tuple
 from .concept_agent import get_weekly_hot_concepts
 from .execution import TradingExecutionBook
 from .notifier import send_feishu
-from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG, FOCUS_LIST_PATH, HOT_CONCEPTS_CACHE_PATH, NEWS_SNAPSHOTS_CACHE_PATH, UNIVERSE_STATE_PATH
+from .paths import BASE_DIR, DAILY_PLAN_PATH, DEFAULT_CONFIG, FOCUS_LIST_PATH, HOT_CONCEPTS_CACHE_PATH, LEARNING_SNAPSHOT_PATH, NEWS_SNAPSHOTS_CACHE_PATH, STATE_PATH, UNIVERSE_STATE_PATH
 from .qmt2http_client import Qmt2HttpClient
 from .recorder import TradingRecorder
 from .review_engine import ReviewEngine
-from .storage import atomic_write_json, load_json
+from .storage import atomic_write_json, load_json, load_state, save_state
 
 
 DEFAULT_TARGET = "ou_f7d5ef82efd4396dea7a604691c56f75"
@@ -22,6 +22,7 @@ class TradingCommandService:
         self.base_dir = Path(base_dir)
         self.config_path = self.base_dir / DEFAULT_CONFIG.name
         self.daily_plan_path = self.base_dir / DAILY_PLAN_PATH.name
+        self.state_path = self.base_dir / STATE_PATH.parent.name / STATE_PATH.name
 
     def load_base_config(self) -> Dict:
         return load_json(self.config_path, {"stocks": []})
@@ -59,6 +60,9 @@ class TradingCommandService:
 
     def load_universe_state(self) -> Dict:
         return load_json(UNIVERSE_STATE_PATH, {"updated_at": "", "stocks": []})
+
+    def load_learning_snapshot(self) -> Dict:
+        return load_json(LEARNING_SNAPSHOT_PATH, {"updated_at": "", "stocks": {}})
 
     def get_qmt2http_client(self) -> Qmt2HttpClient:
         config = self.get_qmt2http_config()
@@ -224,7 +228,8 @@ class TradingCommandService:
                 f"重点 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
                 f"模式{item.get('am_mode', '-')}/{item.get('pm_mode', '-')}"
                 f" 买预算{item.get('buy_budget_amount', 0):.0f} 卖预算{item.get('sell_budget_amount', 0):.0f}"
-                f" 仓位{item.get('suggested_t_ratio', 0):.0%} 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)} "
+                f" 仓位{item.get('suggested_t_ratio', 0):.0%} 风险系数{item.get('learning_risk_factor', 1.0):.2f}"
+                f" 偏好结构{item.get('learning_preferred_structure', '-') or '-'} 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)} "
                 f"{item.get('reason', '')}"
             )
             if item.get("explanation"):
@@ -236,7 +241,8 @@ class TradingCommandService:
                 f"观察 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
                 f"模式{item.get('am_mode', '-')}/{item.get('pm_mode', '-')}"
                 f" 买预算{item.get('buy_budget_amount', 0):.0f} 卖预算{item.get('sell_budget_amount', 0):.0f}"
-                f" 仓位{item.get('suggested_t_ratio', 0):.0%} 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)} "
+                f" 仓位{item.get('suggested_t_ratio', 0):.0%} 风险系数{item.get('learning_risk_factor', 1.0):.2f}"
+                f" 偏好结构{item.get('learning_preferred_structure', '-') or '-'} 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)} "
                 f"{item.get('reason', '')}"
             )
             if item.get("explanation"):
@@ -266,6 +272,8 @@ class TradingCommandService:
                 f" score={item.get('selection_score', '-')}"
                 f" buy_budget={item.get('selection_buy_budget_amount', 0):.0f}"
                 f" sell_budget={item.get('selection_sell_budget_amount', 0):.0f}"
+                f" risk_factor={item.get('selection_learning_risk_factor', 1.0):.2f}"
+                f" preferred={item.get('selection_learning_preferred_structure', '-') or '-'}"
                 f" ratio={item.get('selection_ratio', 0):.0%}"
                 f" buy_shares={item.get('selection_buy_shares', 0)}"
                 f" sell_shares={item.get('selection_sell_shares', 0)}"
@@ -326,10 +334,20 @@ class TradingCommandService:
         if data.get("latest_hot_concepts_date"):
             top_names = [f"{str(item.get('name', '')).strip()}#{item.get('rank', '-')}" for item in data.get("latest_hot_concepts", [])[:5] if str(item.get("name", "")).strip()]
             lines.append(f"最新题材日 {data.get('latest_hot_concepts_date')} {' / '.join(top_names)}")
+        learning_top = data.get("learning_snapshot_top", []) if isinstance(data.get("learning_snapshot_top"), list) else []
+        if learning_top:
+            items = [
+                f"{item.get('code')}:{item.get('risk_factor', 1.0):.2f}/{item.get('preferred_structure', '-') or '-'}"
+                for item in learning_top[:5]
+            ]
+            lines.append(f"学习快照 {' / '.join(items)}")
         for item in data.get("focus", [])[:5]:
             lines.append(
                 f"重点 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
                 f"模式{item.get('am_mode', '-')}/{item.get('pm_mode', '-')}"
+                f" 风险系数{item.get('learning_risk_factor', 1.0):.2f}"
+                f" 偏好结构{item.get('learning_preferred_structure', '-') or '-'}"
+                f" 买股数{item.get('suggested_buy_shares', 0)} 卖股数{item.get('suggested_sell_shares', 0)}"
             )
             if item.get("explanation"):
                 lines.append(f"说明 {item.get('explanation')}")
@@ -347,7 +365,7 @@ class TradingCommandService:
         return "\n".join(lines)
 
     @staticmethod
-    def format_info_status(news_cache: Dict, concept_cache: Dict) -> str:
+    def format_info_status(news_cache: Dict, concept_cache: Dict, learning_snapshot: Dict | None = None) -> str:
         lines = ["信息状态"]
         lines.append(
             f"新闻缓存 更新时间{news_cache.get('updated_at', '-') or '-'} "
@@ -359,6 +377,12 @@ class TradingCommandService:
         lines.append(
             f"题材缓存 更新时间{concept_cache.get('updated_at', '-') or '-'} "
             f"最新题材日{latest_day or '-'} 时段{latest_slot}"
+        )
+        learning_snapshot = learning_snapshot or {"updated_at": "", "stocks": {}}
+        stock_count = len(learning_snapshot.get("stocks", {})) if isinstance(learning_snapshot.get("stocks"), dict) else 0
+        lines.append(
+            f"学习快照 更新时间{learning_snapshot.get('updated_at', '-') or '-'} "
+            f"股票数{stock_count}"
         )
         lines.append("新闻刷新规则 盘前1次 + 开盘/上午中段/上午尾段/下午前段/下午尾段 各1次，同一时段读缓存")
         lines.append("题材刷新规则 盘前不抢刷今日题材，09:30后按 open/mid_am/late_am/early_pm/late_pm/post_close 分段刷新")
@@ -385,12 +409,19 @@ class TradingCommandService:
         )
 
     def execute_command_via_qmt2http(self, command_id: str) -> str:
+        return self.execute_command_via_qmt2http_result(command_id)["message"]
+
+    def execute_command_via_qmt2http_result(self, command_id: str) -> Dict:
         book = self.get_execution_book()
         command = book.find_command(command_id)
         if not command:
-            return f"未找到指令 {command_id}"
+            return {"ok": False, "message": f"未找到指令 {command_id}", "command": None}
         if command.get("status") in ("executed", "cancelled"):
-            return f"指令已是 {command.get('status')} 状态：\n{self.format_command_brief(command)}"
+            return {
+                "ok": False,
+                "message": f"指令已是 {command.get('status')} 状态：\n{self.format_command_brief(command)}",
+                "command": command,
+            }
         client = self.get_qmt2http_client()
         try:
             response = client.place_order(
@@ -403,7 +434,12 @@ class TradingCommandService:
             )
         except Exception as exc:
             book.mark_command_failed(command["id"], "qmt2http", str(exc))
-            return f"qmt2http 下单失败：{exc}\n{self.format_command_brief(book.find_command(command['id']) or command)}"
+            failed = book.find_command(command["id"]) or command
+            return {
+                "ok": False,
+                "message": f"qmt2http 下单失败：{exc}\n{self.format_command_brief(failed)}",
+                "command": failed,
+            }
 
         data = response.get("data", {}) if isinstance(response, dict) else {}
         broker_order_id = (
@@ -420,10 +456,15 @@ class TradingCommandService:
             broker_response=response,
             note="已通过 qmt2http 提交",
         ) or command
-        return (
-            f"已通过 qmt2http 提交：\n{self.format_command_brief(submitted)}\n"
-            f"券商单号：{submitted.get('broker_order_id') or '-'}"
-        )
+        return {
+            "ok": True,
+            "message": (
+                f"已通过 qmt2http 提交：\n{self.format_command_brief(submitted)}\n"
+                f"券商单号：{submitted.get('broker_order_id') or '-'}"
+            ),
+            "command": submitted,
+            "response": response,
+        }
 
     def cancel_command_via_qmt2http(self, command_id: str) -> str:
         book = self.get_execution_book()
@@ -458,9 +499,20 @@ class TradingCommandService:
         reason: str,
         source: str,
     ) -> str:
+        return self.create_and_execute_command_result(stock_code, action, price, quantity, reason, source)["message"]
+
+    def create_and_execute_command_result(
+        self,
+        stock_code: str,
+        action: str,
+        price: float,
+        quantity: int,
+        reason: str,
+        source: str,
+    ) -> Dict:
         validation_error = self.validate_trade_params(stock_code, action, price, quantity)
         if validation_error:
-            return validation_error
+            return {"ok": False, "message": validation_error, "command": None}
         command = self.get_execution_book().create_command(
             stock_code=stock_code,
             action=action,
@@ -469,7 +521,27 @@ class TradingCommandService:
             reason=reason,
             source=source,
         )
-        return self.execute_command_via_qmt2http(command["id"])
+        return self.execute_command_via_qmt2http_result(command["id"])
+
+    def mark_trade_state(self, stock_code: str, action: str, auto_trade: bool = False) -> Dict:
+        state = load_state(self.state_path)
+        today = datetime.now().strftime("%Y-%m-%d")
+        stock_intraday = state.setdefault("intraday", {}).setdefault(stock_code, {"date": today})
+        if stock_intraday.get("date") != today:
+            stock_intraday.clear()
+            stock_intraday["date"] = today
+        last_trade_action = str(stock_intraday.get("last_trade_action", "") or "")
+        action_name = str(action or "").strip().lower()
+        if last_trade_action and action_name and last_trade_action != action_name:
+            stock_intraday["round_trip_count"] = int(stock_intraday.get("round_trip_count", 0) or 0) + 1
+        if action_name:
+            stock_intraday["last_trade_action"] = action_name
+        if auto_trade:
+            stock_intraday["auto_trade_count"] = int(stock_intraday.get("auto_trade_count", 0) or 0) + 1
+        else:
+            stock_intraday["manual_trade_count"] = int(stock_intraday.get("manual_trade_count", 0) or 0) + 1
+        save_state(state, self.state_path)
+        return stock_intraday
 
     def validate_trade_params(self, stock_code: str, action: str, price: float, quantity: int) -> str:
         code = str(stock_code or "").strip()
@@ -526,7 +598,7 @@ class TradingCommandService:
         if text in ("T 信息状态", "T 数据状态", "T info-status"):
             news_cache = load_json(NEWS_SNAPSHOTS_CACHE_PATH, {"updated_at": "", "refresh_slot": ""})
             concept_cache = load_json(HOT_CONCEPTS_CACHE_PATH, {"updated_at": "", "refresh_slots": {}})
-            return self.format_info_status(news_cache, concept_cache)
+            return self.format_info_status(news_cache, concept_cache, self.load_learning_snapshot())
         if text in ("T 通道状态", "T qmt状态", "T qmt-status"):
             return self.format_qmt_status(self.get_qmt2http_client().probe_status())
         matched = re.match(
@@ -742,6 +814,7 @@ class TradingCommandService:
             note = (matched.group(5) or "").strip() or "飞书回执买入"
             trade = self.get_recorder().record_trade(matched.group(2), "buy", float(matched.group(3)), int(matched.group(4)), note)
             portfolio = self.get_execution_book().record_execution(matched.group(2), "buy", float(matched.group(3)), int(matched.group(4)), note)
+            self.mark_trade_state(matched.group(2), "buy", auto_trade=False)
             summary = self.get_recorder().get_daily_summary()
             return (
                 f"已记录买入成交：{trade['stock_name']} {trade['quantity']}股 @ {trade['price']:.2f}\n"
@@ -753,6 +826,7 @@ class TradingCommandService:
             note = (matched.group(5) or "").strip() or "飞书回执卖出"
             trade = self.get_recorder().record_trade(matched.group(2), "sell", float(matched.group(3)), int(matched.group(4)), note)
             portfolio = self.get_execution_book().record_execution(matched.group(2), "sell", float(matched.group(3)), int(matched.group(4)), note)
+            self.mark_trade_state(matched.group(2), "sell", auto_trade=False)
             summary = self.get_recorder().get_daily_summary()
             profit_note = f"，本笔盈亏 {trade.get('profit', 0):.2f}元" if trade.get("profit") else ""
             return (

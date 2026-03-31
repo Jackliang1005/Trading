@@ -348,7 +348,7 @@ class TradingExecutionBook:
         return None
 
     def match_pending_command(self, stock_code: str, action: str) -> Optional[Dict]:
-        for item in self.list_commands(["pending", "acknowledged"]):
+        for item in self.list_commands(["pending", "acknowledged", "submitted"]):
             if item.get("stock_code") == stock_code and item.get("action") == action:
                 return item
         return None

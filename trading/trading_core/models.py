@@ -20,6 +20,10 @@ class IntradayAnalysis:
     t_spread_pct: float
     confidence: str
     bar_count: int
+    structure: str = "neutral"
+    risk_unit: float = 0.0
+    intraday_trend_pct: float = 0.0
+    day_range_pct: float = 0.0
 
 
 @dataclass
@@ -61,6 +65,9 @@ class LearningProfile:
     win_rate: float
     avg_profit: float
     bias: str = "neutral"
+    risk_factor: float = 1.0
+    entry_tolerance: float = 1.0
+    preferred_structure: str = ""
 
 
 @dataclass
@@ -166,3 +173,5 @@ class SelectionResult:
     regime: str
     buy_blocked: bool = False
     buy_block_reason: str = ""
+    learning_risk_factor: float = 1.0
+    learning_preferred_structure: str = ""

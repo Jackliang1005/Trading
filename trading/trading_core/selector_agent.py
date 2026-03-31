@@ -5,6 +5,7 @@ from typing import Dict, List
 from .budget_agent import allocate_t_budget
 from .concept_agent import build_concept_snapshots, get_weekly_hot_concepts, summarize_hot_concepts
 from .execution import TradingExecutionBook
+from .learning import load_learning_profile, save_learning_snapshot
 from .models import MarketRegimeReport, SelectionResult, StockDataSnapshot, StockNewsSnapshot, StockRule
 from .paths import BASE_DIR, FOCUS_LIST_PATH, UNIVERSE_STATE_PATH
 from .storage import atomic_write_json, load_daily_plan, load_json, save_daily_plan
@@ -156,6 +157,8 @@ def select_focus_list(
 ) -> List[SelectionResult]:
     results: List[SelectionResult] = []
     concept_snapshots = build_concept_snapshots(rules, now=now)
+    learning_profiles = {rule.code: load_learning_profile(rule.code, base_dir=BASE_DIR) for rule in rules}
+    save_learning_snapshot(learning_profiles, base_dir=BASE_DIR)
     holding_values = {
         rule.code: float(rule.base_position) * float(data_snapshots[rule.code].price)
         for rule in rules
@@ -167,6 +170,7 @@ def select_focus_list(
         concept = concept_snapshots.get(rule.code, {})
         score = 35
         reasons = []
+        learning = learning_profiles.get(rule.code)
         if data.amplitude_pct >= 4.0:
             score += 18
             reasons.append(f"振幅{data.amplitude_pct:.1f}%适合做T")
@@ -255,6 +259,13 @@ def select_focus_list(
         if market_regime.regime == "panic" and "顺T" in rule.strategy:
             score -= 10
             reasons.append("恐慌市顺T降级")
+        if learning:
+            if learning.bias == "aggressive":
+                score += 5
+                reasons.append("复盘学习偏积极")
+            elif learning.bias == "defensive":
+                score -= 6
+                reasons.append("复盘学习偏防守")
         score = max(0, min(score, 100))
         ratio = _ratio_for_score(score, market_regime.regime)
         suggested_shares = int(rule.per_trade_shares * ratio / 0.25) if ratio > 0 else 0
@@ -328,15 +339,19 @@ def select_focus_list(
             regime=market_regime.regime,
             buy_blocked=buy_blocked,
             buy_block_reason=buy_block_reason,
+            learning_risk_factor=learning.risk_factor if learning else 1.0,
+            learning_preferred_structure=learning.preferred_structure if learning else "",
         ))
     ranked = sorted(results, key=lambda item: item.score, reverse=True)
     remaining_budget = _remaining_cash_budget(floating_cash_budget, data_snapshots)
+    risk_adjustments = {code: profile.risk_factor for code, profile in learning_profiles.items()}
     return allocate_t_budget(
         ranked,
         data_snapshots,
         holding_values,
         floating_cash_budget=remaining_budget,
         max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
+        risk_adjustments=risk_adjustments,
     )
 
 
@@ -375,6 +390,15 @@ def save_selection_outputs(results: List[SelectionResult], now: datetime | None 
         "focus": [item.__dict__ for item in results if item.action == "focus"][:5],
         "watch": [item.__dict__ for item in results if item.action == "watch"][:8],
         "avoid": [item.__dict__ for item in results if item.action == "avoid"][:12],
+        "learning_snapshot_top": [
+            {
+                "code": item.code,
+                "name": item.name,
+                "risk_factor": item.learning_risk_factor,
+                "preferred_structure": item.learning_preferred_structure,
+            }
+            for item in results[:8]
+        ],
         "peer_risk": [
             {
                 "code": item.code,
@@ -423,6 +447,8 @@ def sync_selection_to_daily_plan(rules: List[StockRule], results: List[Selection
             "selection_sell_shares": selection.suggested_sell_shares,
             "selection_buy_blocked": selection.buy_blocked,
             "selection_buy_block_reason": selection.buy_block_reason,
+            "selection_learning_risk_factor": selection.learning_risk_factor,
+            "selection_learning_preferred_structure": selection.learning_preferred_structure,
             "selection_reason": selection.reason,
             "selection_explanation": selection.explanation,
             "note": f"selector:{selection.action}/{selection.am_mode}->{selection.pm_mode} {selection.reason}",
@@ -456,12 +482,13 @@ def format_selection_report(results: List[SelectionResult], title: str = "盘前
     avoid_count = sum(1 for item in results if item.action == "avoid")
     lines.append(f"重点{focus_count} 观察{watch_count} 回避{avoid_count}")
     lines.append("")
-    lines.append("| 代码 | 名称 | 分组 | 模式 | 分数 | 买预算 | 卖预算 | 禁买 | 原因 |")
-    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |")
+    lines.append("| 代码 | 名称 | 分组 | 模式 | 分数 | 风险系数 | 偏好结构 | 买股数 | 卖股数 | 禁买 | 原因 |")
+    lines.append("| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | --- | --- |")
     for item in results[:10]:
         lines.append(
             f"| {item.code} | {item.name} | {item.action} | {item.am_mode}->{item.pm_mode} | {item.score} | "
-            f"{item.buy_budget_amount:.0f} | {item.sell_budget_amount:.0f} | "
+            f"{item.learning_risk_factor:.2f} | {item.learning_preferred_structure or '-'} | "
+            f"{item.suggested_buy_shares} | {item.suggested_sell_shares} | "
             f"{'是' if item.buy_blocked else '否'} | {_short_reason(item.buy_block_reason or item.reason)} |"
         )
     return "\n".join(lines)

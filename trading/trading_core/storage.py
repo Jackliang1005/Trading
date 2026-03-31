@@ -86,10 +86,37 @@ def upsert_plan_override(plan: Dict, rule: StockRule) -> Dict:
 
 
 def load_state(path: Path = STATE_PATH) -> Dict:
-    return load_json(path, {"signals": {}})
+    today = datetime.now().strftime("%Y-%m-%d")
+    default = {
+        "date": today,
+        "signals": {},
+        "summary_push": {},
+        "zones": {},
+        "intraday": {},
+        "yesterday_cache": {"date": today},
+        "context_refresh": {"date": today},
+    }
+    data = load_json(path, default)
+    if data.get("date") != today:
+        return deepcopy(default)
+    if not isinstance(data.get("signals"), dict):
+        data["signals"] = {}
+    if not isinstance(data.get("summary_push"), dict):
+        data["summary_push"] = {}
+    if not isinstance(data.get("zones"), dict):
+        data["zones"] = {}
+    if not isinstance(data.get("intraday"), dict):
+        data["intraday"] = {}
+    if not isinstance(data.get("yesterday_cache"), dict):
+        data["yesterday_cache"] = {"date": today}
+    if not isinstance(data.get("context_refresh"), dict):
+        data["context_refresh"] = {"date": today}
+    data["date"] = today
+    return data
 
 
 def save_state(state: Dict, path: Path = STATE_PATH) -> None:
+    state["date"] = datetime.now().strftime("%Y-%m-%d")
     atomic_write_json(path, state)
 
 
