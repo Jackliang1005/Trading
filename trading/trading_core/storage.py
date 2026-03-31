@@ -131,6 +131,7 @@ def parse_rules(config: Dict) -> List[StockRule]:
                 ).strip(),
             )
         )
-    for rule in rules:
+    enabled_rules = [rule for rule in rules if rule.enabled]
+    for rule in enabled_rules:
         apply_rule_mode_defaults(rule)
-    return rules
+    return enabled_rules

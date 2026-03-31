@@ -211,7 +211,8 @@ class TradingCommandService:
         for mode, stats in summary.get("mode_stats", {}).items():
             lines.append(
                 f"{mode} 决策{stats.get('count', 0)} 买{stats.get('buy', 0)} "
-                f"卖{stats.get('sell', 0)} 观望{stats.get('wait', 0)} 自动候选{stats.get('auto', 0)}"
+                f"卖{stats.get('sell', 0)} 观望{stats.get('wait', 0)} 自动候选{stats.get('auto', 0)} "
+                f"已实现盈亏{stats.get('realized_profit', 0.0):.2f} 胜{stats.get('wins', 0)} 负{stats.get('losses', 0)}"
             )
         return "\n".join(lines)
 
@@ -457,6 +458,9 @@ class TradingCommandService:
         reason: str,
         source: str,
     ) -> str:
+        validation_error = self.validate_trade_params(stock_code, action, price, quantity)
+        if validation_error:
+            return validation_error
         command = self.get_execution_book().create_command(
             stock_code=stock_code,
             action=action,
@@ -466,6 +470,33 @@ class TradingCommandService:
             source=source,
         )
         return self.execute_command_via_qmt2http(command["id"])
+
+    def validate_trade_params(self, stock_code: str, action: str, price: float, quantity: int) -> str:
+        code = str(stock_code or "").strip()
+        if not code:
+            return "证券代码不能为空"
+        try:
+            price_val = float(price)
+        except (TypeError, ValueError):
+            return "价格格式错误"
+        try:
+            quantity_val = int(quantity)
+        except (TypeError, ValueError):
+            return "数量格式错误"
+        if price_val <= 0:
+            return "价格必须大于 0"
+        if quantity_val <= 0:
+            return "数量必须大于 0"
+        if quantity_val % 100 != 0:
+            return "A股数量必须是 100 股整数倍"
+        if quantity_val > 1000000:
+            return "单笔数量过大，请拆单后再下达"
+        if action == "sell":
+            portfolio = self.get_execution_book().load_portfolio_state()
+            available = int(portfolio.get("stocks", {}).get(code, {}).get("available_to_sell", 0) or 0)
+            if quantity_val > available:
+                return f"可卖数量不足：当前可卖 {available} 股"
+        return ""
 
     def handle_command(self, message: str) -> str:
         text = re.sub(r"\s+", " ", message.strip())
@@ -565,6 +596,14 @@ class TradingCommandService:
             base = stock_map.get(code)
             if not base:
                 return f"未找到股票代码 {code}"
+            validation_error = self.validate_trade_params(
+                code,
+                "buy" if action in ("买", "buy") else "sell",
+                float(matched.group(4)),
+                int(matched.group(5)),
+            )
+            if validation_error:
+                return validation_error
             command = self.get_execution_book().create_command(
                 stock_code=code,
                 action="buy" if action in ("买", "buy") else "sell",

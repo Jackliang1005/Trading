@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from .budget_agent import allocate_t_budget
 from .concept_agent import build_concept_snapshots, get_weekly_hot_concepts, summarize_hot_concepts
+from .execution import TradingExecutionBook
 from .models import MarketRegimeReport, SelectionResult, StockDataSnapshot, StockNewsSnapshot, StockRule
 from .paths import BASE_DIR, FOCUS_LIST_PATH, UNIVERSE_STATE_PATH
 from .storage import atomic_write_json, load_daily_plan, load_json, save_daily_plan
@@ -23,6 +24,45 @@ def _item_brief(item: Dict) -> str:
 def _selection_review_path(day: str = "") -> Path:
     value = day or datetime.now().strftime("%Y-%m-%d")
     return BASE_DIR / "trading_data" / f"selection_review_{value}.json"
+
+
+def _remaining_cash_budget(
+    floating_cash_budget: float,
+    data_snapshots: Dict[str, StockDataSnapshot],
+    base_dir: Path = BASE_DIR,
+) -> float:
+    budget = max(0.0, float(floating_cash_budget or 0.0))
+    if budget <= 0:
+        return 0.0
+    execution_book = TradingExecutionBook(base_dir=base_dir)
+    portfolio = execution_book.load_portfolio_state()
+    occupied = 0.0
+    for code, item in portfolio.get("stocks", {}).items():
+        quote = data_snapshots.get(code)
+        if not quote or quote.price <= 0:
+            continue
+        intraday_buy = int(item.get("intraday_buy", 0) or 0)
+        intraday_sell = int(item.get("intraday_sell", 0) or 0)
+        net_buy_qty = max(0, intraday_buy - intraday_sell)
+        occupied += net_buy_qty * float(quote.price)
+    pending_statuses = {"pending", "acknowledged", "submitted"}
+    for command in execution_book.load_command_book().get("commands", []):
+        if str(command.get("action", "")).lower() != "buy":
+            continue
+        if str(command.get("status", "")).lower() not in pending_statuses:
+            continue
+        quantity = int(command.get("quantity", 0) or 0)
+        if quantity <= 0:
+            continue
+        price = float(command.get("price", 0) or 0)
+        if price <= 0:
+            code = str(command.get("stock_code", "")).strip()
+            quote = data_snapshots.get(code)
+            if not quote or quote.price <= 0:
+                continue
+            price = float(quote.price)
+        occupied += quantity * price
+    return round(max(0.0, budget - occupied), 2)
 
 
 def _level(score: int) -> str:
@@ -290,11 +330,12 @@ def select_focus_list(
             buy_block_reason=buy_block_reason,
         ))
     ranked = sorted(results, key=lambda item: item.score, reverse=True)
+    remaining_budget = _remaining_cash_budget(floating_cash_budget, data_snapshots)
     return allocate_t_budget(
         ranked,
         data_snapshots,
         holding_values,
-        floating_cash_budget=floating_cash_budget,
+        floating_cash_budget=remaining_budget,
         max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
     )
 
@@ -357,7 +398,7 @@ def sync_selection_to_daily_plan(rules: List[StockRule], results: List[Selection
         if not selection:
             continue
         watch_mode = ""
-        enabled = True
+        enabled = rule.enabled
         if selection.action == "watch":
             watch_mode = "light"
         if selection.action == "avoid":

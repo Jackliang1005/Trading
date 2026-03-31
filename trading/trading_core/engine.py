@@ -366,6 +366,10 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     if stock_intraday.get("date") != today_str:
                         stock_intraday.clear()
                         stock_intraday["date"] = today_str
+                    last_auto_action = str(stock_intraday.get("last_auto_action", "") or "")
+                    if last_auto_action and last_auto_action != decision.action:
+                        stock_intraday["round_trip_count"] = int(stock_intraday.get("round_trip_count", 0) or 0) + 1
+                    stock_intraday["last_auto_action"] = decision.action
                     stock_intraday["auto_trade_count"] = int(stock_intraday.get("auto_trade_count", 0) or 0) + 1
                     print(exec_result)
                     print("-" * 60)

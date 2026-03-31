@@ -44,9 +44,54 @@ class TradingExecutionBook:
         default = {"updated_at": "", "source": "manual", "stocks": []}
         return load_json(self.initial_portfolio_db_path, default)
 
+    def load_config_data(self) -> Dict:
+        return load_json(self.config_path, {"stocks": []})
+
+    def save_config_data(self, data: Dict) -> None:
+        atomic_write_json(self.config_path, data)
+
     def save_initial_portfolio_db(self, data: Dict) -> None:
         data["updated_at"] = self._now()
         atomic_write_json(self.initial_portfolio_db_path, data)
+
+    def sync_portfolio_entry_to_config(
+        self,
+        stock_code: str,
+        base_position: int,
+        cost_price: float,
+        available_position: Optional[int] = None,
+        last_price: Optional[float] = None,
+        break_even_price: Optional[float] = None,
+    ) -> Dict:
+        config = self.load_config_data()
+        target = None
+        for item in config.get("stocks", []):
+            if str(item.get("code")) == str(stock_code):
+                target = item
+                break
+        if target is None:
+            target = {
+                "code": str(stock_code),
+                "name": str(stock_code),
+                "enabled": False,
+                "strategy": "观察",
+                "buy_range": [0.0, 0.0],
+                "sell_range": [0.0, 0.0],
+                "stop_loss": 0.0,
+                "per_trade_shares": 100,
+                "note": "由持仓库同步生成，待补全交易区间",
+            }
+            config.setdefault("stocks", []).append(target)
+        target["base_position"] = int(base_position)
+        target["cost_price"] = float(cost_price)
+        if available_position is not None:
+            target["available_position"] = int(available_position)
+        if last_price is not None:
+            target["last_price"] = float(last_price)
+        if break_even_price is not None:
+            target["break_even_price"] = float(break_even_price)
+        self.save_config_data(config)
+        return target
 
     def ensure_initial_portfolio_db(self) -> Dict:
         data = self.load_initial_portfolio_db()
@@ -100,6 +145,14 @@ class TradingExecutionBook:
         if break_even_price is not None:
             target["break_even_price"] = float(break_even_price)
         self.save_initial_portfolio_db(data)
+        self.sync_portfolio_entry_to_config(
+            stock_code=stock_code,
+            base_position=base_position,
+            cost_price=cost_price,
+            available_position=available_position,
+            last_price=last_price,
+            break_even_price=break_even_price,
+        )
         return target
 
     def rebuild_portfolio_state_from_initial(self) -> Dict:

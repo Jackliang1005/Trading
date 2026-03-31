@@ -17,6 +17,10 @@ class ReviewEngine:
         value = day or datetime.now().strftime("%Y-%m-%d")
         return self.data_dir / f"decision_journal_{value}.json"
 
+    def _trades_path(self, day: str = "") -> Path:
+        value = day or datetime.now().strftime("%Y-%m-%d")
+        return self.data_dir / f"trades_{value}.json"
+
     def append_decision(
         self,
         rule: StockRule,
@@ -87,15 +91,54 @@ class ReviewEngine:
         data = load_json(path, {"date": day or datetime.now().strftime("%Y-%m-%d"), "decisions": []})
         decisions = data.get("decisions", [])
         mode_stats: Dict[str, Dict] = {}
+        decision_rows = []
         for item in decisions:
+            decision_rows.append(item)
             for key in ("selection_am_mode", "selection_pm_mode"):
                 mode = item.get(key) or "unknown"
-                stats = mode_stats.setdefault(mode, {"count": 0, "buy": 0, "sell": 0, "wait": 0, "auto": 0})
+                stats = mode_stats.setdefault(
+                    mode,
+                    {"count": 0, "buy": 0, "sell": 0, "wait": 0, "auto": 0, "realized_profit": 0.0, "wins": 0, "losses": 0},
+                )
                 stats["count"] += 1
                 action = item.get("action", "wait")
                 stats[action] = stats.get(action, 0) + 1
                 if item.get("allow_auto_trade"):
                     stats["auto"] += 1
+        trades = load_json(self._trades_path(day), [])
+        for trade in trades:
+            if trade.get("operation") != "sell":
+                continue
+            profit = float(trade.get("profit", 0) or 0)
+            if profit == 0:
+                continue
+            stock_code = str(trade.get("stock_code", "")).strip()
+            trade_ts = str(trade.get("timestamp", "")).strip()
+            if not stock_code or not trade_ts:
+                continue
+            matched = None
+            for item in decision_rows:
+                if str(item.get("stock_code", "")).strip() != stock_code:
+                    continue
+                if str(item.get("timestamp", "")).strip() <= trade_ts:
+                    matched = item
+            if not matched:
+                continue
+            try:
+                trade_hour = datetime.strptime(trade_ts, "%Y-%m-%d %H:%M:%S").hour
+            except ValueError:
+                trade_hour = 15
+            mode = matched.get("selection_am_mode") if trade_hour < 13 else matched.get("selection_pm_mode")
+            mode = mode or "unknown"
+            stats = mode_stats.setdefault(
+                mode,
+                {"count": 0, "buy": 0, "sell": 0, "wait": 0, "auto": 0, "realized_profit": 0.0, "wins": 0, "losses": 0},
+            )
+            stats["realized_profit"] = round(float(stats.get("realized_profit", 0.0) or 0.0) + profit, 2)
+            if profit > 0:
+                stats["wins"] += 1
+            elif profit < 0:
+                stats["losses"] += 1
         return {
             "date": data.get("date"),
             "mode_stats": mode_stats,
