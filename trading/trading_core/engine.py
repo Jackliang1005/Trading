@@ -86,6 +86,21 @@ def mark_signal_sent(state: Dict, stock_code: str, signal_type: str) -> None:
     state.setdefault("signals", {}).setdefault(stock_code, {})[signal_type] = datetime.now().isoformat(timespec="seconds")
 
 
+def should_send_summary(state: Dict, summary_key: str, message: str) -> bool:
+    summaries = state.setdefault("summary_push", {})
+    cached = summaries.get(summary_key, {})
+    if not isinstance(cached, dict):
+        return True
+    return str(cached.get("message", "") or "") != str(message or "")
+
+
+def mark_summary_sent(state: Dict, summary_key: str, message: str) -> None:
+    state.setdefault("summary_push", {})[summary_key] = {
+        "sent_at": datetime.now().isoformat(timespec="seconds"),
+        "message": str(message or ""),
+    }
+
+
 def selection_refresh_slot(now: Optional[datetime] = None) -> str:
     now = now or datetime.now()
     hm = now.hour * 100 + now.minute
@@ -182,10 +197,12 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         print(selection_message)
         print("-" * 60)
         selection_signal_type = f"selection_report_{today}"
-        if should_send_signal(state, "system", selection_signal_type, 99999):
+        summary_key = "preopen_selection_report"
+        if should_send_signal(state, "system", selection_signal_type, 99999) and should_send_summary(state, summary_key, selection_message):
             delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
             if delivered:
                 mark_signal_sent(state, "system", selection_signal_type)
+                mark_summary_sent(state, summary_key, selection_message)
                 if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
                     sent_count += 1
         for rule in rules:
@@ -251,10 +268,12 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         print(selection_message)
         print("-" * 60)
         signal_type = "context_refresh_summary"
-        if should_send_signal(state, "system", signal_type, context_refresh_cooldown):
+        summary_key = "intraday_context_refresh"
+        if should_send_signal(state, "system", signal_type, context_refresh_cooldown) and should_send_summary(state, summary_key, selection_message):
             delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
             if delivered:
                 mark_signal_sent(state, "system", signal_type)
+                mark_summary_sent(state, summary_key, selection_message)
                 if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
                     sent_count += 1
     for rule in rules:
