@@ -107,3 +107,43 @@ class Qmt2HttpClient:
             "account_type": self.account_type or None,
         }
         return self._request("POST", "/api/trade/cancel", payload)
+
+    def query_positions(self) -> Dict:
+        params = {}
+        if self.account_id:
+            params["account_id"] = self.account_id
+        if self.account_type:
+            params["account_type"] = self.account_type
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/api/stock/positions?{qs}" if qs else "/api/stock/positions"
+        return self._request("GET", path)
+
+    def query_balance(self) -> Dict:
+        params = {}
+        if self.account_id:
+            params["account_id"] = self.account_id
+        if self.account_type:
+            params["account_type"] = self.account_type
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/api/stock/asset?{qs}" if qs else "/api/stock/asset"
+        return self._request("GET", path)
+
+    def query_today_orders(self) -> Dict:
+        params = {}
+        if self.account_id:
+            params["account_id"] = self.account_id
+        if self.account_type:
+            params["account_type"] = self.account_type
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/api/stock/orders?{qs}" if qs else "/api/stock/orders"
+        return self._request("GET", path)
+
+    def query_today_trades(self) -> Dict:
+        params = {}
+        if self.account_id:
+            params["account_id"] = self.account_id
+        if self.account_type:
+            params["account_type"] = self.account_type
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/api/stock/trades?{qs}" if qs else "/api/stock/trades"
+        return self._request("GET", path)

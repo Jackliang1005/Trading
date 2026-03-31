@@ -39,6 +39,8 @@ def allocate_t_budget(
         if item.am_mode == "observe_only" and item.pm_mode == "observe_only":
             buy_budget = 0.0
             sell_budget = 0.0
+        if item.buy_blocked:
+            buy_budget = 0.0
 
         buy_lot_shares = int(buy_budget / data.price / 100) * 100 if data.price > 0 else 0
         sell_lot_shares = int(sell_budget / data.price / 100) * 100 if data.price > 0 else 0

@@ -14,12 +14,13 @@
     "auto_trade_enabled": true
   },
   "monitor": {
-    "poll_seconds": 60,
-    "cooldown_minutes": 20,
+    "poll_seconds": 180,
+    "cooldown_minutes": 45,
     "only_trade_hours": true,
     "t_signal_enabled": true,
-    "t_signal_cooldown_minutes": 30,
-    "t_signal_max_per_day": 4,
+    "t_signal_cooldown_minutes": 90,
+    "t_signal_max_per_day": 2,
+    "context_refresh_cooldown_minutes": 120,
     "dynamic_range_threshold_pct": 8
   },
   "account": {
@@ -45,7 +46,7 @@
       "note": "当前离成本较近，优先作为修复账户的主做T票。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "688316",
       "name": "青云科技-U",
       "cost_price": 104.4211,
@@ -61,7 +62,7 @@
       "note": "波动较大，适合轻仓分段做T，不要连续加仓。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "688327",
       "name": "云从科技-U",
       "cost_price": 19.4646,
@@ -75,7 +76,7 @@
       "note": "持仓较大，只在箱体边缘做，避免中间位置频繁来回。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "300063",
       "name": "天龙集团",
       "cost_price": 16.7029,
@@ -89,7 +90,7 @@
       "note": "持仓大、价格低，适合固定股数做日内差价。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "002617",
       "name": "露笑科技",
       "cost_price": 22.0128,
@@ -102,7 +103,7 @@
       "note": "暂不启用，等出现更明确箱体后再纳入。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "000815",
       "name": "美利云",
       "cost_price": 69.2191,
@@ -117,7 +118,7 @@
       "note": "已纳入轻观察模式：保留卖出观察和风险提醒，默认不做逆T低吸，先跟踪趋势延续和流动性。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "300339",
       "name": "润和软件",
       "cost_price": 147.261,
@@ -130,7 +131,7 @@
       "note": "只有100股，提醒意义有限，除非你准备额外腾挪做T仓。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "300822",
       "name": "贝仕达克",
       "cost_price": 158.3904,
@@ -143,7 +144,7 @@
       "note": "持仓过小，优先级不高。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "002466",
       "name": "天齐锂业",
       "cost_price": 438.9029,
@@ -156,7 +157,7 @@
       "note": "只有100股，做T空间不大，先不纳入默认监控。"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "code": "605111",
       "name": "新洁能",
       "cost_price": 362.8006,

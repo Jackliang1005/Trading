@@ -39,6 +39,8 @@ class ReviewEngine:
             "selection_am_mode": selection.get("am_mode", selection.get("selection_am_mode", "")),
             "selection_pm_mode": selection.get("pm_mode", selection.get("selection_pm_mode", "")),
             "selection_reason": selection.get("reason", selection.get("selection_reason", "")),
+            "selection_buy_blocked": bool(selection.get("buy_blocked", selection.get("selection_buy_blocked", False))),
+            "selection_buy_block_reason": str(selection.get("buy_block_reason", selection.get("selection_buy_block_reason", "")) or ""),
             "price": float(quote.get("price", 0) or 0),
             "change_percent": float(quote.get("change_percent", 0) or 0),
             "action": decision.action,
@@ -61,6 +63,7 @@ class ReviewEngine:
         action_counts = {"buy": 0, "sell": 0, "wait": 0}
         playbook_counts = {}
         auto_candidates = 0
+        blocked_candidates = 0
         for item in decisions:
             action = item.get("action", "wait")
             action_counts[action] = action_counts.get(action, 0) + 1
@@ -68,12 +71,15 @@ class ReviewEngine:
             playbook_counts[playbook] = playbook_counts.get(playbook, 0) + 1
             if item.get("allow_auto_trade"):
                 auto_candidates += 1
+            if item.get("selection_buy_blocked"):
+                blocked_candidates += 1
         return {
             "date": data.get("date"),
             "decision_count": len(decisions),
             "action_counts": action_counts,
             "playbook_counts": playbook_counts,
             "auto_trade_candidates": auto_candidates,
+            "buy_blocked_candidates": blocked_candidates,
         }
 
     def build_mode_review(self, day: str = "") -> Dict:

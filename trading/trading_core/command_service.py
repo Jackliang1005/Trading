@@ -103,7 +103,14 @@ class TradingCommandService:
 
     @staticmethod
     def clear_risk_overrides(override: Dict) -> None:
-        for key in ("preopen_risk_mode", "avoid_reverse_t", "abandon_buy_below", "risk_notes"):
+        for key in (
+            "preopen_risk_mode",
+            "avoid_reverse_t",
+            "abandon_buy_below",
+            "risk_notes",
+            "buy_blocked",
+            "buy_block_reason",
+        ):
             override.pop(key, None)
 
     @staticmethod
@@ -185,6 +192,7 @@ class TradingCommandService:
             f"决策日报 {summary.get('date', '')}",
             f"总决策{summary.get('decision_count', 0)}",
             f"自动候选{summary.get('auto_trade_candidates', 0)}",
+            f"禁买命中{summary.get('buy_blocked_candidates', 0)}",
         ]
         action_counts = summary.get("action_counts", {})
         lines.append(
@@ -220,6 +228,8 @@ class TradingCommandService:
             )
             if item.get("explanation"):
                 lines.append(f"说明 {item.get('explanation')}")
+            if item.get("buy_blocked"):
+                lines.append(f"外盘风控 {item.get('buy_block_reason', '')}")
         for item in data.get("watch", [])[:5]:
             lines.append(
                 f"观察 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
@@ -230,6 +240,8 @@ class TradingCommandService:
             )
             if item.get("explanation"):
                 lines.append(f"说明 {item.get('explanation')}")
+            if item.get("buy_blocked"):
+                lines.append(f"外盘风控 {item.get('buy_block_reason', '')}")
         for item in data.get("avoid", [])[:3]:
             lines.append(
                 f"回避 {item.get('code')} {item.get('name')} 分数{item.get('score')} "
@@ -237,6 +249,8 @@ class TradingCommandService:
             )
             if item.get("explanation"):
                 lines.append(f"说明 {item.get('explanation')}")
+            if item.get("buy_blocked"):
+                lines.append(f"外盘风控 {item.get('buy_block_reason', '')}")
         return "\n".join(lines)
 
     @staticmethod
@@ -256,6 +270,8 @@ class TradingCommandService:
                 f" sell_shares={item.get('selection_sell_shares', 0)}"
                 f" default_shares={item.get('per_trade_shares', 0)}"
             )
+            if item.get("selection_buy_blocked") or item.get("buy_blocked"):
+                lines.append(f"外盘风控 {item.get('selection_buy_block_reason') or item.get('buy_block_reason', '')}")
         return "\n".join(lines)
 
     @staticmethod
@@ -316,6 +332,17 @@ class TradingCommandService:
             )
             if item.get("explanation"):
                 lines.append(f"说明 {item.get('explanation')}")
+            if item.get("buy_blocked"):
+                lines.append(f"外盘风控 {item.get('buy_block_reason', '')}")
+        for item in data.get("peer_risk", [])[:5]:
+            lines.append(
+                f"外盘风控 {item.get('code')} {item.get('name')} "
+                f"{item.get('buy_block_reason', '')}"
+            )
+        if data.get("avoid"):
+            blocked = [item for item in data.get("avoid", []) if item.get("buy_blocked")]
+            if blocked:
+                lines.append(f"禁买合计 {len(blocked)}")
         return "\n".join(lines)
 
     @staticmethod
@@ -452,9 +479,9 @@ class TradingCommandService:
             lines = [f"今日交易计划 {plan['date']}"]
             for _, base in stock_map.items():
                 merged = self.apply_today_overrides(base, plan)
-                if merged.get("enabled"):
-                    lines.append(self.format_stock_status(merged))
-            return "\n".join(lines) if len(lines) > 1 else f"今日交易计划 {plan['date']}\n当前没有启用的监控票"
+                action = merged.get("selection_action", "-")
+                lines.append(f"{self.format_stock_status(merged)} action={action}")
+            return "\n".join(lines) if len(lines) > 1 else f"今日交易计划 {plan['date']}\n当前没有配置监控票"
         if text in ("T 仓位", "T 持仓", "T portfolio"):
             return self.format_portfolio_status(self.get_execution_book().load_portfolio_state())
         if text in ("T 初始持仓", "T 持仓库", "T initial-portfolio"):
@@ -646,6 +673,31 @@ class TradingCommandService:
             override.pop("abandon_buy_below", None)
             self.save_daily_plan(plan)
             return f"已更新：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
+        matched = re.match(r"T\s*(外盘风险|同行风险|禁买)\s*(\d{6})(?:\s*(.*))?", text, re.IGNORECASE)
+        if matched:
+            code = matched.group(2)
+            reason = (matched.group(3) or "").strip() or "外盘同行走弱，禁止主动买入"
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override["enabled"] = True
+            override["buy_blocked"] = True
+            override["buy_block_reason"] = reason
+            override["avoid_reverse_t"] = True
+            self.save_daily_plan(plan)
+            return f"已设置外盘风险禁买：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
+        matched = re.match(r"T\s*(解除外盘风险|解除同行风险|解除禁买)\s*(\d{6})", text, re.IGNORECASE)
+        if matched:
+            code = matched.group(2)
+            base = stock_map.get(code)
+            if not base:
+                return f"未找到股票代码 {code}"
+            override = self.find_or_create_override(plan, code, base)
+            override.pop("buy_blocked", None)
+            override.pop("buy_block_reason", None)
+            self.save_daily_plan(plan)
+            return f"已解除外盘风险禁买：\n{self.format_stock_status(self.apply_today_overrides(base, plan))}"
         matched = re.match(r"T\s*(已买|买入成交)\s*(\d{6})\s*([0-9]+(?:\.[0-9]+)?)\s*([0-9]+)(?:\s*(.*))?", text, re.IGNORECASE)
         if matched:
             note = (matched.group(5) or "").strip() or "飞书回执买入"
@@ -674,7 +726,7 @@ class TradingCommandService:
             event = self.get_recorder().record_skip(matched.group(2), reason=(matched.group(3) or "").strip() or "盘口不成立，放弃执行")
             summary = self.get_recorder().get_daily_summary()
             return f"已记录放弃执行：{event['stock_name']}，原因：{event['reason']}\n今日累计：买入{summary.get('buy_count', 0)} 卖出{summary.get('sell_count', 0)} 放弃{summary.get('skip_count', 0)} 已实现盈亏{summary.get('total_profit', 0):.2f}元"
-        return "未识别指令。可用格式：T 状态 / T 仓位 / T 指令簿 / T 下达 卖 300475 158.6 100 / T 执行 1a2b3c4d / T 撤单 1a2b3c4d / T 直买 300475 155.2 100 / T 直卖 300475 158.6 100 / T 接单 1a2b3c4d / T 撤销 1a2b3c4d / T 成交日报 / T 开启 300475 / T 关闭 688316 / T 设置 300475 买154.8-155.6 卖158.2-160 止损153 数量100 / T 防守 300475 151.8 / T 放弃低吸 300475 151.8 / T 已买 300475 155.2 100 / T 已卖 300475 158.6 100 / T 放弃 300475 / T 重置"
+        return "未识别指令。可用格式：T 状态 / T 仓位 / T 指令簿 / T 下达 卖 300475 158.6 100 / T 执行 1a2b3c4d / T 撤单 1a2b3c4d / T 直买 300475 155.2 100 / T 直卖 300475 158.6 100 / T 接单 1a2b3c4d / T 撤销 1a2b3c4d / T 成交日报 / T 开启 300475 / T 关闭 688316 / T 设置 300475 买154.8-155.6 卖158.2-160 止损153 数量100 / T 防守 300475 151.8 / T 放弃低吸 300475 151.8 / T 外盘风险 300475 美光海力士隔夜大跌 / T 解除外盘风险 300475 / T 已买 300475 155.2 100 / T 已卖 300475 158.6 100 / T 放弃 300475 / T 重置"
 
     @staticmethod
     def send_reply(target: str, text: str) -> bool:

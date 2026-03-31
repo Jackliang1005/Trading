@@ -21,6 +21,8 @@ def evaluate_risk(
         return RiskDecision(False, False, "当前无执行动作", flags)
     if action == "buy" and not playbook.allow_buy:
         return RiskDecision(False, False, "当前playbook不允许买入", ["playbook_buy_blocked"])
+    if action == "buy" and rule.buy_blocked:
+        return RiskDecision(False, False, rule.buy_block_reason or "外盘同行走弱，禁止主动买入", ["peer_buy_blocked"])
     if action == "sell" and not playbook.allow_sell:
         return RiskDecision(False, False, "当前playbook不允许卖出", ["playbook_sell_blocked"])
     if action == "buy" and not market_regime.allow_buy:

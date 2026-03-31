@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-03-28 00:00:00",
-  "source": "manual-user-provided",
+  "updated_at": "2026-03-30 22:30:00",
+  "source": "qmt2http-sync",
   "account_overview": {
-    "available_cash": 92569.04,
-    "withdrawable_cash": 92569.04,
+    "available_cash": 51392.81,
+    "withdrawable_cash": 51392.81,
     "frozen_cash": 100.0,
     "pending_buy_amount": 0.0,
-    "stock_market_value": 204109.88,
-    "total_assets": 296778.92
+    "stock_market_value": 243343.73,
+    "total_assets": 294836.54
   },
   "stocks": [
     {
@@ -73,8 +73,8 @@
     {
       "code": "300475",
       "name": "香农芯创",
-      "base_position": 200,
-      "available_position": 200,
+      "base_position": 500,
+      "available_position": 500,
       "sell_frozen": 0,
       "cost_price": 158.6426,
       "break_even_price": 158.643,

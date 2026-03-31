@@ -131,6 +131,7 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
     t_signal_cooldown = int(monitor_cfg.get("t_signal_cooldown_minutes", 30))
     t_signal_max_per_day = int(monitor_cfg.get("t_signal_max_per_day", 4))
     dynamic_range_threshold = float(monitor_cfg.get("dynamic_range_threshold_pct", 8))
+    context_refresh_cooldown = int(monitor_cfg.get("context_refresh_cooldown_minutes", 120))
     auto_trade_enabled = bool(config.get("qmt2http", {}).get("auto_trade_enabled", False))
     account_cfg = config.get("account", {})
     floating_cash_budget = float(account_cfg.get("floating_cash_budget", 100000) or 100000)
@@ -175,7 +176,7 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         )
         save_selection_outputs(selections, now=now)
         sync_selection_to_daily_plan(rules, selections)
-        selection_message = format_selection_report(selections)
+        selection_message = format_selection_report(selections, title="盘前持仓做T筛选")
         if not qmt_status.get("trade_connected", False):
             selection_message += "\n通道状态：交易接口不可用，本轮自动交易已降级关闭。"
         print(selection_message)
@@ -246,11 +247,11 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         sync_selection_to_daily_plan(rules, refreshed_selections)
         selection_map = load_selection_map()
         refresh_state["slot"] = context_slot
-        selection_message = "盘中上下文刷新\n" + format_selection_report(refreshed_selections)
+        selection_message = format_selection_report(refreshed_selections, title="盘中上下文刷新")
         print(selection_message)
         print("-" * 60)
-        signal_type = f"context_refresh_{today_str}_{context_slot}"
-        if should_send_signal(state, "system", signal_type, 99999):
+        signal_type = "context_refresh_summary"
+        if should_send_signal(state, "system", signal_type, context_refresh_cooldown):
             delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
             if delivered:
                 mark_signal_sent(state, "system", signal_type)
@@ -353,6 +354,8 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     portfolio_state = command_service.get_execution_book().load_portfolio_state()
                 continue
         if not signal_type:
+            continue
+        if signal_type in ("buy", "rebound_buy") and day_mode in ("sell_only", "observe_only"):
             continue
         if signal_type in ("buy", "rebound_buy") and should_suppress_buy_signal(rule, quote, market):
             state.setdefault("zones", {})[rule.code] = "buy"

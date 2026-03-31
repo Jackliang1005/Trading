@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .models import IntradayAnalysis, LearningProfile, MarketContext, StockRule
 from .storage import _safe_float, upsert_plan_override
@@ -17,8 +17,8 @@ if str(SKILL_DIR) not in sys.path:
 from eastmoney_quotes import get_quotes  # type: ignore
 
 
-QMT2HTTP_BASE_URL = os.environ.get("QMT2HTTP_BASE_URL", "http://150.158.31.115")
-QMT2HTTP_API_TOKEN = os.environ.get("QMT2HTTP_API_TOKEN", "")
+QMT2HTTP_BASE_URL = os.environ.get("QMT2HTTP_BASE_URL", "http://150.158.31.115:8085").rstrip("/")
+QMT2HTTP_API_TOKEN = os.environ.get("QMT2HTTP_API_TOKEN", "998811")
 QMT2HTTP_TIMEOUT = int(os.environ.get("QMT2HTTP_TIMEOUT", "10"))
 MX_APIKEY = os.environ.get("MX_APIKEY", "")
 MX_API_BASE = "https://mkapi2.dfcfs.com/finskillshub"
@@ -34,15 +34,29 @@ def _qmt_code(code: str) -> str:
     return f"{code}.SZ"
 
 
+def _build_url_opener():
+    proxies = {}
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        value = os.environ.get(key, "").strip()
+        if not value:
+            continue
+        lower = key.lower()
+        if "https" in lower:
+            proxies["https"] = value
+        elif "http" in lower:
+            proxies["http"] = value
+    return build_opener(ProxyHandler(proxies)) if proxies else build_opener()
+
+
 def _qmt_request(path: str, method: str = "POST", payload: dict = None) -> Optional[dict]:
     url = f"{QMT2HTTP_BASE_URL}{path}"
     data = json.dumps(payload).encode() if payload else None
     headers = {"Content-Type": "application/json"}
     if QMT2HTTP_API_TOKEN:
-        headers["Authorization"] = f"Bearer {QMT2HTTP_API_TOKEN}"
+        headers["X-API-Token"] = QMT2HTTP_API_TOKEN
     req = Request(url, data=data, headers=headers, method=method)
     try:
-        with urlopen(req, timeout=QMT2HTTP_TIMEOUT) as resp:
+        with _build_url_opener().open(req, timeout=QMT2HTTP_TIMEOUT) as resp:
             return json.loads(resp.read().decode())
     except (HTTPError, URLError, OSError):
         return None
@@ -547,7 +561,7 @@ def search_stock_news(stock_name: str, reason: str = "异动") -> str:
         method="POST",
     )
     try:
-        with urlopen(req, timeout=15) as resp:
+        with _build_url_opener().open(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
     except (HTTPError, URLError, OSError):
         return ""
@@ -646,6 +660,8 @@ def has_obvious_price_scale_mismatch(rule: StockRule, quote: Dict) -> bool:
 
 def should_suppress_buy_signal(rule: StockRule, quote: Dict, market: MarketContext) -> bool:
     price = float(quote.get("price", 0) or 0)
+    if rule.buy_blocked:
+        return True
     if rule.abandon_buy_below and price > 0 and price <= rule.abandon_buy_below:
         return True
     if rule.avoid_reverse_t:
@@ -678,7 +694,12 @@ def format_signal(rule: StockRule, quote: Dict, signal_type: str, market: Market
         "sell": f"回补观察：回落到买区 {rule.buy_range[0]:.2f}-{rule.buy_range[1]:.2f}",
         "risk": "等待重新站稳后再评估",
     }[signal_type]
-    extra = f"\n--- 相关资讯 ---\n{news_context}" if news_context else ""
+    extra_lines = []
+    if rule.buy_blocked and rule.buy_block_reason and signal_type in ("buy", "rebound_buy"):
+        extra_lines.append(f"禁买原因：{rule.buy_block_reason}")
+    if news_context:
+        extra_lines.append(f"--- 相关资讯 ---\n{news_context}")
+    extra = f"\n{chr(10).join(extra_lines)}" if extra_lines else ""
     return (
         f"🔔 {'风险提醒' if signal_type == 'risk' else '交易观察提醒'}\n"
         f"股票：{rule.name} ({rule.code})\n"

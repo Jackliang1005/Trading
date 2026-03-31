@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 
@@ -44,6 +44,8 @@ class StockRule:
     panic_rebound_pct: float = 0.8
     sector_tags: List[str] = None
     enabled: bool = True
+    buy_blocked: bool = False
+    buy_block_reason: str = ""
 
 
 @dataclass
@@ -138,6 +140,11 @@ class StockNewsSnapshot:
     macro_sentiment: str
     macro_items: List[Dict]
     event_tags: List[Dict]
+    overseas_peer_score: int = 0
+    overseas_peer_sentiment: str = "neutral"
+    overseas_peer_items: List[Dict] = field(default_factory=list)
+    overseas_peer_block_buy: bool = False
+    overseas_peer_block_reason: str = ""
 
 
 @dataclass
@@ -157,3 +164,5 @@ class SelectionResult:
     reason: str
     explanation: str
     regime: str
+    buy_blocked: bool = False
+    buy_block_reason: str = ""

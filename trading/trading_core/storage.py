@@ -96,6 +96,8 @@ def save_state(state: Dict, path: Path = STATE_PATH) -> None:
 def apply_rule_mode_defaults(rule: StockRule) -> None:
     if (rule.watch_mode or "").lower() == "light":
         rule.avoid_reverse_t = True
+    if rule.buy_blocked:
+        rule.avoid_reverse_t = True
 
 
 def parse_rules(config: Dict) -> List[StockRule]:
@@ -123,9 +125,12 @@ def parse_rules(config: Dict) -> List[StockRule]:
                 panic_rebound_pct=float(item.get("panic_rebound_pct", 0.8) or 0.8),
                 sector_tags=[str(v) for v in item.get("sector_tags", []) if str(v).strip()],
                 enabled=bool(item.get("enabled", True)),
+                buy_blocked=bool(item.get("buy_blocked", item.get("selection_buy_blocked", False))),
+                buy_block_reason=str(
+                    item.get("buy_block_reason", item.get("selection_buy_block_reason", "")) or ""
+                ).strip(),
             )
         )
-    enabled_rules = [rule for rule in rules if rule.enabled]
-    for rule in enabled_rules:
+    for rule in rules:
         apply_rule_mode_defaults(rule)
-    return enabled_rules
+    return rules

@@ -54,7 +54,7 @@ def _event_weight(rule: StockRule, tag: Dict) -> int:
     base_weight = 0
     if tag_name == "war_risk":
         if "逆T" in strategy or rule.allow_market_panic_reverse_t:
-            base_weight = 6 if direction == "negative" else 0
+            base_weight = -6 if direction == "negative" else 0
         else:
             base_weight = -8 if direction == "negative" else 0
     elif tag_name == "policy_support":
@@ -162,6 +162,11 @@ def select_focus_list(
             reasons.append("宏观事件偏正面")
         elif news.macro_sentiment == "negative":
             reasons.append("宏观事件偏负面")
+        if news.overseas_peer_score:
+            score += news.overseas_peer_score
+            reasons.append(news.overseas_peer_block_reason or f"外盘同行压力{news.overseas_peer_score:+d}")
+        if news.overseas_peer_sentiment == "negative":
+            reasons.append("外盘同行偏弱")
         hot_matches = concept.get("hot_matches", [])
         if hot_matches:
             concept_weight = min(len(hot_matches), 3) * 6
@@ -214,12 +219,19 @@ def select_focus_list(
         ratio = _ratio_for_score(score, market_regime.regime)
         suggested_shares = int(rule.per_trade_shares * ratio / 0.25) if ratio > 0 else 0
         am_mode, pm_mode = _decide_halfday_modes(rule, market_regime, news, score)
+        buy_blocked = bool(rule.buy_blocked or news.overseas_peer_block_buy)
+        buy_block_reason = str(rule.buy_block_reason or news.overseas_peer_block_reason or "").strip()
+        if buy_blocked:
+            am_mode = "sell_only"
+            pm_mode = "observe_only" if pm_mode != "sell_only" else pm_mode
         if ratio >= 0.25:
             action = "focus"
         elif ratio > 0:
             action = "watch"
         else:
             action = "avoid"
+        if buy_blocked and action == "focus":
+            action = "watch"
         explanation_parts = []
         if news.event_tags:
             explanation_parts.append(
@@ -234,6 +246,11 @@ def select_focus_list(
             explanation_parts.append(f"板块: {_item_brief(news.sector_items[0])}")
         if news.macro_items:
             explanation_parts.append(f"宏观: {_item_brief(news.macro_items[0])}")
+        if news.overseas_peer_items:
+            first_peer = news.overseas_peer_items[0]
+            explanation_parts.append(f"外盘同行: {_item_brief(first_peer)}")
+            if news.overseas_peer_block_reason:
+                explanation_parts.append(f"外盘风控: {news.overseas_peer_block_reason}")
         if hot_matches:
             explanation_parts.append("热门题材: " + ",".join(hot_matches[:3]))
         elif concept.get("top_hot_concepts"):
@@ -250,6 +267,9 @@ def select_focus_list(
             explanation_parts.append(
                 f"近7天题材命中: {latest_match.get('date', '')} {'/'.join(latest_match.get('concepts', [])[:3])}"
             )
+        final_reason = " / ".join(reasons[:5])
+        if buy_blocked and buy_block_reason and buy_block_reason not in final_reason:
+            final_reason = f"{buy_block_reason} / {final_reason}" if final_reason else buy_block_reason
         results.append(SelectionResult(
             code=rule.code,
             name=rule.name,
@@ -263,9 +283,11 @@ def select_focus_list(
             suggested_t_ratio=round(ratio, 2),
             suggested_buy_shares=max(0, suggested_shares),
             suggested_sell_shares=max(0, suggested_shares),
-            reason=" / ".join(reasons[:5]),
+            reason=final_reason,
             explanation=" | ".join(explanation_parts[:3]),
             regime=market_regime.regime,
+            buy_blocked=buy_blocked,
+            buy_block_reason=buy_block_reason,
         ))
     ranked = sorted(results, key=lambda item: item.score, reverse=True)
     return allocate_t_budget(
@@ -312,6 +334,16 @@ def save_selection_outputs(results: List[SelectionResult], now: datetime | None 
         "focus": [item.__dict__ for item in results if item.action == "focus"][:5],
         "watch": [item.__dict__ for item in results if item.action == "watch"][:8],
         "avoid": [item.__dict__ for item in results if item.action == "avoid"][:12],
+        "peer_risk": [
+            {
+                "code": item.code,
+                "name": item.name,
+                "buy_blocked": item.buy_blocked,
+                "buy_block_reason": item.buy_block_reason,
+            }
+            for item in results
+            if item.buy_blocked
+        ],
     }
     atomic_write_json(_selection_review_path(), review_payload)
 
@@ -325,7 +357,7 @@ def sync_selection_to_daily_plan(rules: List[StockRule], results: List[Selection
         if not selection:
             continue
         watch_mode = ""
-        enabled = selection.action in ("focus", "watch")
+        enabled = True
         if selection.action == "watch":
             watch_mode = "light"
         if selection.action == "avoid":
@@ -336,6 +368,9 @@ def sync_selection_to_daily_plan(rules: List[StockRule], results: List[Selection
             "enabled": enabled,
             "per_trade_shares": max(selection.suggested_buy_shares, selection.suggested_sell_shares, rule.per_trade_shares),
             "watch_mode": watch_mode,
+            "buy_blocked": selection.buy_blocked,
+            "buy_block_reason": selection.buy_block_reason,
+            "avoid_reverse_t": selection.buy_blocked,
             "selection_action": selection.action,
             "selection_am_mode": selection.am_mode,
             "selection_pm_mode": selection.pm_mode,
@@ -345,6 +380,8 @@ def sync_selection_to_daily_plan(rules: List[StockRule], results: List[Selection
             "selection_ratio": selection.suggested_t_ratio,
             "selection_buy_shares": selection.suggested_buy_shares,
             "selection_sell_shares": selection.suggested_sell_shares,
+            "selection_buy_blocked": selection.buy_blocked,
+            "selection_buy_block_reason": selection.buy_block_reason,
             "selection_reason": selection.reason,
             "selection_explanation": selection.explanation,
             "note": f"selector:{selection.action}/{selection.am_mode}->{selection.pm_mode} {selection.reason}",
@@ -364,17 +401,26 @@ def load_selection_map() -> Dict[str, Dict]:
     return result
 
 
-def format_selection_report(results: List[SelectionResult]) -> str:
-    lines = ["盘前持仓做T筛选"]
+def _short_reason(text: str, limit: int = 18) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def format_selection_report(results: List[SelectionResult], title: str = "盘前持仓做T筛选") -> str:
+    lines = [title]
     focus_count = sum(1 for item in results if item.action == "focus")
     watch_count = sum(1 for item in results if item.action == "watch")
     avoid_count = sum(1 for item in results if item.action == "avoid")
     lines.append(f"重点{focus_count} 观察{watch_count} 回避{avoid_count}")
-    for item in results[:6]:
+    lines.append("")
+    lines.append("| 代码 | 名称 | 分组 | 模式 | 分数 | 买预算 | 卖预算 | 禁买 | 原因 |")
+    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |")
+    for item in results[:10]:
         lines.append(
-            f"{item.code} {item.name} [{item.action}] 分数{item.score} "
-            f"模式{item.am_mode}->{item.pm_mode} 买预算{item.buy_budget_amount:.0f} 卖预算{item.sell_budget_amount:.0f} "
-            f"仓位{item.suggested_t_ratio:.0%} 买股数{item.suggested_buy_shares} 卖股数{item.suggested_sell_shares} "
-            f"{item.reason}"
+            f"| {item.code} | {item.name} | {item.action} | {item.am_mode}->{item.pm_mode} | {item.score} | "
+            f"{item.buy_budget_amount:.0f} | {item.sell_budget_amount:.0f} | "
+            f"{'是' if item.buy_blocked else '否'} | {_short_reason(item.buy_block_reason or item.reason)} |"
         )
     return "\n".join(lines)
