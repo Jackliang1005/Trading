@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
+import requests
 
 from .models import IntradayAnalysis, LearningProfile, MarketContext, StockRule
 from .storage import _safe_float, upsert_plan_override
@@ -17,21 +18,127 @@ if str(SKILL_DIR) not in sys.path:
 from eastmoney_quotes import get_quotes  # type: ignore
 
 
-QMT2HTTP_BASE_URL = os.environ.get("QMT2HTTP_BASE_URL", "http://150.158.31.115:8085").rstrip("/")
-QMT2HTTP_API_TOKEN = os.environ.get("QMT2HTTP_API_TOKEN", "998811")
-QMT2HTTP_TIMEOUT = int(os.environ.get("QMT2HTTP_TIMEOUT", "10"))
+QMT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "做T监控配置.json"
 MX_APIKEY = os.environ.get("MX_APIKEY", "")
 MX_API_BASE = "https://mkapi2.dfcfs.com/finskillshub"
 
 MARKET_INDEXES = [("sh000001", "上证指数"), ("sz399006", "创业板指")]
 
 
+def _load_qmt_runtime_config() -> Dict:
+    try:
+        with QMT_CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    qmt_cfg = payload.get("qmt2http", {}) if isinstance(payload, dict) else {}
+    return qmt_cfg if isinstance(qmt_cfg, dict) else {}
+
+
+def _qmt_runtime_settings() -> Dict[str, object]:
+    qmt_cfg = _load_qmt_runtime_config()
+    timeout_value = os.environ.get("QMT2HTTP_TIMEOUT")
+    base_url = (
+        os.environ.get("QMT2HTTP_BASE_URL")
+        or str(qmt_cfg.get("base_url") or "http://150.158.31.115:8085")
+    ).rstrip("/")
+    api_token = (
+        os.environ.get("QMT2HTTP_API_TOKEN")
+        or str(qmt_cfg.get("api_token") or "998811")
+    ).strip()
+    read_timeout = float(
+        os.environ.get("QMT2HTTP_READ_TIMEOUT")
+        or timeout_value
+        or qmt_cfg.get("timeout")
+        or 10
+    )
+    connect_timeout = float(os.environ.get("QMT2HTTP_CONNECT_TIMEOUT") or 3)
+    return {
+        "base_url": base_url,
+        "api_token": api_token,
+        "connect_timeout": connect_timeout,
+        "read_timeout": read_timeout,
+    }
+
+
 def _qmt_code(code: str) -> str:
-    if "." in code:
-        return code
-    if code.startswith(("6", "5", "9")):
-        return f"{code}.SH"
-    return f"{code}.SZ"
+    text = str(code or "").strip()
+    if not text:
+        return text
+    upper = text.upper()
+    lower = text.lower()
+    if "." in upper:
+        return upper
+    if lower.startswith("sh"):
+        return f"{upper[2:]}.SH"
+    if lower.startswith("sz"):
+        return f"{upper[2:]}.SZ"
+    if lower.startswith("bj"):
+        return f"{upper[2:]}.BJ"
+    if upper.startswith(("8", "4")):
+        return f"{upper}.BJ"
+    if upper.startswith(("6", "5", "9")):
+        return f"{upper}.SH"
+    return f"{upper}.SZ"
+
+
+def _price_from_tick(item: Dict) -> float:
+    bids = item.get("bids") or []
+    if isinstance(bids, list) and bids:
+        bid0 = _safe_float(bids[0])
+        if bid0 and bid0 > 0:
+            return bid0
+    return _safe_float(item.get("last_price", item.get("price"))) or 0.0
+
+
+def fetch_batch_realtime_quotes(codes: List[str]) -> Dict[str, Dict]:
+    if not codes:
+        return {}
+    code_map = {_qmt_code(code): str(code) for code in codes}
+    result = _qmt_request(
+        "/rpc/data_fetcher",
+        payload={
+            "method": "get_batch_realtime_data",
+            "params": {"codes": list(code_map.keys())},
+        },
+    )
+    data = (result or {}).get("data")
+    if not result or not result.get("success") or not isinstance(data, dict):
+        return {}
+
+    quotes: Dict[str, Dict] = {}
+    for qmt_code, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        original_code = code_map.get(str(qmt_code).upper())
+        if not original_code:
+            continue
+        price = _price_from_tick(item)
+        pre_close = _safe_float(item.get("pre_close", item.get("last_close"))) or 0.0
+        high = _safe_float(item.get("high")) or 0.0
+        low = _safe_float(item.get("low")) or 0.0
+        open_price = _safe_float(item.get("open")) or 0.0
+        volume = _safe_float(item.get("volume")) or 0.0
+        amount = _safe_float(item.get("amount")) or 0.0
+        change_percent = _safe_float(item.get("change_pct")) or (round((price - pre_close) / pre_close * 100, 2) if pre_close and price > 0 else 0.0)
+        change = price - pre_close if pre_close and price > 0 else 0.0
+        if price <= 0:
+            continue
+        quotes[original_code] = {
+            "code": original_code,
+            "name": original_code,
+            "price": round(price, 2),
+            "change": round(change, 2),
+            "change_percent": round(change_percent, 2),
+            "volume": volume,
+            "amount": round(amount / 10000, 2),
+            "high": round(high, 2),
+            "low": round(low, 2),
+            "open": round(open_price, 2),
+            "pre_close": round(pre_close, 2),
+            "source": "qmt2http",
+        }
+    return quotes
 
 
 def _build_url_opener():
@@ -49,17 +156,203 @@ def _build_url_opener():
 
 
 def _qmt_request(path: str, method: str = "POST", payload: dict = None) -> Optional[dict]:
-    url = f"{QMT2HTTP_BASE_URL}{path}"
-    data = json.dumps(payload).encode() if payload else None
+    settings = _qmt_runtime_settings()
+    url = f"{settings['base_url']}{path}"
     headers = {"Content-Type": "application/json"}
-    if QMT2HTTP_API_TOKEN:
-        headers["X-API-Token"] = QMT2HTTP_API_TOKEN
-    req = Request(url, data=data, headers=headers, method=method)
+    api_token = str(settings.get("api_token") or "").strip()
+    if api_token:
+        headers["X-API-Token"] = api_token
+        headers["Authorization"] = f"Bearer {api_token}"
     try:
-        with _build_url_opener().open(req, timeout=QMT2HTTP_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
-    except (HTTPError, URLError, OSError):
+        session = requests.Session()
+        session.trust_env = False
+        response = session.request(
+            method=method,
+            url=url,
+            json=payload if payload else None,
+            headers=headers,
+            timeout=(float(settings["connect_timeout"]), float(settings["read_timeout"])),
+        )
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError, HTTPError, URLError, OSError):
         return None
+
+
+def _qmt_get(path: str, params: dict = None) -> Optional[dict]:
+    settings = _qmt_runtime_settings()
+    url = f"{settings['base_url']}{path}"
+    headers = {}
+    api_token = str(settings.get("api_token") or "").strip()
+    if api_token:
+        headers["X-API-Token"] = api_token
+        headers["Authorization"] = f"Bearer {api_token}"
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(
+            url=url,
+            params=params if params else None,
+            headers=headers,
+            timeout=(float(settings["connect_timeout"]), float(settings["read_timeout"])),
+        )
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError, HTTPError, URLError, OSError):
+        return None
+
+
+def _qmt_extract_series_payload(data, code: str = ""):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if code and isinstance(data.get(code), dict):
+            return data.get(code)
+        for value in data.values():
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict) and any(isinstance(v, list) for v in value.values()):
+                return value
+    return None
+
+
+def _extract_first_sequence(data):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        preferred_keys = (
+            "data",
+            "items",
+            "bars",
+            "klines",
+            "kline",
+            "list",
+            "rows",
+            "records",
+            "candles",
+            "values",
+        )
+        for key in preferred_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        for value in data.values():
+            found = _extract_first_sequence(value)
+            if isinstance(found, list) and found:
+                return found
+    return []
+
+
+def _bar_from_sequence_item(item) -> Optional[Dict]:
+    if not isinstance(item, (list, tuple)) or len(item) < 5:
+        return None
+    time_value = item[0]
+    open_value = _safe_float(item[1]) or 0.0
+    high_value = _safe_float(item[2]) or 0.0
+    low_value = _safe_float(item[3]) or 0.0
+    close_value = _safe_float(item[4]) or 0.0
+    volume_value = _safe_float(item[5]) or 0.0 if len(item) >= 6 else 0.0
+    if close_value <= 0:
+        return None
+    return {
+        "time": time_value,
+        "open": open_value,
+        "high": high_value,
+        "low": low_value,
+        "close": close_value,
+        "volume": volume_value,
+    }
+
+
+def _qmt_series_to_bars(series_data) -> List[Dict]:
+    if isinstance(series_data, list):
+        bars = []
+        for item in series_data:
+            if isinstance(item, dict):
+                normalized = {
+                    "time": item.get("time", item.get("datetime", item.get("date", ""))),
+                    "open": _safe_float(item.get("open", item.get("openPrice"))) or 0.0,
+                    "high": _safe_float(item.get("high", item.get("highPrice"))) or 0.0,
+                    "low": _safe_float(item.get("low", item.get("lowPrice"))) or 0.0,
+                    "close": _safe_float(item.get("close", item.get("lastPrice", item.get("price")))) or 0.0,
+                    "volume": _safe_float(item.get("volume", item.get("vol", item.get("amount")))) or 0.0,
+                }
+                if normalized["close"] > 0:
+                    bars.append(normalized)
+            else:
+                normalized = _bar_from_sequence_item(item)
+                if normalized:
+                    bars.append(normalized)
+        return bars
+    if not isinstance(series_data, dict):
+        return []
+    times = list(series_data.get("time", []) or [])
+    opens = list(series_data.get("open", []) or [])
+    highs = list(series_data.get("high", []) or [])
+    lows = list(series_data.get("low", []) or [])
+    closes = list(series_data.get("close", series_data.get("lastPrice", [])) or [])
+    volumes = list(series_data.get("volume", series_data.get("vol", [])) or [])
+    size = min(len(times), len(opens), len(highs), len(lows), len(closes))
+    if size <= 0:
+        return []
+    bars = []
+    for idx in range(size):
+        close_value = _safe_float(closes[idx]) or 0.0
+        if close_value <= 0:
+            continue
+        bars.append({
+            "time": times[idx],
+            "open": _safe_float(opens[idx]) or 0.0,
+            "high": _safe_float(highs[idx]) or 0.0,
+            "low": _safe_float(lows[idx]) or 0.0,
+            "close": close_value,
+            "volume": _safe_float(volumes[idx]) or 0.0,
+        })
+    return bars
+
+
+def _warmup_qmt_history(code: str, period: str) -> None:
+    _qmt_get("/api/stock/data", params={"stock_list": _qmt_code(code), "period": period})
+
+
+def _fetch_intraday_minute_bars(code: str, start_hm: str = "09:30") -> Optional[List[Dict]]:
+    qmt_code = _qmt_code(code)
+    now = datetime.now()
+    attempts = [
+        {
+            "method": "get_intraday_minute_data",
+            "params": {"code": qmt_code, "date_str": now.strftime("%Y%m%d"), "start_hm": start_hm},
+        },
+        {
+            "method": "get_intraday_minute_data",
+            "params": {"code": qmt_code, "date_str": now.strftime("%Y%m%d"), "start_hm": start_hm, "end_hm": now.strftime("%H:%M")},
+        },
+    ]
+    for attempt in attempts:
+        result = _qmt_request("/rpc/data_fetcher", payload=attempt)
+        data = (result or {}).get("data")
+        if result and result.get("success") and data:
+            bars = _qmt_series_to_bars(data) or _qmt_series_to_bars(_extract_first_sequence(data))
+            if bars:
+                return bars
+
+    _warmup_qmt_history(code, "1m")
+    history_attempts = [
+        {"code": qmt_code, "period": "1m", "count": 240},
+        {"code": [qmt_code], "period": "1m", "count": 240},
+    ]
+    for params in history_attempts:
+        fallback = _qmt_request("/rpc/data_fetcher", payload={"method": "get_history_data", "params": params})
+        fallback_data = (fallback or {}).get("data")
+        if not fallback or not fallback.get("success") or not fallback_data:
+            continue
+        series_payload = _qmt_extract_series_payload(fallback_data, qmt_code)
+        bars = _qmt_series_to_bars(series_payload)
+        if not bars:
+            bars = _qmt_series_to_bars(_extract_first_sequence(fallback_data))
+        if bars:
+            return bars
+    return None
 
 
 def fetch_minute_prices(code: str, lookback: int = 5) -> Optional[List[float]]:
@@ -69,49 +362,15 @@ def fetch_minute_prices(code: str, lookback: int = 5) -> Optional[List[float]]:
     if now.minute < lookback:
         start_h = max(start_h - 1, 9)
         start_m = 60 - (lookback - now.minute)
-    result = _qmt_request("/rpc/data_fetcher", payload={
-        "method": "get_intraday_minute_data",
-        "params": {"code": _qmt_code(code), "date_str": now.strftime("%Y%m%d"), "start_hm": f"{start_h:02d}:{start_m:02d}"},
-    })
-    data = (result or {}).get("data")
-    if not result or not result.get("success") or not data:
+    bars = _fetch_intraday_minute_bars(code, start_hm=f"{start_h:02d}:{start_m:02d}")
+    if not bars:
         return None
-    prices = []
-    raw_list = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), [])
-    for bar in raw_list:
-        if isinstance(bar, dict):
-            p = bar.get("close", bar.get("lastPrice", bar.get("price")))
-            if p is not None:
-                prices.append(float(p))
-        elif isinstance(bar, (int, float)):
-            prices.append(float(bar))
-    return prices or None
+    prices = [float(bar.get("close", 0) or 0) for bar in bars if float(bar.get("close", 0) or 0) > 0]
+    return prices[-max(lookback, 1):] or None
 
 
 def fetch_full_intraday_bars(code: str) -> Optional[List[Dict]]:
-    result = _qmt_request("/rpc/data_fetcher", payload={
-        "method": "get_intraday_minute_data",
-        "params": {"code": _qmt_code(code), "date_str": datetime.now().strftime("%Y%m%d"), "start_hm": "09:30"},
-    })
-    data = (result or {}).get("data")
-    if not result or not result.get("success") or not data:
-        return None
-    raw_list = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), [])
-    bars = []
-    for bar in raw_list:
-        if not isinstance(bar, dict):
-            continue
-        item = {
-            "time": bar.get("time", bar.get("datetime", "")),
-            "open": _safe_float(bar.get("open", bar.get("openPrice"))) or 0.0,
-            "high": _safe_float(bar.get("high", bar.get("highPrice"))) or 0.0,
-            "low": _safe_float(bar.get("low", bar.get("lowPrice"))) or 0.0,
-            "close": _safe_float(bar.get("close", bar.get("lastPrice", bar.get("price")))) or 0.0,
-            "volume": _safe_float(bar.get("volume", bar.get("vol"))) or 0.0,
-        }
-        if item["close"] > 0:
-            bars.append(item)
-    return bars or None
+    return _fetch_intraday_minute_bars(code, start_hm="09:30")
 
 
 def fetch_yesterday_daily(code: str) -> Optional[Dict]:
@@ -122,6 +381,11 @@ def fetch_yesterday_daily(code: str) -> Optional[Dict]:
     data = (result or {}).get("data")
     if not result or not result.get("success") or not data:
         return None
+    series_payload = _qmt_extract_series_payload(data, _qmt_code(code))
+    series_bars = _qmt_series_to_bars(series_payload)
+    if series_bars:
+        bar = series_bars[-2] if len(series_bars) >= 2 else series_bars[-1]
+        return {"high": bar["high"], "low": bar["low"], "close": bar["close"]}
     raw_list = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), [])
     if not raw_list:
         return None
@@ -426,7 +690,13 @@ def should_use_dynamic_range(rule: StockRule, quote: Dict, threshold_pct: float 
 
 
 def get_quotes_map(codes: List[str]) -> Dict[str, Dict]:
-    return {str(quote.get("code")): quote for quote in get_quotes(codes) if "error" not in quote}
+    qmt_quotes = fetch_batch_realtime_quotes(codes)
+    missing = [code for code in codes if str(code) not in qmt_quotes]
+    merged = dict(qmt_quotes)
+    for requested_code, quote in zip(missing, get_quotes(missing)):
+        if "error" not in quote:
+            merged[str(requested_code)] = quote
+    return merged
 
 
 def build_market_context(quotes: Dict[str, Dict]) -> MarketContext:

@@ -360,6 +360,7 @@ class TradingExecutionBook:
         price: float,
         quantity: int,
         note: str = "",
+        command_id: str = "",
     ) -> Dict:
         state = self.load_portfolio_state()
         stock_state = state["stocks"].setdefault(
@@ -388,7 +389,7 @@ class TradingExecutionBook:
         self._refresh_stock_state(stock_state)
         self.save_portfolio_state(state)
 
-        matched = self.match_pending_command(stock_code, action)
+        matched = self.find_command(command_id) if command_id else self.match_pending_command(stock_code, action)
         if matched:
             self.update_command_execution(matched["id"], price, note)
         return stock_state

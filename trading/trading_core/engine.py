@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from .analysis import (
     should_use_dynamic_range,
 )
 from .decision_engine import format_decision_message, make_decision
-from .data_agent import build_stock_data_snapshots
+from .data_agent import assess_selection_input_health, build_stock_data_snapshots
 from .learning import load_learning_profile
 from .market_regime import build_market_regime
 from .news_agent import build_news_snapshots
@@ -47,7 +48,22 @@ from .selector_agent import (
     sync_selection_to_daily_plan,
 )
 from .command_service import TradingCommandService
-from .storage import load_config, load_daily_plan, load_state, merge_daily_plan, parse_rules, save_daily_plan, save_state
+from .models import MarketContext
+from .storage import atomic_write_json, load_config, load_daily_plan, load_state, merge_daily_plan, parse_rules, save_daily_plan, save_state
+
+CONFIDENCE_RANK = {"低": 0, "中": 1, "高": 2}
+
+
+def write_daemon_heartbeat(config_path: Path, status: str, extra: Optional[Dict] = None) -> None:
+    heartbeat_path = config_path.parent / "trading_data" / "trading_monitor_daemon_heartbeat.json"
+    payload = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pid": os.getpid(),
+        "status": status,
+    }
+    if extra:
+        payload.update(extra)
+    atomic_write_json(heartbeat_path, payload)
 
 
 def in_trade_hours(now: Optional[datetime] = None) -> bool:
@@ -131,6 +147,131 @@ def get_qmt_status(config: Dict) -> Dict:
     return Qmt2HttpClient(qmt_cfg).probe_status()
 
 
+def should_force_refresh_for_status_change(state: Dict, qmt_status: Dict, market: MarketContext) -> bool:
+    runtime = state.setdefault("runtime", {})
+    last_qmt = runtime.get("last_qmt_status", {})
+    current = {
+        "status": str(qmt_status.get("status", "")),
+        "market_connected": bool(qmt_status.get("market_connected", False)),
+        "trade_connected": bool(qmt_status.get("trade_connected", False)),
+        "has_index": bool(market.index_changes),
+    }
+    force = (
+        last_qmt.get("market_connected") is False and current["market_connected"] is True
+    ) or (
+        last_qmt.get("has_index") is False and current["has_index"] is True
+    ) or (
+        str(last_qmt.get("status", "")) not in ("ok", "disabled") and current["status"] == "ok"
+    )
+    runtime["last_qmt_status"] = current
+    return force
+
+
+def should_refresh_selection_outputs(
+    rules,
+    data_snapshots,
+    market: MarketContext,
+    state: Dict,
+    refresh_state: Optional[Dict] = None,
+) -> bool:
+    healthy, reason, details = assess_selection_input_health(rules, data_snapshots, market)
+    runtime = state.setdefault("runtime", {})
+    runtime["last_selection_input_health"] = {
+        "healthy": healthy,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "reason": reason,
+        **details,
+    }
+    if healthy:
+        return True
+    print(reason)
+    if refresh_state is not None:
+        refresh_state["last_skipped_reason"] = reason
+        refresh_state["last_skipped_at"] = datetime.now().isoformat(timespec="seconds")
+    return False
+
+
+def describe_auto_trade_block(
+    *,
+    rule,
+    selection: Dict,
+    decision,
+    auto_trade_allowed: bool,
+    dry_run: bool,
+    pool_action: str,
+    message_signal_allowed: bool,
+    execution_filter_reasons: Optional[list[str]] = None,
+) -> str:
+    reasons = []
+    if decision.action not in ("buy", "sell"):
+        reasons.append(f"decision={decision.action}")
+        if decision.reason:
+            reasons.append(f"reason={decision.reason}")
+    if not auto_trade_allowed:
+        reasons.append("qmt_trade_disconnected_or_auto_trade_disabled")
+    if dry_run:
+        reasons.append("dry_run")
+    if pool_action != "focus":
+        reasons.append(f"pool_action={pool_action}")
+    if not message_signal_allowed:
+        reasons.append("message_signal_cooldown_or_daily_cap")
+    if decision.action in ("buy", "sell") and not decision.allow_auto_trade:
+        reasons.append(f"risk_block={','.join(decision.risk_flags) if decision.risk_flags else 'score_or_policy'}")
+    if execution_filter_reasons:
+        reasons.append(f"execution_filter={','.join(execution_filter_reasons)}")
+    am_mode = str(selection.get("am_mode", selection.get("selection_am_mode", "")) or "-")
+    pm_mode = str(selection.get("pm_mode", selection.get("selection_pm_mode", "")) or "-")
+    return (
+        f"{rule.name}({rule.code}) 未自动下单："
+        f"{' / '.join(reasons) if reasons else 'unknown'}"
+        f" / AM={am_mode} PM={pm_mode}"
+    )
+
+
+def evaluate_execution_filters(
+    *,
+    decision,
+    analysis,
+    bars,
+    min_confidence_rank: int,
+    min_spread_pct: float,
+    max_target_distance_atr: float,
+    min_recent_volume_ratio: float,
+) -> list[str]:
+    reasons: list[str] = []
+    if CONFIDENCE_RANK.get(str(analysis.confidence), -1) < min_confidence_rank:
+        reasons.append(f"confidence={analysis.confidence}")
+    if float(analysis.t_spread_pct or 0) < min_spread_pct:
+        reasons.append(f"spread={analysis.t_spread_pct:.1f}")
+    trigger_price = float(decision.trigger_price or 0)
+    execution_price = float(decision.execution_price or 0)
+    risk_unit = float(analysis.risk_unit or 0)
+    if trigger_price > 0 and execution_price > 0 and risk_unit > 0:
+        distance_atr = abs(execution_price - trigger_price) / risk_unit
+        if distance_atr > max_target_distance_atr:
+            reasons.append(f"target_distance_atr={distance_atr:.2f}")
+    else:
+        reasons.append("target_distance_unknown")
+    valid_volumes = [
+        float(item.get("volume", 0) or 0)
+        for item in (bars or [])
+        if float(item.get("volume", 0) or 0) > 0
+    ]
+    if valid_volumes:
+        recent_count = min(5, len(valid_volumes))
+        recent_avg = sum(valid_volumes[-recent_count:]) / recent_count
+        session_avg = sum(valid_volumes) / len(valid_volumes)
+        if session_avg > 0:
+            volume_ratio = recent_avg / session_avg
+            if volume_ratio < min_recent_volume_ratio:
+                reasons.append(f"volume_ratio={volume_ratio:.2f}")
+        else:
+            reasons.append("volume_session_avg_zero")
+    else:
+        reasons.append("volume_data_missing")
+    return reasons
+
+
 def check_once(config_path: Path, dry_run: bool = False) -> int:
     config = merge_daily_plan(load_config(config_path), DAILY_PLAN_PATH)
     rules = parse_rules(config)
@@ -147,6 +288,10 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
     t_signal_max_per_day = int(monitor_cfg.get("t_signal_max_per_day", 4))
     dynamic_range_threshold = float(monitor_cfg.get("dynamic_range_threshold_pct", 8))
     context_refresh_cooldown = int(monitor_cfg.get("context_refresh_cooldown_minutes", 120))
+    auto_trade_min_confidence = str(monitor_cfg.get("auto_trade_min_confidence", "中") or "中")
+    auto_trade_min_spread_pct = float(monitor_cfg.get("auto_trade_min_spread_pct", 1.5) or 1.5)
+    auto_trade_target_atr_tolerance = float(monitor_cfg.get("auto_trade_target_atr_tolerance", 0.5) or 0.5)
+    auto_trade_min_recent_volume_ratio = float(monitor_cfg.get("auto_trade_min_recent_volume_ratio", 0.6) or 0.6)
     auto_trade_enabled = bool(config.get("qmt2http", {}).get("auto_trade_enabled", False))
     account_cfg = config.get("account", {})
     floating_cash_budget = float(account_cfg.get("floating_cash_budget", 100000) or 100000)
@@ -172,6 +317,7 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         qmt_summary += f" reason={qmt_status.get('reason')}"
     print(qmt_summary)
     state = load_state()
+    force_refresh = should_force_refresh_for_status_change(state, qmt_status, market)
     send_allowed = can_send_monitor_message(now, allow_preopen=allow_preopen_alerts)
     if preopen_mode:
         plan = load_daily_plan(DAILY_PLAN_PATH)
@@ -179,32 +325,33 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
         sent_count = 0
         today = now.strftime("%Y-%m-%d")
         data_snapshots = build_stock_data_snapshots(rules)
-        news_snapshots = build_news_snapshots(rules, now=now)
-        selections = select_focus_list(
-            rules,
-            data_snapshots,
-            news_snapshots,
-            market_regime,
-            floating_cash_budget=floating_cash_budget,
-            max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
-            now=now,
-        )
-        save_selection_outputs(selections, now=now)
-        sync_selection_to_daily_plan(rules, selections)
-        selection_message = format_selection_report(selections, title="盘前持仓做T筛选")
-        if not qmt_status.get("trade_connected", False):
-            selection_message += "\n通道状态：交易接口不可用，本轮自动交易已降级关闭。"
-        print(selection_message)
-        print("-" * 60)
-        selection_signal_type = f"selection_report_{today}"
-        summary_key = "preopen_selection_report"
-        if should_send_signal(state, "system", selection_signal_type, 99999) and should_send_summary(state, summary_key, selection_message):
-            delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
-            if delivered:
-                mark_signal_sent(state, "system", selection_signal_type)
-                mark_summary_sent(state, summary_key, selection_message)
-                if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
-                    sent_count += 1
+        if should_refresh_selection_outputs(rules, data_snapshots, market, state):
+            news_snapshots = build_news_snapshots(rules, now=now)
+            selections = select_focus_list(
+                rules,
+                data_snapshots,
+                news_snapshots,
+                market_regime,
+                floating_cash_budget=floating_cash_budget,
+                max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
+                now=now,
+            )
+            save_selection_outputs(selections, now=now)
+            sync_selection_to_daily_plan(rules, selections)
+            selection_message = format_selection_report(selections, title="盘前持仓做T筛选")
+            if not qmt_status.get("trade_connected", False):
+                selection_message += "\n通道状态：交易接口不可用，本轮自动交易已降级关闭。"
+            print(selection_message)
+            print("-" * 60)
+            selection_signal_type = f"selection_report_{today}"
+            summary_key = "preopen_selection_report"
+            if should_send_signal(state, "system", selection_signal_type, 99999) and should_send_summary(state, summary_key, selection_message):
+                delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
+                if delivered:
+                    mark_signal_sent(state, "system", selection_signal_type)
+                    mark_summary_sent(state, summary_key, selection_message)
+                    if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
+                        sent_count += 1
         for rule in rules:
             result = evaluate_preopen_warning(rule, quotes.get(rule.code, {}), fetch_auction_snapshot(rule.code), market)
             if not result:
@@ -242,40 +389,49 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
     auto_trade_count = 0
     command_service = TradingCommandService(base_dir=config_path.parent)
     review_engine = ReviewEngine(base_dir=config_path.parent)
+    try:
+        sync_result = command_service.sync_submitted_commands_from_qmt2http()
+        if sync_result.get("matched", 0):
+            auto_trade_count += int(sync_result.get("matched", 0) or 0)
+            print(f"成交同步：{sync_result.get('message')}")
+    except Exception as exc:
+        print(f"成交同步失败：{exc}")
     portfolio_state = command_service.get_execution_book().load_portfolio_state()
     context_slot = selection_refresh_slot(now)
     refresh_state = state.setdefault("context_refresh", {})
     if context_slot and refresh_state.get("date") != today_str:
         refresh_state.clear()
         refresh_state["date"] = today_str
-    if context_slot and refresh_state.get("slot") != context_slot:
+    if context_slot and (refresh_state.get("slot") != context_slot or force_refresh):
         data_snapshots = build_stock_data_snapshots(rules)
-        news_snapshots = build_news_snapshots(rules, now=now)
-        refreshed_selections = select_focus_list(
-            rules,
-            data_snapshots,
-            news_snapshots,
-            market_regime,
-            floating_cash_budget=floating_cash_budget,
-            max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
-            now=now,
-        )
-        save_selection_outputs(refreshed_selections, now=now)
-        sync_selection_to_daily_plan(rules, refreshed_selections)
-        selection_map = load_selection_map()
-        refresh_state["slot"] = context_slot
-        selection_message = format_selection_report(refreshed_selections, title="盘中上下文刷新")
-        print(selection_message)
-        print("-" * 60)
-        signal_type = "context_refresh_summary"
-        summary_key = "intraday_context_refresh"
-        if should_send_signal(state, "system", signal_type, context_refresh_cooldown) and should_send_summary(state, summary_key, selection_message):
-            delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
-            if delivered:
-                mark_signal_sent(state, "system", signal_type)
-                mark_summary_sent(state, summary_key, selection_message)
-                if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
-                    sent_count += 1
+        if should_refresh_selection_outputs(rules, data_snapshots, market, state, refresh_state=refresh_state):
+            news_snapshots = build_news_snapshots(rules, now=now)
+            refreshed_selections = select_focus_list(
+                rules,
+                data_snapshots,
+                news_snapshots,
+                market_regime,
+                floating_cash_budget=floating_cash_budget,
+                max_single_t_ratio_of_holding=max_single_t_ratio_of_holding,
+                now=now,
+            )
+            save_selection_outputs(refreshed_selections, now=now)
+            sync_selection_to_daily_plan(rules, refreshed_selections)
+            selection_map = load_selection_map()
+            refresh_state["slot"] = context_slot
+            refresh_state["forced_by_status_recovery"] = bool(force_refresh)
+            selection_message = format_selection_report(refreshed_selections, title="盘中上下文刷新")
+            print(selection_message)
+            print("-" * 60)
+            signal_type = "context_refresh_summary"
+            summary_key = "intraday_context_refresh"
+            if should_send_signal(state, "system", signal_type, context_refresh_cooldown) and should_send_summary(state, summary_key, selection_message):
+                delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), selection_message))
+                if delivered:
+                    mark_signal_sent(state, "system", signal_type)
+                    mark_summary_sent(state, summary_key, selection_message)
+                    if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
+                        sent_count += 1
     for rule in rules:
         selection = selection_map.get(rule.code, {})
         pool_action = selection.get("action", "focus")
@@ -299,6 +455,7 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
             print(f"{rule.name}({rule.code}) 行情口径疑似异常，跳过本轮信号判断")
             continue
         analysis = None
+        bars = None
         is_dynamic = False
         if t_signal_enabled and phase in ("first_wave", "steady", "winddown"):
             yesterday = yesterday_cache.get(rule.code) or fetch_yesterday_daily(rule.code)
@@ -309,6 +466,9 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                 raw_analysis = compute_intraday_analysis(rule.code, rule, bars, yesterday)
                 if raw_analysis:
                     analysis = adjust_for_strategy(raw_analysis, rule)
+            else:
+                bar_count = len(bars) if bars else 0
+                print(f"{rule.name}({rule.code}) 分钟线不足，跳过体系化决策：bars={bar_count}")
             is_dynamic = analysis is not None and should_use_dynamic_range(rule, quote, dynamic_range_threshold)
         playbook = select_playbook(rule)
         learning = load_learning_profile(rule.code, base_dir=config_path.parent)
@@ -343,7 +503,19 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     "analysis_risk_unit": analysis.risk_unit,
                 },
             )
-            if decision.action in ("buy", "sell") and should_send_t_signal(state, rule.code, t_signal_cooldown, t_signal_max_per_day):
+            message_signal_allowed = decision.action in ("buy", "sell") and should_send_t_signal(state, rule.code, t_signal_cooldown, t_signal_max_per_day)
+            execution_filter_reasons = []
+            if decision.action in ("buy", "sell"):
+                execution_filter_reasons = evaluate_execution_filters(
+                    decision=decision,
+                    analysis=analysis,
+                    bars=bars,
+                    min_confidence_rank=CONFIDENCE_RANK.get(auto_trade_min_confidence, 1),
+                    min_spread_pct=auto_trade_min_spread_pct,
+                    max_target_distance_atr=auto_trade_target_atr_tolerance,
+                    min_recent_volume_ratio=auto_trade_min_recent_volume_ratio,
+                )
+            if message_signal_allowed:
                 trade_shares = suggested_buy_shares if decision.action == "buy" else suggested_sell_shares
                 if trade_shares <= 0:
                     trade_shares = rule.per_trade_shares
@@ -366,30 +538,35 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     mark_t_signal_sent(state, rule.code, analysis)
                     if feishu_cfg.get("enabled", True) and not dry_run and send_allowed:
                         sent_count += 1
-                if auto_trade_allowed and not dry_run and pool_action == "focus" and decision.allow_auto_trade:
-                    exec_result = command_service.create_and_execute_command_result(
-                        stock_code=rule.code,
-                        action=decision.action,
-                        price=decision.execution_price or float(quote["price"]),
-                        quantity=trade_shares,
-                        reason=f"{decision.playbook_name} {decision.level} {phase}",
-                        source="decision-engine-auto",
+            if auto_trade_allowed and not dry_run and pool_action == "focus" and decision.allow_auto_trade and decision.action in ("buy", "sell") and not execution_filter_reasons:
+                trade_shares = suggested_buy_shares if decision.action == "buy" else suggested_sell_shares
+                if trade_shares <= 0:
+                    trade_shares = rule.per_trade_shares
+                exec_result = command_service.create_and_execute_command_result(
+                    stock_code=rule.code,
+                    action=decision.action,
+                    price=decision.execution_price or float(quote["price"]),
+                    quantity=trade_shares,
+                    reason=f"{decision.playbook_name} {decision.level} {phase}",
+                    source="decision-engine-auto",
+                )
+                print(exec_result["message"])
+                print("-" * 60)
+            else:
+                print(
+                    describe_auto_trade_block(
+                        rule=rule,
+                        selection=selection,
+                        decision=decision,
+                        auto_trade_allowed=auto_trade_allowed,
+                        dry_run=dry_run,
+                        pool_action=pool_action,
+                        message_signal_allowed=message_signal_allowed,
+                        execution_filter_reasons=execution_filter_reasons,
                     )
-                    if exec_result.get("ok"):
-                        stock_intraday = state.setdefault("intraday", {}).setdefault(rule.code, {"date": today_str})
-                        if stock_intraday.get("date") != today_str:
-                            stock_intraday.clear()
-                            stock_intraday["date"] = today_str
-                        last_trade_action = str(stock_intraday.get("last_trade_action", "") or "")
-                        if last_trade_action and last_trade_action != decision.action:
-                            stock_intraday["round_trip_count"] = int(stock_intraday.get("round_trip_count", 0) or 0) + 1
-                        stock_intraday["last_trade_action"] = decision.action
-                        stock_intraday["auto_trade_count"] = int(stock_intraday.get("auto_trade_count", 0) or 0) + 1
-                        auto_trade_count += 1
-                        portfolio_state = command_service.get_execution_book().load_portfolio_state()
-                    print(exec_result["message"])
-                    print("-" * 60)
-                continue
+                )
+                print("-" * 60)
+            continue
         if not signal_type:
             continue
         if signal_type in ("buy", "rebound_buy") and day_mode in ("sell_only", "observe_only"):
@@ -439,13 +616,20 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
 def run_daemon(config_path: Path, dry_run: bool = False) -> int:
     poll_seconds = int(merge_daily_plan(load_config(config_path), DAILY_PLAN_PATH).get("monitor", {}).get("poll_seconds", 60))
     print(f"开始监控，轮询间隔 {poll_seconds} 秒")
+    write_daemon_heartbeat(config_path, "starting", {"poll_seconds": poll_seconds})
     try:
         while True:
+            write_daemon_heartbeat(config_path, "running", {"poll_seconds": poll_seconds})
             check_once(config_path, dry_run=dry_run)
+            write_daemon_heartbeat(config_path, "sleeping", {"poll_seconds": poll_seconds})
             time.sleep(poll_seconds)
     except KeyboardInterrupt:
+        write_daemon_heartbeat(config_path, "stopped", {"reason": "keyboard_interrupt"})
         print("监控已停止")
         return 0
+    except Exception as exc:
+        write_daemon_heartbeat(config_path, "error", {"reason": str(exc)[:300]})
+        raise
 
 
 def main() -> int:

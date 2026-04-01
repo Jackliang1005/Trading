@@ -70,6 +70,174 @@ class TradingCommandService:
             raise RuntimeError("qmt2http 交易通道已关闭，请在配置里打开 qmt2http.enabled")
         return Qmt2HttpClient(config)
 
+    @staticmethod
+    def _parse_datetime_loose(text: str) -> Optional[datetime]:
+        value = str(text or "").strip()
+        if not value:
+            return None
+        formats = (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%H:%M:%S",
+            "%H:%M",
+        )
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(value, fmt)
+                if fmt in ("%H:%M:%S", "%H:%M"):
+                    now = datetime.now()
+                    return parsed.replace(year=now.year, month=now.month, day=now.day)
+                return parsed
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _normalize_trade_side(text: str) -> str:
+        value = str(text or "").strip().lower()
+        if value in ("buy", "b"):
+            return "buy"
+        if value in ("sell", "s"):
+            return "sell"
+        if any(token in value for token in ("买", "证券买入", "普通买入")):
+            return "buy"
+        if any(token in value for token in ("卖", "证券卖出", "普通卖出")):
+            return "sell"
+        return value
+
+    @staticmethod
+    def _normalize_trade_row(item: Dict) -> Optional[Dict]:
+        if not isinstance(item, dict):
+            return None
+        code = str(
+            item.get("stock_code")
+            or item.get("证券代码")
+            or item.get("代码")
+            or item.get("code")
+            or ""
+        ).strip()
+        side = TradingCommandService._normalize_trade_side(
+            item.get("side")
+            or item.get("action")
+            or item.get("operation")
+            or item.get("买卖方向")
+            or item.get("操作")
+            or item.get("委托方向")
+            or item.get("成交方向")
+            or ""
+        )
+        price = item.get("price") or item.get("成交均价") or item.get("成交价格") or item.get("成交价") or item.get("均价") or 0
+        quantity = item.get("amount") or item.get("quantity") or item.get("成交数量") or item.get("成交股数") or item.get("成交数") or item.get("数量") or 0
+        order_id = str(
+            item.get("order_id")
+            or item.get("entrust_no")
+            or item.get("order_no")
+            or item.get("合同编号")
+            or item.get("委托编号")
+            or item.get("委托序号")
+            or ""
+        ).strip()
+        traded_at = TradingCommandService._parse_datetime_loose(
+            item.get("traded_at")
+            or item.get("成交时间")
+            or item.get("time")
+            or item.get("成交日期时间")
+            or item.get("成交日期")
+            or item.get("datetime")
+            or ""
+        )
+        try:
+            price_value = float(price or 0)
+            quantity_value = int(float(quantity or 0))
+        except (TypeError, ValueError):
+            return None
+        if not code or side not in ("buy", "sell") or price_value <= 0 or quantity_value <= 0:
+            return None
+        return {
+            "stock_code": code.split(".", 1)[0],
+            "action": side,
+            "price": price_value,
+            "quantity": quantity_value,
+            "broker_order_id": order_id,
+            "traded_at": traded_at,
+            "raw": item,
+        }
+
+    @staticmethod
+    def _extract_trade_rows(payload) -> list[Dict]:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("data", "rows", "items", "list", "records", "result"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+            rows = []
+            for value in payload.values():
+                rows.extend(TradingCommandService._extract_trade_rows(value))
+            return rows
+        return []
+
+    def sync_submitted_commands_from_qmt2http(self) -> Dict:
+        book = self.get_execution_book()
+        submitted = book.list_commands(["submitted"])
+        if not submitted:
+            return {"ok": True, "matched": 0, "checked": 0, "message": "无 submitted 指令"}
+        client = self.get_qmt2http_client()
+        response = client.query_today_trades()
+        raw_rows = self._extract_trade_rows(response.get("data", response) if isinstance(response, dict) else response)
+        trades = [item for item in (self._normalize_trade_row(row) for row in raw_rows) if item]
+        matched_count = 0
+        for command in submitted:
+            command_id = str(command.get("id") or "").strip()
+            if not command_id:
+                continue
+            command_ts = self._parse_datetime_loose(command.get("created_at") or "") or datetime.now()
+            broker_order_id = str(command.get("broker_order_id") or "").strip()
+            candidates = []
+            for trade in trades:
+                if trade["stock_code"] != str(command.get("stock_code") or "").strip():
+                    continue
+                if trade["action"] != str(command.get("action") or "").strip():
+                    continue
+                if int(trade["quantity"]) != int(command.get("quantity") or 0):
+                    continue
+                if broker_order_id and trade["broker_order_id"] and trade["broker_order_id"] != broker_order_id:
+                    continue
+                traded_at = trade.get("traded_at")
+                if traded_at and traded_at < command_ts:
+                    continue
+                candidates.append(trade)
+            if not candidates:
+                continue
+            candidates.sort(key=lambda item: item.get("traded_at") or command_ts)
+            trade = candidates[0]
+            note = f"qmt2http 成交回报 command:{command_id}"
+            self.get_recorder().record_trade(
+                command["stock_code"],
+                trade["action"],
+                float(trade["price"]),
+                int(trade["quantity"]),
+                note,
+            )
+            self.get_execution_book().record_execution(
+                command["stock_code"],
+                trade["action"],
+                float(trade["price"]),
+                int(trade["quantity"]),
+                note,
+                command_id=command_id,
+            )
+            self.mark_trade_state(command["stock_code"], trade["action"], auto_trade=str(command.get("source") or "").startswith("decision-engine-auto"))
+            matched_count += 1
+        return {
+            "ok": True,
+            "matched": matched_count,
+            "checked": len(submitted),
+            "message": f"checked={len(submitted)} matched={matched_count}",
+        }
+
     def apply_today_overrides(self, stock: Dict, plan: Dict) -> Dict:
         result = deepcopy(stock)
         override = {str(item["code"]): item for item in plan.get("stocks", [])}.get(str(stock["code"]))
@@ -630,7 +798,7 @@ class TradingCommandService:
             state = self.get_execution_book().rebuild_portfolio_state_from_initial()
             return self.format_portfolio_status(state)
         if text in ("T 指令簿", "T 指令", "T 任务", "T commands"):
-            commands = self.get_execution_book().list_commands(["pending", "acknowledged", "executed"])
+            commands = self.get_execution_book().list_commands(["pending", "acknowledged", "submitted", "executed"])
             if not commands:
                 return f"指令簿 {plan['date']}\n当前没有记录。"
             lines = [f"指令簿 {plan['date']}"]

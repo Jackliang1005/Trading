@@ -21,7 +21,11 @@
     "t_signal_cooldown_minutes": 90,
     "t_signal_max_per_day": 2,
     "context_refresh_cooldown_minutes": 120,
-    "dynamic_range_threshold_pct": 8
+    "dynamic_range_threshold_pct": 8,
+    "auto_trade_min_confidence": "中",
+    "auto_trade_min_spread_pct": 1.5,
+    "auto_trade_target_atr_tolerance": 0.5,
+    "auto_trade_min_recent_volume_ratio": 0.6
   },
   "account": {
     "position_capital": 200000,
@@ -36,13 +40,23 @@
       "cost_price": 158.6426,
       "base_position": 200,
       "per_trade_shares": 100,
-      "buy_range": [154.0, 156.2],
-      "sell_range": [158.2, 161.5],
+      "buy_range": [
+        154.0,
+        156.2
+      ],
+      "sell_range": [
+        158.2,
+        161.5
+      ],
       "stop_loss": 152.5,
       "strategy": "顺T优先",
       "allow_market_panic_reverse_t": true,
       "panic_rebound_pct": 0.9,
-      "sector_tags": ["半导体", "存储芯片", "算力"],
+      "sector_tags": [
+        "半导体",
+        "存储芯片",
+        "算力"
+      ],
       "note": "当前离成本较近，优先作为修复账户的主做T票。"
     },
     {
@@ -52,13 +66,23 @@
       "cost_price": 104.4211,
       "base_position": 681,
       "per_trade_shares": 100,
-      "buy_range": [76.0, 77.2],
-      "sell_range": [78.4, 80.2],
+      "buy_range": [
+        76.0,
+        77.2
+      ],
+      "sell_range": [
+        78.4,
+        80.2
+      ],
       "stop_loss": 74.8,
       "strategy": "轻仓逆T",
       "allow_rebound_watch_after_stop": true,
       "rebound_buy_above": 75.2,
-      "sector_tags": ["云计算", "信创", "AI算力"],
+      "sector_tags": [
+        "云计算",
+        "信创",
+        "AI算力"
+      ],
       "note": "波动较大，适合轻仓分段做T，不要连续加仓。"
     },
     {
@@ -68,11 +92,21 @@
       "cost_price": 19.4646,
       "base_position": 4201,
       "per_trade_shares": 300,
-      "buy_range": [13.4, 13.8],
-      "sell_range": [14.2, 14.8],
+      "buy_range": [
+        13.4,
+        13.8
+      ],
+      "sell_range": [
+        14.2,
+        14.8
+      ],
       "stop_loss": 13.1,
       "strategy": "箱体震荡",
-      "sector_tags": ["人工智能", "数字经济", "机器人"],
+      "sector_tags": [
+        "人工智能",
+        "数字经济",
+        "机器人"
+      ],
       "note": "持仓较大，只在箱体边缘做，避免中间位置频繁来回。"
     },
     {
@@ -82,11 +116,21 @@
       "cost_price": 16.7029,
       "base_position": 2700,
       "per_trade_shares": 500,
-      "buy_range": [11.1, 11.4],
-      "sell_range": [11.7, 12.1],
+      "buy_range": [
+        11.1,
+        11.4
+      ],
+      "sell_range": [
+        11.7,
+        12.1
+      ],
       "stop_loss": 10.95,
       "strategy": "箱体震荡",
-      "sector_tags": ["传媒", "广告营销", "AI应用"],
+      "sector_tags": [
+        "传媒",
+        "广告营销",
+        "AI应用"
+      ],
       "note": "持仓大、价格低，适合固定股数做日内差价。"
     },
     {
@@ -96,8 +140,14 @@
       "cost_price": 22.0128,
       "base_position": 1600,
       "per_trade_shares": 300,
-      "buy_range": [7.55, 7.8],
-      "sell_range": [8.0, 8.3],
+      "buy_range": [
+        7.55,
+        7.8
+      ],
+      "sell_range": [
+        8.0,
+        8.3
+      ],
       "stop_loss": 7.35,
       "strategy": "观察",
       "note": "暂不启用，等出现更明确箱体后再纳入。"
@@ -109,12 +159,22 @@
       "cost_price": 69.2191,
       "base_position": 700,
       "per_trade_shares": 100,
-      "buy_range": [18.3, 18.8],
-      "sell_range": [19.2, 19.8],
+      "buy_range": [
+        18.3,
+        18.8
+      ],
+      "sell_range": [
+        19.2,
+        19.8
+      ],
       "stop_loss": 18.0,
       "strategy": "趋势观察",
       "watch_mode": "light",
-      "sector_tags": ["东数西算", "云计算", "数据中心"],
+      "sector_tags": [
+        "东数西算",
+        "云计算",
+        "数据中心"
+      ],
       "note": "已纳入轻观察模式：保留卖出观察和风险提醒，默认不做逆T低吸，先跟踪趋势延续和流动性。"
     },
     {
@@ -124,8 +184,14 @@
       "cost_price": 147.261,
       "base_position": 100,
       "per_trade_shares": 100,
-      "buy_range": [40.0, 41.2],
-      "sell_range": [42.2, 43.5],
+      "buy_range": [
+        40.0,
+        41.2
+      ],
+      "sell_range": [
+        42.2,
+        43.5
+      ],
       "stop_loss": 39.2,
       "strategy": "观察",
       "note": "只有100股，提醒意义有限，除非你准备额外腾挪做T仓。"
@@ -137,8 +203,14 @@
       "cost_price": 158.3904,
       "base_position": 100,
       "per_trade_shares": 100,
-      "buy_range": [14.1, 14.6],
-      "sell_range": [15.0, 15.6],
+      "buy_range": [
+        14.1,
+        14.6
+      ],
+      "sell_range": [
+        15.0,
+        15.6
+      ],
       "stop_loss": 13.8,
       "strategy": "观察",
       "note": "持仓过小，优先级不高。"
@@ -150,8 +222,14 @@
       "cost_price": 438.9029,
       "base_position": 100,
       "per_trade_shares": 100,
-      "buy_range": [48.5, 49.8],
-      "sell_range": [50.8, 52.5],
+      "buy_range": [
+        48.5,
+        49.8
+      ],
+      "sell_range": [
+        50.8,
+        52.5
+      ],
       "stop_loss": 47.8,
       "strategy": "观察",
       "note": "只有100股，做T空间不大，先不纳入默认监控。"
@@ -163,8 +241,14 @@
       "cost_price": 362.8006,
       "base_position": 100,
       "per_trade_shares": 100,
-      "buy_range": [40.2, 41.3],
-      "sell_range": [42.0, 43.4],
+      "buy_range": [
+        40.2,
+        41.3
+      ],
+      "sell_range": [
+        42.0,
+        43.4
+      ],
       "stop_loss": 39.5,
       "strategy": "观察",
       "note": "持仓较小，优先级次于主修复票。"

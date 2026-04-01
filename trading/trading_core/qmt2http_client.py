@@ -4,6 +4,9 @@ from typing import Dict, Optional
 import requests
 
 
+QMT2HTTP_DEFAULT_TOKEN = "998811"
+
+
 def normalize_stock_code(code: str, code_format: str = "plain") -> str:
     text = str(code or "").strip().upper()
     if not text:
@@ -25,7 +28,7 @@ class Qmt2HttpClient:
             or os.getenv("QMT2HTTP_BASE_URL")
             or "http://150.158.31.115:8085"
         ).rstrip("/")
-        self.api_token = str(config.get("api_token") or os.getenv("QMT2HTTP_API_TOKEN") or "").strip()
+        self.api_token = str(config.get("api_token") or os.getenv("QMT2HTTP_API_TOKEN") or QMT2HTTP_DEFAULT_TOKEN).strip()
         self.timeout = float(config.get("timeout") or os.getenv("QMT2HTTP_TIMEOUT") or 20)
         self.account_id = str(config.get("account_id") or os.getenv("QMT_ACCOUNT_ID") or "").strip()
         self.account_type = str(config.get("account_type") or os.getenv("QMT_ACCOUNT_TYPE") or "STOCK").strip() or "STOCK"
@@ -36,6 +39,7 @@ class Qmt2HttpClient:
         headers = {"Content-Type": "application/json"}
         if self.api_token:
             headers["X-API-Token"] = self.api_token
+            headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
 
     def _request(self, method: str, path: str, payload: Optional[Dict] = None) -> Dict:
