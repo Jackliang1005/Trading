@@ -813,6 +813,21 @@ def opportunity_score(
     if learning.preferred_structure and learning.preferred_structure == analysis.structure:
         score += 6
         reasons.append(f"结构复盘偏好({analysis.structure})")
+    forecast_weight = 10 if analysis.forecast_confidence == "高" else 6 if analysis.forecast_confidence == "中" else 3
+    if analysis.forecast_bias == "bullish":
+        if action == "buy":
+            score += forecast_weight
+            reasons.append(f"TimeFM预测偏强({analysis.forecast_return_pct:+.2f}%)")
+        elif action == "sell":
+            score -= forecast_weight
+            reasons.append("TimeFM预测不支持追卖")
+    elif analysis.forecast_bias == "bearish":
+        if action == "sell":
+            score += forecast_weight
+            reasons.append(f"TimeFM预测偏弱({analysis.forecast_return_pct:+.2f}%)")
+        elif action == "buy":
+            score -= forecast_weight
+            reasons.append("TimeFM预测不支持抄底")
     score = max(0, min(score, 100))
     level = "S" if score >= 75 else ("A" if score >= 60 else ("B" if score >= 40 else "C"))
     return score, level, " / ".join(reasons) or "等待更优位置", action
@@ -869,6 +884,7 @@ def format_t_signal(
         target_line = f"关注区间：T买 {analysis.t_buy_target:.2f} / T卖 {analysis.t_sell_target:.2f}"
         abort_line = "放弃条件：价差继续收窄或结构失真"
     auto_line = "是" if auto_trade_enabled and should_auto_trade_signal(analysis, rule, quote, market, learning) else "否"
+    forecast_line = analysis.forecast_summary if analysis.forecast_summary else "TimeFM：未启用"
     return (
         f"📊 做T大脑信号{dynamic_tag}\n"
         f"时间：{now}\n"
@@ -878,6 +894,7 @@ def format_t_signal(
         f"核心依据：{reason}\n"
         f"VWAP：{analysis.vwap:.2f} / MA20：{analysis.ma20:.2f} / MA60：{analysis.ma60:.2f}\n"
         f"结构：{analysis.structure} / 波动单位：{analysis.risk_unit:.3f}\n"
+        f"{forecast_line}\n"
         f"建议动作：{action}\n"
         f"{trigger_line}\n"
         f"{target_line}\n"

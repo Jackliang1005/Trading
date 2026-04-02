@@ -7,11 +7,22 @@
     "enabled": true,
     "base_url": "http://150.158.31.115:8085",
     "api_token": "998811",
-    "timeout": 20,
+    "timeout": 130,
     "account_id": "2035032946",
     "account_type": "STOCK",
     "code_format": "plain",
     "auto_trade_enabled": true
+  },
+  "timefm": {
+    "enabled": true,
+    "model_name": "google/timesfm-2.0-500m-pytorch",
+    "endpoint": "https://hf-mirror.com",
+    "context_length": 256,
+    "horizon": 12,
+    "min_bars": 96,
+    "normalize_inputs": true,
+    "torch_compile": false,
+    "target_blend_weight": 0.35
   },
   "monitor": {
     "poll_seconds": 180,

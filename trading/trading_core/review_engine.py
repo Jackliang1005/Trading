@@ -41,6 +41,9 @@ class ReviewEngine:
             "market_regime": market_regime.regime,
             "analysis_structure": selection.get("analysis_structure", ""),
             "analysis_risk_unit": float(selection.get("analysis_risk_unit", 0) or 0),
+            "analysis_forecast_bias": str(selection.get("analysis_forecast_bias", "") or ""),
+            "analysis_forecast_return_pct": float(selection.get("analysis_forecast_return_pct", 0) or 0),
+            "analysis_forecast_summary": str(selection.get("analysis_forecast_summary", "") or ""),
             "selection_action": selection.get("action", ""),
             "selection_am_mode": selection.get("am_mode", selection.get("selection_am_mode", "")),
             "selection_pm_mode": selection.get("pm_mode", selection.get("selection_pm_mode", "")),
@@ -59,6 +62,8 @@ class ReviewEngine:
             "allow_auto_trade": decision.allow_auto_trade,
             "reason": decision.reason,
             "risk_flags": decision.risk_flags,
+            "forecast_bias": decision.forecast_bias,
+            "forecast_return_pct": decision.forecast_return_pct,
         })
         atomic_write_json(path, data)
 

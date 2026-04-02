@@ -24,6 +24,16 @@ class IntradayAnalysis:
     risk_unit: float = 0.0
     intraday_trend_pct: float = 0.0
     day_range_pct: float = 0.0
+    forecast_source: str = ""
+    forecast_enabled: bool = False
+    forecast_horizon: int = 0
+    forecast_end_price: float = 0.0
+    forecast_high_price: float = 0.0
+    forecast_low_price: float = 0.0
+    forecast_return_pct: float = 0.0
+    forecast_bias: str = "neutral"
+    forecast_confidence: str = "低"
+    forecast_summary: str = ""
 
 
 @dataclass
@@ -116,6 +126,8 @@ class DecisionResult:
     hold_minutes: int
     allow_auto_trade: bool
     risk_flags: List[str]
+    forecast_bias: str = "neutral"
+    forecast_return_pct: float = 0.0
 
 
 @dataclass
@@ -175,3 +187,4 @@ class SelectionResult:
     buy_block_reason: str = ""
     learning_risk_factor: float = 1.0
     learning_preferred_structure: str = ""
+    score_breakdown: Dict = field(default_factory=dict)

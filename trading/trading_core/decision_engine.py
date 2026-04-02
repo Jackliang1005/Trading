@@ -128,6 +128,21 @@ def make_decision(
     if learning.preferred_structure and learning.preferred_structure == analysis.structure:
         score += 6
         reasons.append(f"结构复盘偏好({analysis.structure})")
+    forecast_weight = 10 if analysis.forecast_confidence == "高" else 6 if analysis.forecast_confidence == "中" else 3
+    if analysis.forecast_bias == "bullish":
+        if action == "buy":
+            score += forecast_weight
+            reasons.append(f"TimeFM看多({analysis.forecast_return_pct:+.2f}%)")
+        elif action == "sell":
+            score -= forecast_weight
+            reasons.append("TimeFM与卖出方向冲突")
+    elif analysis.forecast_bias == "bearish":
+        if action == "sell":
+            score += forecast_weight
+            reasons.append(f"TimeFM看空({analysis.forecast_return_pct:+.2f}%)")
+        elif action == "buy":
+            score -= forecast_weight
+            reasons.append("TimeFM与买入方向冲突")
     score = max(0, min(score, 100))
     risk = evaluate_risk(
         rule,
@@ -166,6 +181,8 @@ def make_decision(
         hold_minutes=hold_minutes,
         allow_auto_trade=risk.allow_auto_trade and risk.allowed,
         risk_flags=risk.risk_flags,
+        forecast_bias=analysis.forecast_bias,
+        forecast_return_pct=analysis.forecast_return_pct,
     )
 
 
@@ -187,6 +204,7 @@ def format_decision_message(
         f"Playbook：{decision.playbook_name}\n"
         f"市场状态：{market_regime.regime} / 风险{market_regime.risk_level}\n"
         f"结构：{analysis.structure} / 波动单位{analysis.risk_unit:.3f}\n"
+        f"{analysis.forecast_summary if analysis.forecast_summary else 'TimeFM：未启用'}\n"
         f"建议动作：{action_text} {rule.per_trade_shares if decision.action in ('buy', 'sell') else 0}股\n"
         f"触发价：{trigger_line}\n"
         f"当前执行价：{decision.execution_price:.2f}\n"

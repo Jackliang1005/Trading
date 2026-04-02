@@ -47,6 +47,7 @@ from .selector_agent import (
     select_focus_list,
     sync_selection_to_daily_plan,
 )
+from .timefm_agent import enrich_analysis_with_timefm
 from .command_service import TradingCommandService
 from .models import MarketContext
 from .storage import atomic_write_json, load_config, load_daily_plan, load_state, merge_daily_plan, parse_rules, save_daily_plan, save_state
@@ -461,11 +462,37 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
             yesterday = yesterday_cache.get(rule.code) or fetch_yesterday_daily(rule.code)
             if yesterday:
                 yesterday_cache[rule.code] = yesterday
+                print(
+                    f"{rule.name}({rule.code}) 昨日数据 "
+                    f"high={float(yesterday.get('high', 0) or 0):.2f} "
+                    f"low={float(yesterday.get('low', 0) or 0):.2f} "
+                    f"close={float(yesterday.get('close', 0) or 0):.2f}"
+                )
+            else:
+                print(f"{rule.name}({rule.code}) 未获取到昨日日线数据")
             bars = fetch_full_intraday_bars(rule.code)
+            print(f"{rule.name}({rule.code}) 分钟线抓取结果 bars={len(bars) if bars else 0}")
             if bars and len(bars) >= 15:
                 raw_analysis = compute_intraday_analysis(rule.code, rule, bars, yesterday)
                 if raw_analysis:
+                    print(
+                        f"{rule.name}({rule.code}) analysis-ready "
+                        f"struct={raw_analysis.structure} "
+                        f"t_buy={raw_analysis.t_buy_target:.2f} "
+                        f"t_sell={raw_analysis.t_sell_target:.2f} "
+                        f"spread={raw_analysis.t_spread_pct:.1f}%"
+                    )
                     analysis = adjust_for_strategy(raw_analysis, rule)
+                    analysis = enrich_analysis_with_timefm(rule.code, bars, analysis, config_path=config_path)
+                    print(
+                        f"{rule.name}({rule.code}) timefm "
+                        f"bias={analysis.forecast_bias} "
+                        f"ret={analysis.forecast_return_pct:+.2f}% "
+                        f"conf={analysis.forecast_confidence} "
+                        f"summary={analysis.forecast_summary or 'n/a'}"
+                    )
+                else:
+                    print(f"{rule.name}({rule.code}) analysis-ready failed: compute_intraday_analysis returned None")
             else:
                 bar_count = len(bars) if bars else 0
                 print(f"{rule.name}({rule.code}) 分钟线不足，跳过体系化决策：bars={bar_count}")
@@ -491,6 +518,15 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                 planned_buy_shares=suggested_buy_shares,
                 planned_sell_shares=suggested_sell_shares,
             )
+            print(
+                f"{rule.name}({rule.code}) decision-generated "
+                f"action={decision.action} "
+                f"score={decision.score} "
+                f"level={decision.level} "
+                f"trigger={decision.trigger_price:.2f} "
+                f"target={decision.target_price:.2f} "
+                f"stop={decision.stop_price:.2f}"
+            )
             review_engine.append_decision(
                 rule,
                 playbook,
@@ -501,8 +537,12 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
                     **selection,
                     "analysis_structure": analysis.structure,
                     "analysis_risk_unit": analysis.risk_unit,
+                    "analysis_forecast_bias": analysis.forecast_bias,
+                    "analysis_forecast_return_pct": analysis.forecast_return_pct,
+                    "analysis_forecast_summary": analysis.forecast_summary,
                 },
             )
+            print(f"{rule.name}({rule.code}) decision-journal appended")
             message_signal_allowed = decision.action in ("buy", "sell") and should_send_t_signal(state, rule.code, t_signal_cooldown, t_signal_max_per_day)
             execution_filter_reasons = []
             if decision.action in ("buy", "sell"):
@@ -601,6 +641,8 @@ def check_once(config_path: Path, dry_run: bool = False) -> int:
             message += f"\n新闻解释：{selection_explanation}"
         if analysis:
             message += f"\n--- 做T大脑摘要 ---\nVWAP {analysis.vwap:.2f} / T买 {analysis.t_buy_target:.2f} / T卖 {analysis.t_sell_target:.2f} / 价差 {analysis.t_spread_pct:.1f}% / 置信度 {analysis.confidence}"
+            if analysis.forecast_summary:
+                message += f"\nTimeFM：{analysis.forecast_summary}"
         print(message)
         print("-" * 60)
         delivered = dry_run or not feishu_cfg.get("enabled", True) or (send_allowed and send_feishu(feishu_cfg.get("target", "").strip(), message))
