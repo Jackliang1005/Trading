@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, os.path.dirname(__file__))
 
 import db
-from data_collector import fetch_qmt_positions, _qmt_rpc
+from qmt_client import get_qmt_manager
 
 # ──────────────── 常量 ────────────────
 
@@ -317,14 +317,13 @@ def get_stock_sectors(stock_code: str) -> List[str]:
     """
     base_code = stock_code.split(".")[0]
 
-    # 1. QMT RPC
+    # 1. QMT RPC（通过统一客户端）
     try:
+        qm = get_qmt_manager()
         qmt_code = stock_code if "." in stock_code else stock_code
-        result = _qmt_rpc("get_stock_sectors", {"code": qmt_code})
-        if result and result.get("success") and result.get("data"):
-            data = result["data"]
-            if isinstance(data, list) and data:
-                return data
+        data = qm.main.get_stock_sectors(qmt_code)
+        if isinstance(data, list) and data:
+            return data
     except Exception:
         pass
 
@@ -340,22 +339,34 @@ def get_stock_sectors(stock_code: str) -> List[str]:
 
 # ──────────────── 持仓获取 ────────────────
 
-def fetch_positions() -> List[Dict]:
-    """获取持仓：优先 QMT 实时，回退到最近 snapshot 缓存"""
-    # 1. 实时 QMT
-    positions = fetch_qmt_positions()
-    if positions:
-        return positions
+def fetch_positions() -> tuple[List[Dict], str]:
+    """获取持仓：优先 QMT 双服务器实时，回退到 portfolio snapshot，再回退旧 snapshot。"""
+    try:
+        qm = get_qmt_manager()
+        positions = qm.get_all_positions()
+        if positions:
+            return positions, "runtime"
+    except Exception as e:
+        print(f"  ⚠️ QMT 持仓获取失败: {e}")
 
-    # 2. 从最近 snapshot 读取缓存
+    # 2. 从统一 bundle 读取 portfolio snapshot
+    bundle = db.get_latest_analysis_context_bundle(packet_types=["prediction_context"])
+    portfolio = bundle.get("portfolio_snapshot")
+    if portfolio:
+        cached = portfolio.get("data", {}).get("qmt_positions", [])
+        if cached:
+            print("  ℹ️ 使用 portfolio snapshot 持仓缓存")
+            return cached, "portfolio_snapshot"
+
+    # 3. 从最近旧 snapshot 读取缓存
     latest = db.get_latest_snapshot("daily_close")
     if latest:
         cached = latest.get("data", {}).get("qmt_positions", [])
         if cached:
-            print("  ℹ️ 使用缓存持仓数据")
-            return cached
+            print("  ℹ️ 使用 daily_close snapshot 持仓缓存")
+            return cached, "daily_close_snapshot"
 
-    return []
+    return [], "none"
 
 
 # ──────────────── 持仓诊断 ────────────────
@@ -465,7 +476,7 @@ def generate_sector_report() -> Dict:
 
     # 3. 获取持仓
     print("  📋 获取持仓...")
-    positions = fetch_positions()
+    positions, portfolio_source = fetch_positions()
 
     # 4. 持仓诊断
     print("  🔬 持仓诊断...")
@@ -483,6 +494,7 @@ def generate_sector_report() -> Dict:
         "us_stocks": us_stocks,
         "rotation_prediction": rotation_prediction,
         "positions_count": len(positions),
+        "portfolio_source": portfolio_source,
         "diagnosis": diagnosis,
     }
 

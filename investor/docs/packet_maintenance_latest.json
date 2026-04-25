@@ -1,0 +1,71 @@
+{
+  "run_at": "2026-04-25T16:31:56",
+  "dry_run": true,
+  "force": false,
+  "limits": {
+    "daily_close": 2,
+    "intraday": 2
+  },
+  "daily_close": {
+    "total_candidates": 2,
+    "processed": 2,
+    "skipped_unsupported_type": 0,
+    "skipped_already_backfilled": 2,
+    "success": 0,
+    "failed": 0,
+    "dry_run": true,
+    "coverage_before": {
+      "research_packets_total": 144,
+      "portfolio_snapshots_total": 41,
+      "research_packet_dates": 30,
+      "portfolio_snapshot_dates": 30
+    },
+    "coverage_after": {
+      "research_packets_total": 144,
+      "portfolio_snapshots_total": 41,
+      "research_packet_dates": 30,
+      "portfolio_snapshot_dates": 30
+    }
+  },
+  "intraday": {
+    "total_candidates": 0,
+    "processed": 0,
+    "skipped_unsupported_type": 0,
+    "skipped_already_backfilled": 0,
+    "success": 0,
+    "failed": 0,
+    "dry_run": true,
+    "coverage_before": {
+      "research_packets_total": 144,
+      "portfolio_snapshots_total": 41,
+      "research_packet_dates": 30,
+      "portfolio_snapshot_dates": 30
+    },
+    "coverage_after": {
+      "research_packets_total": 144,
+      "portfolio_snapshots_total": 41,
+      "research_packet_dates": 30,
+      "portfolio_snapshot_dates": 30
+    }
+  },
+  "merged": {
+    "total_candidates": 2,
+    "processed": 2,
+    "skipped_unsupported_type": 0,
+    "skipped_already_backfilled": 2,
+    "success": 0,
+    "failed": 0
+  },
+  "coverage_before": {
+    "research_packets_total": 144,
+    "portfolio_snapshots_total": 41,
+    "research_packet_dates": 30,
+    "portfolio_snapshot_dates": 30
+  },
+  "coverage_after": {
+    "research_packets_total": 144,
+    "portfolio_snapshots_total": 41,
+    "research_packet_dates": 30,
+    "portfolio_snapshot_dates": 30
+  }
+}

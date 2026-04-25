@@ -1,0 +1,20 @@
+[Unit]
+Description=Investor Feishu Webhook (Unified)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.openclaw/workspace/investor
+Environment=HOME=/root
+Environment=NODE_VERSION=22.22.0
+Environment=PATH=/root/.local/share/pnpm:/root/.nvm/versions/node/v22.22.0/bin:/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=INVESTOR_ROOT=/root/.openclaw/workspace/investor
+ExecStart=/usr/bin/python3 /root/.openclaw/workspace/investor/feishu_webhook_server.py --port 8788
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/.openclaw/workspace/investor/logs/feishu_webhook.log
+StandardError=append:/root/.openclaw/workspace/investor/logs/feishu_webhook_error.log
+
+[Install]
+WantedBy=multi-user.target

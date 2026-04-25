@@ -1,0 +1,226 @@
+{
+  "version": 2,
+  "updated_at": "2026-04-25T16:31:55.677027",
+  "weights": {
+    "technical": 0.1,
+    "fundamental": 0.237,
+    "sentiment": 0.427,
+    "geopolitical": 0.237
+  },
+  "weight_history": [
+    {
+      "date": "2026-04-01",
+      "old_weights": {
+        "technical": 0.3,
+        "fundamental": 0.25,
+        "sentiment": 0.2,
+        "geopolitical": 0.25
+      },
+      "new_weights": {
+        "technical": 0.25,
+        "fundamental": 0.25,
+        "sentiment": 0.25,
+        "geopolitical": 0.25
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "sentiment",
+          "total": 3,
+          "correct": 0,
+          "win_rate": 0.0,
+          "avg_score": 26.0
+        },
+        {
+          "strategy_used": "technical",
+          "total": 33,
+          "correct": 11,
+          "win_rate": 33.3,
+          "avg_score": 45.4
+        }
+      ]
+    },
+    {
+      "date": "2026-04-02",
+      "old_weights": {
+        "technical": 0.25,
+        "fundamental": 0.25,
+        "sentiment": 0.25,
+        "geopolitical": 0.25
+      },
+      "new_weights": {
+        "technical": 0.2,
+        "fundamental": 0.25,
+        "sentiment": 0.3,
+        "geopolitical": 0.25
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "sentiment",
+          "total": 2,
+          "correct": 0,
+          "win_rate": 0.0,
+          "avg_score": 20.5
+        },
+        {
+          "strategy_used": "technical",
+          "total": 34,
+          "correct": 12,
+          "win_rate": 35.3,
+          "avg_score": 45.8
+        }
+      ]
+    },
+    {
+      "date": "2026-04-05",
+      "old_weights": {
+        "technical": 0.2,
+        "fundamental": 0.25,
+        "sentiment": 0.3,
+        "geopolitical": 0.25
+      },
+      "new_weights": {
+        "technical": 0.15,
+        "fundamental": 0.25,
+        "sentiment": 0.35,
+        "geopolitical": 0.25
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "sentiment",
+          "total": 2,
+          "correct": 0,
+          "win_rate": 0.0,
+          "avg_score": 20.5
+        },
+        {
+          "strategy_used": "technical",
+          "total": 22,
+          "correct": 5,
+          "win_rate": 22.7,
+          "avg_score": 34.8
+        }
+      ]
+    },
+    {
+      "date": "2026-04-12",
+      "old_weights": {
+        "technical": 0.15,
+        "fundamental": 0.25,
+        "sentiment": 0.35,
+        "geopolitical": 0.25
+      },
+      "new_weights": {
+        "technical": 0.1,
+        "fundamental": 0.25,
+        "sentiment": 0.4,
+        "geopolitical": 0.25
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "sentiment",
+          "total": 1,
+          "correct": 0,
+          "win_rate": 0.0,
+          "avg_score": 13.0
+        },
+        {
+          "strategy_used": "technical",
+          "total": 14,
+          "correct": 2,
+          "win_rate": 14.3,
+          "avg_score": 27.3
+        }
+      ]
+    },
+    {
+      "date": "2026-04-19",
+      "old_weights": {
+        "technical": 0.1,
+        "fundamental": 0.25,
+        "sentiment": 0.4,
+        "geopolitical": 0.25
+      },
+      "new_weights": {
+        "technical": 0.095,
+        "fundamental": 0.238,
+        "sentiment": 0.429,
+        "geopolitical": 0.238
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "sentiment",
+          "total": 1,
+          "correct": 1,
+          "win_rate": 100.0,
+          "avg_score": 84.0
+        },
+        {
+          "strategy_used": "technical",
+          "total": 17,
+          "correct": 7,
+          "win_rate": 41.2,
+          "avg_score": 48.0
+        }
+      ]
+    },
+    {
+      "date": "2026-04-25",
+      "old_weights": {
+        "technical": 0.095,
+        "fundamental": 0.238,
+        "sentiment": 0.429,
+        "geopolitical": 0.238
+      },
+      "new_weights": {
+        "technical": 0.1,
+        "fundamental": 0.237,
+        "sentiment": 0.427,
+        "geopolitical": 0.237
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "technical",
+          "total": 1,
+          "correct": 0,
+          "win_rate": 0.0,
+          "avg_score": 20.0
+        }
+      ]
+    },
+    {
+      "date": "2026-04-25",
+      "old_weights": {
+        "technical": 0.1,
+        "fundamental": 0.237,
+        "sentiment": 0.427,
+        "geopolitical": 0.237
+      },
+      "new_weights": {
+        "technical": 0.1,
+        "fundamental": 0.237,
+        "sentiment": 0.427,
+        "geopolitical": 0.237
+      },
+      "reason": "基于近14天表现自动调整",
+      "performance": [
+        {
+          "strategy_used": "technical",
+          "total": 1,
+          "correct": 0,
+          "win_rate": 0.0,
+          "avg_score": 20.0
+        }
+      ]
+    }
+  ],
+  "auto_adjust_enabled": true,
+  "min_weight": 0.1,
+  "max_weight": 0.6,
+  "adjust_step": 0.05
+}
