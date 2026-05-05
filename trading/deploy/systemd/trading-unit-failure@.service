@@ -1,0 +1,11 @@
+[Unit]
+Description=Trading unit failure notifier for %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/.openclaw/workspace/trading
+EnvironmentFile=-/root/.openclaw/workspace/trading/.env.longterm
+ExecStart=/root/.openclaw/workspace/trading/deploy/systemd/unit_failure_notify.sh %i
+
+[Install]
+WantedBy=multi-user.target

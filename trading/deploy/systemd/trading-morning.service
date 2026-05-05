@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading LongTerm Morning Decision
+After=network-online.target
+Wants=network-online.target
+OnFailure=trading-unit-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/.openclaw/workspace/trading
+EnvironmentFile=-/root/.openclaw/workspace/trading/.env.longterm
+ExecStart=/root/.openclaw/workspace/trading/run_longterm_morning_decision.sh
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

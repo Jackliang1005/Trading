@@ -1,0 +1,11 @@
+[Unit]
+Description=Timer for Trading LongTerm Morning Decision
+
+[Timer]
+OnCalendar=Mon..Fri 09:35:00
+Persistent=true
+RandomizedDelaySec=15
+Unit=trading-morning.service
+
+[Install]
+WantedBy=timers.target

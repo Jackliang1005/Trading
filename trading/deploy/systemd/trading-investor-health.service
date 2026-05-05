@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading + Investor Bootstrap Health Check
+After=network-online.target
+Wants=network-online.target
+OnFailure=trading-unit-failure@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/.openclaw/workspace
+Environment=RUN_DECISION=0
+ExecStart=/root/.openclaw/workspace/run_trading_investor_bootstrap.sh
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

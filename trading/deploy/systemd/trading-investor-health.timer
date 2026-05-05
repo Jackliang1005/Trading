@@ -1,0 +1,12 @@
+[Unit]
+Description=Timer for Trading + Investor Bootstrap Health Check
+
+[Timer]
+OnCalendar=Mon..Fri 09:20:00
+OnCalendar=Mon..Fri 15:55:00
+Persistent=true
+RandomizedDelaySec=15
+Unit=trading-investor-health.service
+
+[Install]
+WantedBy=timers.target
