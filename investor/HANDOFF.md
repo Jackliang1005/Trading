@@ -1,16 +1,19 @@
-# 🦞 OpenClaw Investor — Handoff 手册
+# 🦞 小龙虾 (XiaoLongXia) — Investor Handoff 手册
 
-> 下次启动优化前，先读此文件，快速恢复上下文。
+> 下次启动前先读此文件，快速恢复上下文。
 
 ## 系统定位
 
-自学习 A股投资分析系统，核心循环：**Collect → Predict → Reflect → Evolve**。
-自动采集多源数据、LLM 生成预测、回测打分、策略权重/规则/Few-shot 自动进化。
-现已集成 **双服务器 QMT 网关**（主服务器 + 交易专用服务器），支持实盘交易数据采集与展示。
+自学习 A股投资分析系统，统一名称 **小龙虾 (XiaoLongXia)**，核心循环：**Collect → Predict → Reflect → Evolve**。
+跨两个子系统运作：
+- **investor/** — 研究/预测/反思/进化/实盘监控/飞书交互
+- **trading/** — 长线组合模拟（快照供 investor 消费）
+
+现已集成 **双服务器 QMT 网关**（国金全功能 + 东莞交易专用），支持实盘交易数据采集与展示。
 
 ## 当前运行策略（稳定观察模式）
 
-当前阶段以“先稳定运行、后增量开发”为主，不继续扩大主线功能面。  
+当前阶段以”先稳定运行、后增量开发”为主，不继续扩大主线功能面。
 优先关注三项运行指标：
 
 - 飞书查询成功率（含 `/持仓`、`/监控`、`东莞策略日志`、`国金ETF 13:20/14:20`）
@@ -27,25 +30,58 @@
 ## 模块地图
 
 ```
-main.py              CLI 入口，所有命令调度
-qmt_client.py        🆕 统一双服务器 QMT 客户端（QMTClient + QMTManager）
+main.py              CLI 入口，统合调度 (legacy + new-style 命令)
+app/cli.py           New-style 命令实现层（监控/交易视图/飞书/修复任务）
+qmt_client.py        统一双服务器 QMT 客户端（QMTClient + QMTManager）
 data_collector.py    数据采集（双服务器QMT/OpenClaw A股插件/AKShare/东财/RSS/全球指数/大宗商品/宏观新闻）
-predictor.py         LLM 预测生成（含实盘交易上下文：持仓盈亏/今日成交/待成交委托）
-reflection.py        回测打分 + 每日/周/月反思报告 + 实盘交易摘要
-evolution.py         策略权重调整 + 规则库更新 + Few-shot 管理 + system prompt 生成
-knowledge_base.py    FTS5 全文检索 RAG + Few-shot 构建
-sector_scanner.py    板块轮动扫描 + 美股→A股映射 + 持仓诊断（使用QMT双服务器）
 db.py                SQLite 数据层（prediction_log/strategy/rules/few_shot/snapshots/kb）
-investor_agent.py    OpenClaw Agent 桥接接口
 cron_setup.py        定时任务配置生成
-record_prediction.py 预测记录辅助模块
+
+domain/
+├── entities/        领域实体定义
+├── services/        服务层（canonical index: __init__.py）
+│   ├── assistant_service.py         分析/看板/预测记录
+│   ├── prediction_service.py        预测快照加载/落库
+│   ├── prediction_prompt_service.py 预测提示词构建
+│   ├── prediction_orchestrator.py   预测编排（LLM调用/解析）
+│   ├── reflection_service.py        周度归因/月度审计编排
+│   ├── reflection_runtime_service.py 回测/每日反思/交易摘要
+│   ├── reflection_analysis_service.py 失败模式分析/周报格式化
+│   ├── evolution_service.py         策略进化（权重/规则/few-shot/prompt）
+│   ├── legacy_entry_service.py      定时任务编排入口
+│   ├── live_monitor_service.py      实盘监控编排
+│   ├── live_monitor_view_service.py 交易视图（today-*）
+│   ├── longterm_portfolio_service.py 长线组合快照聚合
+│   ├── feishu_query_service.py      飞书查询处理
+│   ├── feishu_bridge_service.py     飞书消息桥接
+│   └── analysis_context_service.py  分析上下文归一化
+└── policies/        策略规则引擎
+    ├── scoring_policy.py
+    └── confidence_policy.py
+
+workflows/           工作流编排脚本
+├── backfill_packets.py
+├── packet_maintenance.py
+├── daily_maintenance.py
+├── runtime_check.py
+├── run_smoke_checks.py
+├── scheduled_briefings.py
+└── sync_handoff_snapshot.py
+
+live_monitor/        实盘监控子系统
+├── collectors/      采集器（health/trade_state/runtime/observability/logs）
+├── analyzers/       分析器（heartbeat/error/phase/risk/root_cause）
+└── remediation/     修复任务（codex_fix_runner/escalation）
+
+legacy compatibility package removed; legacy command orchestration lives in domain/services/legacy_entry_service.py
 ```
 
 ## CLI 命令
 
 ```
-python3 main.py <command>
+python3 main.py <command> [args...]
 
+── 闭环命令 ──
 init          初始化 DB + 知识库
 collect       采集每日数据（07:30）— 含双服务器QMT账户/持仓/委托/成交/交易摘要
 predict       生成预测（09:30）— 含实盘交易上下文
@@ -56,14 +92,46 @@ dashboard     状态看板
 prompt        查看当前 system prompt
 backtest      手动回测
 sector-scan   板块扫描 + 美股映射 + 持仓诊断
-record        手动录入预测
-feishu-query  Feishu plugin 查询入口（如：国金今天持仓）
-feishu-bridge Feishu plugin 事件桥接入口（--query 或 stdin JSON）
-packet-maintain 日常 packet 增量维护（daily_close + intraday）
-handoff-sync  将 packet 维护快照同步写入 HANDOFF
-daily-maintain 日常维护总入口（packet-maintain + handoff-sync）
-runtime-check 运行诊断（qmt2http 健康/交易读口/日志）
-scheduled-briefing 定时交易简报（0945东莞策略 / 1320、1420国金ETF）
+sync-logs     同步生产机器日志到本地（15:10）
+
+── 监控与交易视图 ──
+monitor               实盘监控（qmt2http + qmttrader）
+monitor-trading       交易监控视图（候选/买入/持仓读口）
+runtime-check         运行诊断（qmt2http 健康/交易读口/日志）
+today-candidates      查看最新候选与最终选股
+today-buys            查看最新买入提交与成交摘要
+today-account         查看双账户读口与对账状态
+today-summary         查看候选/买入/账户/告警简报（支持 --text）
+longterm-summary      查看长线组合模拟盘聚合摘要
+
+── 飞书与数据维护 ──
+record                手动录入预测
+feishu-query          Feishu plugin 查询入口（如：国金今天持仓）
+feishu-bridge         Feishu plugin 事件桥接入口（--query 或 stdin JSON）
+scheduled-briefing    定时交易简报（0945东莞策略 / 1320、1420国金ETF）
+packet-maintain       日常 packet 增量维护（daily_close + intraday）
+handoff-sync          将 packet 维护快照同步写入 HANDOFF
+daily-maintain        日常维护总入口（packet-maintain + handoff-sync）
+backfill-packets      将 market_snapshots 回填为 research/portfolio packets
+smoke-check           执行主线 smoke 验收命令集合
+
+── 修复任务管理 ──
+fix-task-summary      查看修复任务状态摘要
+fix-tasks             查看 Codex 修复任务（open/acknowledged/patched/closed/all）
+fix-task-show         查看单个修复任务详情
+fix-task-context      查看修复任务精简排障上下文
+fix-task-pack         查看修复任务自动修复 payload
+fix-task-bundle       查看修复任务可投喂 agent 的最小输入
+fix-task-export       导出修复任务 bundle 到 JSON 文件
+fix-task-run-validation  执行修复任务验证计划
+fix-task-validations  查看修复任务验证记录
+fix-task-validation-groups  查看修复任务验证批次摘要
+fix-task-promote      按最新验证结果推进 patched/closed
+fix-task-ack          认领修复任务
+fix-task-note         给修复任务追加备注
+fix-task-patched      标记修复任务为已打补丁
+fix-task-close        关闭修复任务
+fix-task-reopen       重新打开修复任务
 ```
 
 `packet-maintain` 默认会生成：
@@ -77,10 +145,14 @@ scheduled-briefing 定时交易简报（0945东莞策略 / 1320、1420国金ETF�
 ```
 07:30  collect ─→ market_snapshots(daily_close) ─→ auto_memorize → kb
                    └→ qmt_account / qmt_positions / qmt_orders / qmt_trades / qmt_trading_summary
-09:30  predict ─→ 读 snapshot + 实盘交易上下文(持仓盈亏+成交+委托) + RAG + few-shot + system_prompt → LLM → prediction_log
-随时    sector-scan ─→ 同花顺热门板块 + 美股板块ETF + 龙头个股 + 双服务器持仓 → 轮动预判 → market_snapshots(sector_scan)
+09:30  predict ─→ 读 snapshot + 实盘交易上下文(持仓盈亏+成交+委托) + RAG + few-shot + system_prompt → LLM → 3日K线+买卖点预测 → prediction_log
+09:45  scheduled-briefing ─→ 东莞 NH/MIX 策略日志巡检
+13:20  scheduled-briefing ─→ 国金 ETF 午盘简报
+14:20  scheduled-briefing ─→ 国金 ETF 尾盘简报
+15:10  sync-logs ─→ 同步国金/东莞生产日志到本地
+随时   sector-scan ─→ 同花顺热门板块 + 美股板块ETF + 龙头个股 + 双服务器持仓 → 轮动预判 → market_snapshots(sector_scan)
 20:30  reflect ─→ 回测 prediction_log + 实盘交易摘要(双服务器汇总) → 打分 → reflection_reports/
-周日    evolve  ─→ 调权重 + 提规则 + 管 few-shot → strategy_config.json + system_prompt.md
+周日   evolve  ─→ 调权重 + 提规则 + 管 few-shot → strategy_config.json + system_prompt.md
 ```
 
 ---
@@ -168,14 +240,13 @@ summary = qm.get_trading_summary()
 - 已移除 `investor` 内旧的 Feishu 直连实现（OpenAPI/Webhook）。
 - 统一改为 plugin 调用：
   - `python3 main.py feishu-query "<query>"`
-  - `python3 feishu_plugin_query.py "<query>"`
 - 查询结果由 `qmt2http` 实时返回，适合飞书机器人问答场景（持仓/委托/成交/健康/日志）。
 
 ## 核心表结构（db.py）
 
 | 表 | 用途 | 关键字段 |
 |----|------|---------|
-| prediction_log | 预测记录+回测结果 | target, direction, confidence, score, is_correct |
+| prediction_log | 预测记录+回测结果 | target, trend_3d, direction, confidence, kline_day1/2/3, buy_point, sell_point, stop_loss, score |
 | strategy | 4策略权重+胜率 | name, weight, win_rate, avg_score |
 | rules | 投资规则库 | rule_text, category, confidence, enabled |
 | few_shot_examples | 好/坏分析案例 | category(good/bad), scenario, score |
@@ -183,11 +254,15 @@ summary = qm.get_trading_summary()
 | kb_documents + kb_fts | 知识库+全文检索 | doc_type, title, content |
 | reflection_reports | 反思报告 | report_type(daily/weekly/monthly) |
 
-## 预测打分逻辑（0-100）
+## 预测打分逻辑（0-100）— 3日K线+买卖点
 
-- 方向正确 +50，近似正确（实际波动<0.1%）+30
-- 置信度校准 +20（高置信+正确 → 满分）
-- 幅度准确度 +30（预测 vs 实际涨跌幅偏差越小越高）
+- 3日趋势正确 +35（bullish且涨 / bearish且跌 / ranging且波动<1.5%）
+- K线精度(收盘价) +25（3天收盘价预测 vs 实际，按误差衰减）
+- K线精度(区间) +15（预测的high/low覆盖实际波动区间程度）
+- 买卖点有效性 +15（实际价格触及 buy/sell 附近±1%）
+- 止损合理性 +10（未被触发且距离合理 2-6%）
+
+旧格式兼容：方向正确 +50，置信度校准 +20，幅度准确度 +30
 
 ## 策略进化参数
 
@@ -229,7 +304,8 @@ summary = qm.get_trading_summary()
 ## 已知限制 & 优化方向
 
 ### 当前限制
-- 预测仅覆盖 3 大指数（上证/深证/创业板），不含个股
+- 预测覆盖 3 大指数 + 持仓标的，输出3日K线(OHLC+形态)+买卖点(买入/卖出/止损)
+- 回测需等3个交易日后执行（给足时间让K线走完）
 - 美股数据来自新浪（`ak.stock_us_daily`），偶尔延迟或缺失
 - 同花顺涨停板块 API 非交易时段可能返回空
 - QMT 交易网关依赖外部服务器在线
@@ -367,7 +443,7 @@ journalctl -u feishu-webhook -f   # 实时日志
 | `/策略` | 策略权重配置 |
 | `/复盘` | 最新反思报告 |
 
-*最后更新: 2026-04-25 — 飞书 Webhook 接入完成*
+*最后更新: 2026-05-17 — Phase 7 旧代码清理与身份文档统一*
 
 ---
 
