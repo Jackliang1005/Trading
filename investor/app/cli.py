@@ -33,8 +33,23 @@ from domain.services.live_monitor_view_service import (
     get_today_summary,
     run_trading_monitor,
 )
+from domain.services.longterm_portfolio_service import (
+    build_longterm_snapshot_text,
+    load_longterm_snapshot,
+    summarize_longterm_snapshot,
+)
 from domain.services.feishu_query_service import handle_feishu_query
 from domain.services.feishu_bridge_service import build_bridge_response
+from domain.services.assistant_menu_service import build_assistant_menu, format_assistant_menu_text
+from domain.services.event_service import (
+    build_global_event_brief,
+    format_global_event_brief,
+    list_recent_events,
+    map_theme,
+    scan_events,
+    scan_global_events,
+    watch_events,
+)
 from workflows.daily_maintenance import run_daily_maintenance
 from workflows.backfill_packets import backfill_packets
 from workflows.packet_maintenance import run_packet_maintenance
@@ -42,6 +57,14 @@ from workflows.runtime_check import run_runtime_check
 from workflows.run_smoke_checks import run_smoke_checks
 from workflows.scheduled_briefings import run_scheduled_briefing
 from workflows.sync_handoff_snapshot import sync_handoff_snapshot
+from domain.services.weekly_report_service import build_weekly_report, save_weekly_report
+from domain.services.risk_report_service import build_risk_report, save_risk_report
+from domain.services.morning_brief_service import build_morning_brief, save_morning_brief
+from domain.services.assistant_status_service import build_assistant_status
+from domain.services.watchlist_report_service import build_watchlist_report
+from domain.services.closing_brief_service import build_closing_brief, save_closing_brief
+from domain.services.global_impact_service import build_global_impact_brief
+from domain.services.qmt_strategy_control_service import control_strategy
 
 
 NEW_COMMAND_SPECS = {
@@ -49,12 +72,24 @@ NEW_COMMAND_SPECS = {
         "description": "查看新 CLI 命令帮助",
         "usage": "python3 main.py help [command]",
     },
+    "assistant-menu": {
+        "description": "查看投资助理飞书/CLI 命令菜单与自动化时间表",
+        "usage": "python3 main.py assistant-menu [--json]",
+    },
+    "assistant-status": {
+        "description": "生成 OpenClaw assistant operational status",
+        "usage": "python3 main.py assistant-status [--json]",
+    },
+    "capability-audit": {
+        "description": "查看投资助理能力审计与阻塞项",
+        "usage": "python3 main.py capability-audit [--json]",
+    },
     "record": {
         "description": "记录预测 (--json '[...]' 或 stdin)",
         "usage": "python3 main.py record --json '[{\"code\":\"sh000001\",\"name\":\"上证指数\",\"direction\":\"up\",\"confidence\":0.6,\"predicted_change\":0.5,\"strategy_used\":\"technical\",\"reasoning\":\"...\"}]'",
     },
     "monitor": {
-        "description": "实盘监控（qmt2http + qmttrader）",
+        "description": "实盘监控（qmt2http + qmttrader_v2）",
         "usage": "python3 main.py monitor [YYYY-MM-DD|YYYYMMDD]",
     },
     "monitor-trading": {
@@ -80,6 +115,10 @@ NEW_COMMAND_SPECS = {
     "today-summary": {
         "description": "查看候选/买入/账户/告警简报（支持日期与 --text）",
         "usage": "python3 main.py today-summary [YYYY-MM-DD|YYYYMMDD] [--text]",
+    },
+    "longterm-summary": {
+        "description": "查看长线组合模拟盘聚合摘要",
+        "usage": "python3 main.py longterm-summary",
     },
     "fix-task-summary": {
         "description": "查看修复任务状态摘要",
@@ -161,6 +200,10 @@ NEW_COMMAND_SPECS = {
         "description": "执行主线 smoke 验收命令集合",
         "usage": "python3 main.py smoke-check [--strict]",
     },
+    "strategy-control": {
+        "description": "Control qmt2http strategy service status/start/stop/restart",
+        "usage": "python3 main.py strategy-control <status|start|stop|restart> <guojin|dongguan> [--confirm]",
+    },
     "feishu-query": {
         "description": "Feishu plugin 查询入口（示例：'国金今天持仓'）",
         "usage": "python3 main.py feishu-query \"国金今天持仓\"",
@@ -176,6 +219,54 @@ NEW_COMMAND_SPECS = {
     "scheduled-briefing": {
         "description": "定时交易简报（0945东莞策略 / 1320或1420国金ETF）",
         "usage": "python3 main.py scheduled-briefing <0945|1320|1420> [YYYY-MM-DD|YYYYMMDD]",
+    },
+    "event-scan": {
+        "description": "扫描实时事件并生成投资提醒（可 --push）",
+        "usage": "python3 main.py event-scan [--limit N] [--min-score N] [--push] [--target user_or_chat] [--source URL]",
+    },
+    "global-event-scan": {
+        "description": "Scan global breaking financial news and map to A-share themes",
+        "usage": "python3 main.py global-event-scan [--limit N] [--min-score N] [--push] [--target user_or_chat]",
+    },
+    "global-event-brief": {
+        "description": "生成全球突发财经 A股影响简报",
+        "usage": "python3 main.py global-event-brief [--limit N] [--min-score N] [--top N] [--json]",
+    },
+    "global-impact-brief": {
+        "description": "Global breaking-news portfolio impact command center",
+        "usage": "python3 main.py global-impact-brief [--limit N] [--min-score N] [--top N] [--refresh] [--max-cache-minutes N] [--json]",
+    },
+    "watchlist-report": {
+        "description": "生成 event-driven A-share watchlist",
+        "usage": "python3 main.py watchlist-report [--limit N] [--top N] [--json]",
+    },
+    "weekly-report": {
+        "description": "生成 OpenClaw A股投资助理周报",
+        "usage": "python3 main.py weekly-report [--days N] [--end YYYY-MM-DD] [--json] [--save]",
+    },
+    "risk-report": {
+        "description": "生成 portfolio risk exposure report",
+        "usage": "python3 main.py risk-report [--json] [--save]",
+    },
+    "morning-brief": {
+        "description": "生成 OpenClaw pre-market brief",
+        "usage": "python3 main.py morning-brief [--json] [--save]",
+    },
+    "closing-brief": {
+        "description": "生成 OpenClaw post-market closing brief",
+        "usage": "python3 main.py closing-brief [--date YYYY-MM-DD] [--json] [--save]",
+    },
+    "event-watch": {
+        "description": "常驻轮询实时事件（默认只跑一次；--forever 持续运行）",
+        "usage": "python3 main.py event-watch [--interval 60] [--iterations N|--forever] [--push] [--target user_or_chat] [--min-score N]",
+    },
+    "event-today": {
+        "description": "查看最近事件提醒",
+        "usage": "python3 main.py event-today [limit]",
+    },
+    "theme-map": {
+        "description": "查看主题/事件到产业链和A股标的的映射",
+        "usage": "python3 main.py theme-map <关键词，如 华为 昇腾>",
     },
 }
 
@@ -243,6 +334,22 @@ def _read_stdin_text() -> str:
     return sys.stdin.read().strip()
 
 
+def _run_capability_audit_command():
+    import subprocess
+
+    result = subprocess.run(
+        ["python3", "/root/.openclaw/workspace/scripts/investor_assistant_audit.py", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=130,
+    )
+    output = result.stdout.strip() or result.stderr.strip()
+    try:
+        return json.loads(output)
+    except Exception:
+        return {"ok": result.returncode == 0, "returncode": result.returncode, "output": output}
+
+
 def _run_record_command() -> str:
     db.init_db()
     json_str = _read_record_json()
@@ -264,6 +371,13 @@ def _run_record_command() -> str:
 
 
 def run_command(command: str):
+    if command == "assistant-menu":
+        return build_assistant_menu() if _has_flag("--json") else format_assistant_menu_text()
+    if command == "assistant-status":
+        status = build_assistant_status()
+        return status if _has_flag("--json") else status.get("text", "")
+    if command == "capability-audit":
+        return _run_capability_audit_command()
     if command == "record":
         return _run_record_command()
     if command == "monitor":
@@ -285,6 +399,12 @@ def run_command(command: str):
         if _has_flag("--text"):
             return format_today_summary_text(date=date)
         return get_today_summary(date=date)
+    if command == "longterm-summary":
+        summary = summarize_longterm_snapshot(load_longterm_snapshot())
+        return {
+            "summary": summary,
+            "text": build_longterm_snapshot_text(summary),
+        }
     if command == "fix-task-summary":
         return {"summary": summarize_fix_tasks()}
     if command == "fix-tasks":
@@ -424,6 +544,11 @@ def run_command(command: str):
         )
     if command == "smoke-check":
         return run_smoke_checks(stop_on_fail=_has_flag("--strict"))
+    if command == "strategy-control":
+        action = _arg(2, "")
+        account = _arg(3, "")
+        result = control_strategy(account=account, action=action, confirm=_has_flag("--confirm"), reason="cli_strategy_control")
+        return result if _has_flag("--json") else result.get("text", "")
     if command == "feishu-query":
         query = " ".join(sys.argv[2:]).strip()
         if not query:
@@ -460,6 +585,94 @@ def run_command(command: str):
             raise ValueError(get_new_command_usage("scheduled-briefing"))
         date = _arg(3, "")
         return run_scheduled_briefing(slot=slot, date_text=date)
+    if command == "event-scan":
+        source = _flag_value("--source", "")
+        limit = int(_flag_value("--limit", "100") or 100)
+        min_score = int(_flag_value("--min-score", "45") or 45)
+        return scan_events(
+            source_urls=[source] if source else None,
+            limit=limit,
+            min_score=min_score,
+            push=_has_flag("--push"),
+            target=_flag_value("--target", ""),
+        )
+    if command == "global-event-scan":
+        limit = int(_flag_value("--limit", "120") or 120)
+        min_score = int(_flag_value("--min-score", "45") or 45)
+        return scan_global_events(
+            limit=limit,
+            min_score=min_score,
+            push=_has_flag("--push"),
+            target=_flag_value("--target", ""),
+        )
+    if command == "global-event-brief":
+        limit = int(_flag_value("--limit", "80") or 80)
+        min_score = int(_flag_value("--min-score", "45") or 45)
+        top_n = int(_flag_value("--top", "6") or 6)
+        brief = build_global_event_brief(limit=limit, min_score=min_score, top_n=top_n)
+        return brief if _has_flag("--json") else format_global_event_brief(brief)
+    if command == "global-impact-brief":
+        limit = int(_flag_value("--limit", "80") or 80)
+        min_score = int(_flag_value("--min-score", "45") or 45)
+        top_n = int(_flag_value("--top", "8") or 8)
+        max_cache = int(_flag_value("--max-cache-minutes", "60") or 60)
+        brief = build_global_impact_brief(
+            limit=limit,
+            min_score=min_score,
+            top_n=top_n,
+            use_cache=not _has_flag("--refresh"),
+            max_cache_minutes=max_cache,
+        )
+        return brief if _has_flag("--json") else brief.get("text", "")
+    if command == "watchlist-report":
+        limit = int(_flag_value("--limit", "80") or 80)
+        top_n = int(_flag_value("--top", "12") or 12)
+        report = build_watchlist_report(limit_events=limit, top_n=top_n)
+        return report if _has_flag("--json") else report.get("text", "")
+    if command == "weekly-report":
+        days = int(_flag_value("--days", "7") or 7)
+        end_date = _flag_value("--end", "")
+        report = build_weekly_report(days=days, end_date=end_date)
+        if _has_flag("--save"):
+            report["report_path"] = save_weekly_report(report)
+        return report if _has_flag("--json") else report.get("text", "")
+    if command == "risk-report":
+        report = build_risk_report()
+        if _has_flag("--save"):
+            report["report_path"] = save_risk_report(report)
+        return report if _has_flag("--json") else report.get("text", "")
+    if command == "morning-brief":
+        brief = build_morning_brief()
+        if _has_flag("--save"):
+            brief["report_path"] = save_morning_brief(brief)
+        return brief if _has_flag("--json") else brief.get("text", "")
+    if command == "closing-brief":
+        target_date = _flag_value("--date", "")
+        brief = build_closing_brief(target_date=target_date)
+        if _has_flag("--save"):
+            brief["report_path"] = save_closing_brief(brief)
+        return brief if _has_flag("--json") else brief.get("text", "")
+    if command == "event-watch":
+        interval = int(_flag_value("--interval", "60") or 60)
+        raw_iterations = _flag_value("--iterations", "")
+        iterations = 0 if _has_flag("--forever") else int(raw_iterations or "1")
+        min_score = int(_flag_value("--min-score", "45") or 45)
+        limit = int(_flag_value("--limit", "100") or 100)
+        return watch_events(
+            interval_seconds=interval,
+            iterations=iterations,
+            push=_has_flag("--push"),
+            target=_flag_value("--target", ""),
+            min_score=min_score,
+            limit=limit,
+        )
+    if command == "event-today":
+        return list_recent_events(limit=int(_arg(2, "20") or 20))
+    if command == "theme-map":
+        query = " ".join(sys.argv[2:]).strip()
+        if not query:
+            raise ValueError(get_new_command_usage("theme-map"))
+        return map_theme(query)
     if command == "help":
         target = _arg(2, "")
         if target and is_new_command(target):

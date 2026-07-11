@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,8 +14,24 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from domain.services.assistant_menu_service import format_assistant_menu_text
+from domain.services.assistant_status_service import build_assistant_status
+from domain.services.watchlist_report_service import build_watchlist_report
+
 from domain.services.live_monitor_view_service import format_today_summary_text
+from domain.services.longterm_portfolio_service import (
+    build_longterm_snapshot_text,
+    load_longterm_snapshot,
+    summarize_longterm_snapshot,
+)
 from workflows.scheduled_briefings import run_scheduled_briefing
+from domain.services.event_service import build_global_event_brief, format_global_event_brief
+from domain.services.weekly_report_service import build_weekly_report
+from domain.services.risk_report_service import build_risk_report
+from domain.services.morning_brief_service import build_morning_brief
+from domain.services.closing_brief_service import build_closing_brief
+from domain.services.global_impact_service import build_global_impact_brief
+from domain.services.qmt_strategy_control_service import handle_strategy_control_query, is_strategy_control_query
 
 
 DEFAULT_BASE_URLS = {
@@ -88,7 +105,12 @@ def _headers(token: str) -> Dict[str, str]:
     return payload
 
 
-def _http_get(base_url: str, path: str, token: str, timeout: float = 15.0) -> Dict:
+def _http_get(base_url: str, path: str, token: str, timeout: float = 0) -> Dict:
+    if not timeout:
+        try:
+            timeout = float(os.getenv("QMT2HTTP_FEISHU_TIMEOUT", os.getenv("QMT2HTTP_TIMEOUT", "8")) or 8)
+        except Exception:
+            timeout = 8.0
     url = f"{base_url.rstrip('/')}{path}"
     req = urllib.request.Request(url, headers=_headers(token), method="GET")
     try:
@@ -182,7 +204,7 @@ def _collect_trade_logs(base_url: str, token: str, days: int = 3) -> List[Dict]:
     for idx in range(capped_days):
         d = (date.today() - timedelta(days=idx)).isoformat()
         query = urllib.parse.urlencode({"lines": 200, "include_content": "true", "date": d})
-        result = _http_get(base_url, f"/api/trade/log?{query}", token)
+        result = _http_get(base_url, f"/api/qmttrader_v2/logs?{query}&kind=all&max_files=20", token)
         if not result.get("ok"):
             rows.append({"date": d, "ok": False, "error": result.get("error", "request_failed")})
             continue
@@ -230,8 +252,26 @@ def _normalize_account(text: str) -> str:
 def _normalize_intent(text: str) -> str:
     query = str(text or "")
     ql = query.lower()
-    if "帮助" in query or "help" in query.lower():
+    if is_strategy_control_query(query):
+        return "strategy_control"
+    if any(key in query for key in ("帮助", "菜单", "命令", "使用说明")) or "help" in query.lower() or "menu" in query.lower():
         return "help"
+    if any(key in query for key in ("影响", "指挥台", "全球影响", "新闻影响")) or "impact" in ql:
+        return "global_impact"
+    if any(key in query for key in ("全球", "突发", "海外", "全球新闻")) or "global" in ql or "breaking" in ql:
+        return "global_events"
+    if any(key in query for key in ("\u5173\u6ce8", "watchlist")) or "watchlist" in ql:
+        return "watchlist_report"
+    if any(key in query for key in ("审计", "能力审计", "能力", "阻塞项")) or "audit" in ql or "capability" in ql:
+        return "capability_audit"
+    if any(key in query for key in ("\u72b6\u6001", "\u603b\u89c8", "assistant status")) or "assistant status" in ql:
+        return "assistant_status"
+    if any(key in query for key in ("\u5468\u62a5", "\u5468\u5ea6", "\u672c\u5468")) or "weekly" in ql:
+        return "weekly_report"
+    if any(key in query for key in ("\u65e9\u62a5", "\u76d8\u524d", "morning brief")) or "morning" in ql:
+        return "morning_brief"
+    if any(key in query for key in ("\u6536\u76d8", "\u76d8\u540e", "closing brief")) or "closing" in ql:
+        return "closing_brief"
     if "健康" in query or ("状态" in query and "运行" in query):
         return "health"
     if ("etf" in ql or "ETF" in query) and ("国金" in query or "13:20" in query or "1320" in ql or "14:20" in query or "1420" in ql):
@@ -257,6 +297,8 @@ def _normalize_intent(text: str) -> str:
         return "reflection"
     if any(k in query for k in ("策略", "权重", "进化", "规则")):
         return "strategy"
+    if any(k in query for k in ("长线", "模拟盘", "组合", "调仓计划")):
+        return "longterm_portfolio"
     return "summary"
 
 
@@ -307,7 +349,13 @@ def _query_endpoint(account: str, endpoint: str, token: str) -> str:
     path = f"/api/stock/{endpoint}"
     result = _http_get(base_url, path, token)
     if not result.get("ok"):
-        return f"{alias} {endpoint} 请求失败: {result.get('error', 'unknown_error')}"
+        if endpoint == "positions":
+            fallback_rows, as_of = _fallback_positions_from_snapshot(account)
+            if fallback_rows:
+                head, details = _summarize_positions(fallback_rows)
+                note = f"realtime_failed={result.get('error', 'unknown_error')}; fallback_snapshot={as_of}"
+                return "\n".join([f"{alias} {head} ({note})", *details[:8]])
+        return f"{alias} {endpoint} request_failed: {result.get('error', 'unknown_error')}"
     payload = result.get("payload", {}) or {}
     if not bool(payload.get("success")):
         return f"{alias} {endpoint} 返回失败: {payload.get('message', 'unknown')}"
@@ -396,7 +444,7 @@ def _query_logs(account: str, token: str, days: int) -> str:
     base_url = _resolve_base_url(account)
     alias = ACCOUNT_ALIASES.get(account, account)
     rows = _collect_trade_logs(base_url, token, days=days)
-    parts = [f"{alias} 最近{len(rows)}天交易日志"]
+    parts = [f"{alias} 最近{len(rows)}天 qmttrader_v2 日志"]
     for item in rows:
         if not item.get("ok"):
             parts.append(f"- {item.get('date')} 失败: {item.get('error', 'unknown_error')}")
@@ -442,63 +490,10 @@ def _query_predictions() -> str:
 
 
 def _query_risk() -> str:
-    """查询当前风险敞口。"""
-    from datetime import datetime
-
-    import db as db_mod
-
-    # 读取最新 portfolio snapshot
-    portfolio = db_mod.get_latest_portfolio_snapshot(account_scope="combined")
-    positions = []
-    total_asset = 0.0
-    if portfolio:
-        data = portfolio.get("data", {}) or {}
-        positions = data.get("qmt_positions", data.get("positions", [])) or []
-        account = data.get("qmt_account", {}) or {}
-        total_asset = float(account.get("total_asset", 0) or 0)
-
-    lines = ["⚠️ 风险概览", f"数据时间: {portfolio.get('as_of_date', 'N/A') if portfolio else 'N/A'}", ""]
-
-    if not positions:
-        lines.append("无持仓数据")
-        return "\n".join(lines)
-
-    # 计算集中度
-    total_mv = sum(float(pos.get("market_value", 0) or 0) for pos in positions)
-    effective_total = total_asset or total_mv
-    if effective_total > 0:
-        lines.append(f"总资产: {effective_total:,.0f}")
-        lines.append(f"持仓市值: {total_mv:,.0f}")
-        lines.append(f"现金占比: {(1 - total_mv/effective_total)*100:.0f}%" if effective_total else "")
-        lines.append("")
-
-        # Top 5 集中度
-        sorted_positions = sorted(
-            positions,
-            key=lambda p: float(p.get("market_value", 0) or 0),
-            reverse=True,
-        )
-        lines.append("仓位集中度 TOP5:")
-        for i, pos in enumerate(sorted_positions[:5], 1):
-            code = str(pos.get("stock_code", pos.get("code", "")) or "")[:12]
-            name = str(pos.get("stock_name", pos.get("name", "")) or "")[:8]
-            mv = float(pos.get("market_value", 0) or 0)
-            ratio = mv / effective_total * 100
-            flag = " 🔴" if ratio > 30 else " 🟡" if ratio > 20 else ""
-            lines.append(f"  #{i} {code} {name}: {mv:,.0f} ({ratio:.1f}%){flag}")
-
-        # 盈亏汇总
-        total_pnl = sum(
-            float(pos.get("unrealized_pnl", pos.get("profit_loss", 0)) or 0)
-            for pos in positions
-        )
-        winners = [p for p in positions if float(p.get("unrealized_pnl", p.get("profit_loss", 0)) or 0) > 0]
-        losers = [p for p in positions if float(p.get("unrealized_pnl", p.get("profit_loss", 0)) or 0) < 0]
-        lines.append(f"\n未实现盈亏: {total_pnl:+,.0f}")
-        lines.append(f"盈利: {len(winners)}只 | 亏损: {len(losers)}只")
-
-    return "\n".join(lines)
-
+    try:
+        return build_risk_report().get("text", "")
+    except Exception as exc:
+        return f"risk report failed: {exc}"
 
 def _query_reflection() -> str:
     """查询最新反思摘要。"""
@@ -561,6 +556,26 @@ def _query_strategy() -> str:
     return "\n".join(lines)
 
 
+def _query_longterm_portfolio() -> str:
+    summary = summarize_longterm_snapshot(load_longterm_snapshot())
+    lines = ["🧭 长线组合（模拟盘）", build_longterm_snapshot_text(summary)]
+    if not summary.get("available"):
+        lines.append("提示: 先在 trading 侧执行 longterm 命令生成 investor_longterm_snapshot.json")
+        return "\n".join(lines)
+
+    rejected_summary = summary.get("rejected_reason_summary", []) or []
+    if rejected_summary:
+        lines.append(
+            "计划拒绝原因: "
+            + " | ".join(
+                f"{str(item.get('reason', 'unknown'))}:{int(item.get('count', 0) or 0)}"
+                for item in rejected_summary[:6]
+            )
+        )
+    lines.append(f"快照路径: {summary.get('snapshot_path', '')}")
+    return "\n".join(lines)
+
+
 def _query_trade_monitor(query: str) -> str:
     date_text = _extract_query_date(query)
     try:
@@ -599,27 +614,74 @@ def _query_guojin_etf_brief(query: str) -> str:
         return f"国金ETF简报生成失败: {exc}"
 
 
-def _help_text() -> str:
-    return (
-        "🦞 Investor 交易助手\n\n"
-        "**实盘查询**\n"
-        "- 国金/东莞持仓\n"
-        "- 双账户成交/委托\n"
-        "- 国金健康状态\n"
-        "- 东莞最近5天日志\n\n"
-        "**分析查询**（新增）\n"
-        "- 最近预测/胜率\n"
-        "- 当前风险敞口\n"
-        "- 今日交易摘要/复盘\n"
-        "- 交易监控（候选/买入/对账）\n"
-        "- 东莞策略日志快照（NH/MIX）\n"
-        "- 国金ETF 13:20/14:20 简报\n"
-        "- 当前策略权重/表现\n\n"
-        "**快捷指令**\n"
-        "/持仓 /成交 /账户 /摘要 /监控 /候选 /买入 /日志 /预测 /风险 /策略 /帮助\n"
-        "示例: 国金ETF 13:20 / 国金ETF 14:20"
-    )
 
+def _query_assistant_status() -> str:
+    try:
+        return build_assistant_status().get("text", "")
+    except Exception as exc:
+        return f"assistant status failed: {exc}"
+
+def _query_watchlist_report() -> str:
+    try:
+        return build_watchlist_report(limit_events=80, top_n=12).get("text", "")
+    except Exception as exc:
+        return f"watchlist report failed: {exc}"
+
+def _query_global_events() -> str:
+    try:
+        brief = build_global_event_brief(limit=80, min_score=45, top_n=6)
+        return format_global_event_brief(brief)
+    except Exception as exc:
+        return f"global event brief failed: {exc}"
+
+def _query_global_impact() -> str:
+    try:
+        return build_global_impact_brief(limit=80, min_score=45, top_n=8, use_cache=True, max_cache_minutes=60).get("text", "")
+    except Exception as exc:
+        return f"global impact brief failed: {exc}"
+def _query_weekly_report() -> str:
+    try:
+        return build_weekly_report(days=7).get("text", "")
+    except Exception as exc:
+        return f"weekly report failed: {exc}"
+
+
+def _query_morning_brief() -> str:
+    try:
+        return build_morning_brief().get("text", "")
+    except Exception as exc:
+        return f"morning brief failed: {exc}"
+
+
+def _query_closing_brief() -> str:
+    try:
+        return build_closing_brief().get("text", "")
+    except Exception as exc:
+        return f"closing brief failed: {exc}"
+
+def _query_capability_audit() -> str:
+    path = Path("/root/.openclaw/workspace/reports/investor_assistant_capability_audit_latest.json")
+    if not path.exists():
+        return "No capability audit report yet. Run: cd /root/.openclaw/workspace && python3 scripts/investor_assistant_audit.py"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"Capability audit report read failed: {exc}"
+    lines = [
+        "OpenClaw capability audit",
+        f"time: {payload.get('generated_at', '')}",
+        f"overall: {payload.get('overall', '')} | blocked={payload.get('blocked_count', 0)} warn={payload.get('warning_count', 0)}",
+    ]
+    for item in payload.get("items", []):
+        status = item.get("status", "")
+        name = item.get("name", "")
+        evidence = (item.get("evidence") or [""])[0]
+        lines.append(f"- {status}: {name} | {evidence}")
+    lines.append("Full report: /root/.openclaw/workspace/reports/investor_assistant_capability_audit_latest.md")
+    return "\n".join(lines)
+
+def _help_text() -> str:
+    return format_assistant_menu_text()
 
 def handle_feishu_query(query_text: str) -> str:
     query = str(query_text or "").strip()
@@ -628,6 +690,25 @@ def handle_feishu_query(query_text: str) -> str:
     intent = _normalize_intent(query)
     if intent == "help":
         return _help_text()
+    if intent == "assistant_status":
+        return _query_assistant_status()
+    if intent == "global_events":
+        return _query_global_events()
+    if intent == "global_impact":
+        return _query_global_impact()
+    if intent == "watchlist_report":
+        return _query_watchlist_report()
+    if intent == "capability_audit":
+        return _query_capability_audit()
+    if intent == "weekly_report":
+        return _query_weekly_report()
+    if intent == "morning_brief":
+        return _query_morning_brief()
+    if intent == "closing_brief":
+        return _query_closing_brief()
+
+    if intent == "strategy_control":
+        return handle_strategy_control_query(query)
 
     # 分析类查询（不需要 qmt2http token）
     if intent == "predictions":
@@ -638,6 +719,8 @@ def handle_feishu_query(query_text: str) -> str:
         return _query_reflection()
     if intent == "strategy":
         return _query_strategy()
+    if intent == "longterm_portfolio":
+        return _query_longterm_portfolio()
     if intent == "trade_monitor":
         return _query_trade_monitor(query)
     if intent == "strategy_log_brief":
