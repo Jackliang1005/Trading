@@ -13,6 +13,14 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 
 from live_monitor.collectors.qmt_auth import build_qmt_auth_headers
+from domain.services.longterm_portfolio_service import (
+    build_longterm_snapshot_text,
+    format_longterm_rejected_reasons,
+    load_longterm_snapshot,
+    summarize_longterm_snapshot,
+)
+from domain.services.decision_monitor_service import format_decision_monitor_text
+from domain.services.report_style_service import longterm_summary_cn
 
 
 DONGGUAN_DEFAULT_URL = "http://150.158.31.115:8085"
@@ -73,6 +81,10 @@ def _parse_any_date(value: str) -> str:
 
 
 def _rpc_call(base_url: str, method: str, params: Dict) -> Dict:
+    try:
+        timeout = float(os.getenv("SCHEDULED_BRIEF_RPC_TIMEOUT", "5") or 5)
+    except Exception:
+        timeout = 5.0
     payload = json.dumps({"method": method, "params": params}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/rpc/data_fetcher",
@@ -80,13 +92,21 @@ def _rpc_call(base_url: str, method: str, params: Dict) -> Dict:
         headers={**build_qmt_auth_headers(), "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15.0) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
         parsed = json.loads(raw) if raw else {}
         return parsed if isinstance(parsed, dict) else {}
 
 
 def _resolve_trade_date(input_iso: str) -> str:
+    # Weekend runs are common for manual checks; avoid slow qmt2http RPC probes.
+    current = datetime.strptime(input_iso, "%Y-%m-%d").date()
+    weekday = current.weekday()
+    if weekday == 5:
+        return (current - timedelta(days=1)).isoformat()
+    if weekday == 6:
+        return (current - timedelta(days=2)).isoformat()
+
     compact = _compact_date(input_iso)
     base_urls = [
         os.getenv("QMT2HTTP_MAIN_URL", "").strip()
@@ -119,13 +139,6 @@ def _resolve_trade_date(input_iso: str) -> str:
             if candidate:
                 return candidate
 
-    # Fallback: weekend adjustment when RPC unavailable
-    current = datetime.strptime(input_iso, "%Y-%m-%d").date()
-    weekday = current.weekday()
-    if weekday == 5:
-        return (current - timedelta(days=1)).isoformat()
-    if weekday == 6:
-        return (current - timedelta(days=2)).isoformat()
     return input_iso
 
 
@@ -152,15 +165,25 @@ def _is_etf(item: Dict) -> bool:
 
 
 def _http_get(base_url: str, path: str, timeout: float = 15.0) -> Dict:
+    if timeout == 15.0:
+        try:
+            timeout = float(os.getenv("SCHEDULED_BRIEF_HTTP_TIMEOUT", "6") or 6)
+        except Exception:
+            timeout = 6.0
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}{path}",
         headers=build_qmt_auth_headers(),
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        payload = json.loads(raw) if raw else {}
-        return payload if isinstance(payload, dict) else {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw) if raw else {}
+            if isinstance(payload, dict):
+                return payload
+            return {"success": False, "message": "invalid_response_format"}
+    except Exception as exc:
+        return {"success": False, "message": f"http_get_failed: {exc}"}
 
 
 def _to_szsh(code: str) -> str:
@@ -199,9 +222,10 @@ def _fetch_dongguan_log_lines(date_text: str) -> Dict:
         or os.getenv("QMT2HTTP_TRADE_URL", "").strip()
         or DONGGUAN_DEFAULT_URL
     )
-    # Use a large window to include morning strategy decision lines (e.g. 09:26 main strategy logs).
-    query = urllib.parse.urlencode({"date": date_text, "lines": 30000, "include_content": "true"})
-    payload = _http_get(base_url, f"/api/trade/log?{query}")
+    # At 09:45 the current trading-day log is still small; cap the response so
+    # a slow remote host cannot block the whole Feishu briefing.
+    query = urllib.parse.urlencode({"date": date_text, "lines": 1200, "include_content": "true"})
+    payload = _http_get(base_url, f"/api/qmttrader_v2/logs?{query}&kind=all&max_files=8", timeout=5.0)
     if not bool(payload.get("success")):
         return {"ok": False, "date": date_text, "error": payload.get("message", "log_request_failed"), "lines": []}
     data = payload.get("data") or {}
@@ -227,12 +251,9 @@ def _fetch_dongguan_log_lines(date_text: str) -> Dict:
 
 
 def _fetch_recent_dongguan_logs(anchor_iso: str, days: int = 5) -> Dict:
-    base_date = datetime.strptime(anchor_iso, "%Y-%m-%d").date()
-    for offset in range(max(1, days)):
-        target = (base_date - timedelta(days=offset)).isoformat()
-        result = _fetch_dongguan_log_lines(target)
-        if result.get("ok") and result.get("lines"):
-            return result
+    # anchor_iso has already been resolved to the effective trading date.
+    # Do not scan multiple historical days: stale strategy logs must not be
+    # presented as today's state, and sequential remote timeouts are costly.
     return _fetch_dongguan_log_lines(anchor_iso)
 
 
@@ -344,29 +365,40 @@ def build_0945_dongguan_brief(date_text: str = "") -> str:
 
     log_summary = _summarize_log_lines(lines)
 
-    lines: List[str] = [f"⏰ 09:45 东莞策略巡检 [{as_of}]"]
-    lines.append(f"策略: {strategy or 'unknown'}")
-    lines.append(f"日志日期: {fetched.get('date', as_of)}")
+    lines: List[str] = [f"⏰ 09:45 东莞策略检查", f"数据日：{fetched.get('date', as_of)}", "", "**策略状态**"]
+    strategy_label = {
+        "runner": "常规选股策略",
+        "mix": "多信号混合策略",
+        "nh": "NH 增强策略",
+    }.get(strategy.lower(), "当前策略无法识别" if not strategy else "自定义策略")
+    lines.append(f"- 当前策略：{strategy_label}")
     if primary_modes:
-        lines.append(f"日志主策略: {','.join(primary_modes)}")
+        lines.append(f"- 主策略模式：{'、'.join(primary_modes).upper()}")
     if nh_active:
-        lines.append("模式: NH策略已激活")
+        lines.append("- NH 增强策略已启用，本次按增强策略口径检查。")
     else:
-        lines.append("模式: NH未激活，按MIX口径输出" if mix_active else "模式: NH未激活（按当前策略口径输出）")
-    lines.append(f"已买入/已提交: {', '.join(bought) if bought else '无'}")
+        lines.append("- 本次按多信号混合策略检查。" if mix_active else "- 本次按常规策略口径检查。")
+    lines.extend(["", "**交易与观察**"])
+    lines.append(f"- 已买入或已提交：{'、'.join(bought) if bought else '无'}")
     if nh_active:
         nh_view = nh_monitoring or monitoring
-        lines.append(f"NH监控池: {', '.join(nh_view[:20]) if nh_view else '无'}")
+        lines.append(f"- NH监控池：{'、'.join(nh_view[:12]) if nh_view else '无'}")
     elif mix_active:
         mix_view = mix_monitoring or monitoring
-        lines.append(f"MIX监控池: {', '.join(mix_view[:20]) if mix_view else '无'}")
-    lines.append(f"正在监控: {', '.join(monitoring[:12]) if monitoring else '无'}")
-    if log_summary.get("ok"):
-        lines.append(f"东莞日志: lines={log_summary.get('line_count', 0)} error_hits={log_summary.get('error_count', 0)}")
-        for hit in log_summary.get("hits", []):
-            lines.append(f"- {hit}")
+        lines.append(f"- MIX监控池：{'、'.join(mix_view[:12]) if mix_view else '无'}")
+    if log_summary.get("ok") and log_summary.get("error_count", 0):
+        lines.append(f"- 发现 {log_summary.get('error_count', 0)} 条异常日志，需检查服务状态。")
     else:
-        lines.append(f"东莞日志: 获取失败 ({log_summary.get('error', 'unknown')})")
+        if not log_summary.get("ok"):
+            lines.append("- 东莞日志读取失败，本次策略状态按不可验证处理。")
+    longterm_summary = summarize_longterm_snapshot(load_longterm_snapshot())
+    lines.append("")
+    lines.append("**长线组合（模拟盘）**")
+    lines.append(longterm_summary_cn(longterm_summary))
+    if longterm_summary.get("available"):
+        rejected_text = format_longterm_rejected_reasons(longterm_summary, limit=4)
+        if rejected_text:
+            lines.append(f"- 长线风控拦截：{rejected_text}。")
     return "\n".join(lines)
 
 
@@ -376,21 +408,21 @@ def _fetch_guojin_endpoint(path: str) -> List[Dict]:
         or os.getenv("QMT2HTTP_BASE_URL", "").strip()
         or GUOJIN_DEFAULT_URL
     )
-    payload = _http_get(base_url, path)
+    payload = _http_get(base_url, path, timeout=5.0)
     if not bool(payload.get("success")):
         return []
     rows = payload.get("data", [])
     return rows if isinstance(rows, list) else []
 
 
-def _fetch_guojin_log_lines(date_text: str, lines: int = 30000) -> Dict:
+def _fetch_guojin_log_lines(date_text: str, lines: int = 4000) -> Dict:
     base_url = (
         os.getenv("QMT2HTTP_MAIN_URL", "").strip()
         or os.getenv("QMT2HTTP_BASE_URL", "").strip()
         or GUOJIN_DEFAULT_URL
     )
     query = urllib.parse.urlencode({"date": date_text, "lines": lines, "include_content": "true"})
-    payload = _http_get(base_url, f"/api/trade/log?{query}")
+    payload = _http_get(base_url, f"/api/qmttrader_v2/logs?{query}&kind=all&max_files=8", timeout=5.0)
     if not bool(payload.get("success")):
         return {"ok": False, "date": date_text, "error": payload.get("message", "log_request_failed"), "lines": []}
     data = payload.get("data") or {}
@@ -530,16 +562,24 @@ def _dedupe_actions(serialized_items: List[str]) -> List[Dict]:
 
 def _format_etf_rows(rows: List[Dict], title: str, limit: int = 10) -> List[str]:
     if not rows:
-        return [f"{title}: 0 条"]
-    lines = [f"{title}: {len(rows)} 条"]
+        return []
+    lines = [f"**{title}（{len(rows)}条）**"]
     for item in rows[:limit]:
         code = _extract_code(item) or "UNKNOWN"
         name = _extract_name(item)
         qty = int(float(item.get("trade_volume", item.get("order_volume", item.get("volume", 0))) or 0))
         price = float(item.get("traded_price", item.get("order_price", item.get("price", 0))) or 0.0)
         status = str(item.get("order_status") or item.get("status") or "").strip()
-        suffix = f" 状态={status}" if status else ""
-        lines.append(f"- {code}{'(' + name + ')' if name else ''} 数量={qty} 价格={price:.3f}{suffix}")
+        status_label = {
+            "filled": "已成交",
+            "submitted": "已提交",
+            "pending": "等待成交",
+            "cancelled": "已撤单",
+            "canceled": "已撤单",
+            "rejected": "已拒绝",
+        }.get(status.lower(), "状态待核验" if status else "")
+        suffix = f"｜状态：{status_label}" if status_label else ""
+        lines.append(f"- {name + '（' if name else ''}{code}{'）' if name else ''}｜数量 {qty}｜价格 {price:.3f}{suffix}")
     return lines
 
 
@@ -556,14 +596,14 @@ def _is_buy_record(item: Dict) -> bool:
 
 def _format_score_rows(rows: List[Dict], title: str, limit: int = 10) -> List[str]:
     if not rows:
-        return [f"{title}: 无"]
-    lines = [f"{title}: {len(rows)} 只"]
+        return []
+    lines = [f"**{title}（{len(rows)}只）**"]
     for item in rows[:limit]:
         code = str(item.get("code", "") or "UNKNOWN")
         name = str(item.get("name", "") or "")
         score = item.get("score")
         score_text = f"{float(score):.4f}" if isinstance(score, (int, float)) else "N/A"
-        lines.append(f"- {code}{'(' + name + ')' if name else ''} score={score_text}")
+        lines.append(f"- {name + '（' if name else ''}{code}{'）' if name else ''}｜动量评分 {score_text}")
     return lines
 
 
@@ -583,15 +623,22 @@ def _format_action_rows(rows: List[Dict], title: str, limit: int = 10) -> List[s
     normalized = list(merged.values())
     normalized.sort(key=lambda item: (str(item.get("code", "")), -int(item.get("qty", 0))))
     if not normalized:
-        return [f"{title}: 0 条"]
-    lines = [f"{title}: {len(normalized)} 条"]
+        return []
+    lines = [f"**{title}（{len(normalized)}条）**"]
     for item in normalized[:limit]:
         code = str(item.get("code", "") or "UNKNOWN")
         qty = int(item.get("qty", 0) or 0)
         price = float(item.get("price", 0) or 0)
         sources = sorted(str(src) for src in (item.get("sources", set()) or set()) if src)
-        suffix = f" 来源={'+'.join(sources)}" if sources else ""
-        lines.append(f"- {code} 数量={qty} 价格={price:.3f}{suffix}")
+        source_labels = {
+            "log_pack": "策略日志",
+            "api": "交易接口",
+            "orders": "委托回读",
+            "trades": "成交回读",
+        }
+        source_text = "、".join(source_labels.get(source, "已验证记录") for source in sources)
+        suffix = f"｜记录来源：{source_text}" if source_text else ""
+        lines.append(f"- {code}｜数量 {qty}｜价格 {price:.3f}{suffix}")
     return lines
 
 
@@ -613,7 +660,7 @@ def build_guojin_etf_brief(slot_label: str, date_text: str = "") -> str:
     buy_actions_log = _dedupe_actions(parsed.get("buy_actions", []) or [])
     sell_actions_log = _dedupe_actions(parsed.get("sell_actions", []) or [])
 
-    lines: List[str] = [f"⏰ {slot_label} 国金ETF交易简报 [{as_of}]"]
+    lines: List[str] = [f"⏰ {slot_label} 国金ETF交易简报", f"数据日：{as_of}", ""]
     lines.extend(_format_score_rows(selected_scored, "ETF候选/最终打分", limit=12))
     lines.extend(_format_etf_rows(orders_buy, "ETF买入委托", limit=8))
     lines.extend(_format_etf_rows(orders_sell, "ETF卖出委托", limit=8))
@@ -622,20 +669,33 @@ def build_guojin_etf_brief(slot_label: str, date_text: str = "") -> str:
     lines.extend(_format_action_rows(buy_actions_log, "日志买入动作", limit=8))
     lines.extend(_format_action_rows(sell_actions_log, "日志卖出动作", limit=8))
     lines.extend(_format_etf_rows(positions, "ETF持仓", limit=8))
-    if fetched.get("ok"):
-        lines.append(f"国金日志({slot_label}前): lines={len(slot_filtered_lines)}")
-    else:
-        lines.append(f"国金日志: 获取失败 ({fetched.get('error', 'unknown')})")
+    if not any((selected_scored, orders_buy, orders_sell, trades_buy, trades_sell, buy_actions_log, sell_actions_log, positions)):
+        lines.append("- 当前没有读取到候选、委托、成交或ETF持仓；若国金链路不可达，本结果按降级处理，不代表数量为零。")
+    if not fetched.get("ok"):
+        lines.append("- 国金策略日志读取失败，候选与日志动作不可验证。")
+    longterm_summary = summarize_longterm_snapshot(load_longterm_snapshot())
+    lines.append("")
+    lines.append("**长线组合（模拟盘）**")
+    lines.append(longterm_summary_cn(longterm_summary))
+    if longterm_summary.get("available"):
+        rejected_text = format_longterm_rejected_reasons(longterm_summary, limit=4)
+        if rejected_text:
+            lines.append(f"- 长线风控拦截：{rejected_text}。")
     return "\n".join(lines)
 
 
-def run_scheduled_briefing(slot: str, date_text: str = "") -> str:
+def run_scheduled_briefing(slot: str, date_text: str = "", *, save: bool = True) -> str:
     name = str(slot or "").strip().lower()
     effective_date = _effective_trade_date(date_text)
+    if name in {"0935", "09:35", "decision-0935"}:
+        return format_decision_monitor_text(slot="09:35 开盘风险检查", save=save)
     if name in {"0945", "09:45", "dongguan-0945", "dongguan"}:
         return build_0945_dongguan_brief(date_text=effective_date)
+    if name in {"1030", "10:30", "decision-1030"}:
+        from domain.services.intraday_outlook_service import build_intraday_outlook
+        return str(build_intraday_outlook("1030", save=save).get("text") or "")
     if name in {"1320", "13:20", "guojin-etf-1320"}:
         return build_guojin_etf_brief(slot_label="13:20", date_text=effective_date)
     if name in {"1420", "14:20", "guojin-etf-1420"}:
         return build_guojin_etf_brief(slot_label="14:20", date_text=effective_date)
-    raise ValueError("unsupported slot, use: 0945 | 1320 | 1420")
+    raise ValueError("unsupported slot, use: 0935 | 0945 | 1030 | 1320 | 1420")

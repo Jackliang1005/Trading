@@ -3,10 +3,20 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+from datetime import datetime
 from typing import Dict, Optional
 
 from domain.repository import get_analysis_context_repository
 from domain.services.analysis_context_service import normalize_analysis_context_summary
+from domain.services.longterm_portfolio_service import (
+    build_longterm_snapshot_text,
+    format_longterm_rejected_reasons,
+    load_longterm_snapshot,
+    summarize_longterm_snapshot,
+)
+from domain.services.decision_monitor_service import format_decision_monitor_text
 from domain.services.live_monitor_service import run_live_monitor
 
 def _analysis_context_summary(requested_date: str = "") -> Dict:
@@ -15,8 +25,8 @@ def _analysis_context_summary(requested_date: str = "") -> Dict:
     return normalize_analysis_context_summary(summary, as_of_date=requested_date)
 
 
-def _load_live_view(date: Optional[str] = None) -> Dict:
-    result = run_live_monitor(date=date)
+def _load_live_view(date: Optional[str] = None, *, fast: bool = False) -> Dict:
+    result = run_live_monitor(date=date, fast=fast)
     return {
         "result": result,
         "requested_date": result.get("summary", {}).get("requested_date", ""),
@@ -203,13 +213,14 @@ def get_today_account(date: Optional[str] = None) -> Dict:
     }
 
 
-def get_today_summary(date: Optional[str] = None) -> Dict:
-    view = _load_live_view(date=date)
+def get_today_summary(date: Optional[str] = None, *, fast: bool = False) -> Dict:
+    view = _load_live_view(date=date, fast=fast)
     result = view["result"]
     focus = view["focus"]
     requested_date = view["requested_date"]
     accounts = result.get("qmt_trade_state_focus", [])
     reconciliation = result.get("trade_reconciliation", {})
+    longterm_summary = summarize_longterm_snapshot(load_longterm_snapshot())
     return {
         "snapshot_id": result.get("snapshot_id"),
         "requested_date": requested_date,
@@ -237,6 +248,7 @@ def get_today_summary(date: Optional[str] = None) -> Dict:
             filled_buys=focus.get("filled_buys", []),
         ),
         "analysis_context_summary": _analysis_context_summary(requested_date),
+        "longterm_portfolio_summary": longterm_summary,
         "trade_incidents": [
             {
                 "kind": item.get("kind", ""),
@@ -249,7 +261,7 @@ def get_today_summary(date: Optional[str] = None) -> Dict:
     }
 
 
-def format_today_summary_text(date: Optional[str] = None) -> str:
+def _format_today_summary_text_legacy(date: Optional[str] = None) -> str:
     payload = get_today_summary(date=date)
     requested_date = payload.get("requested_date", "") or "latest"
     log_date = payload.get("log_date", "") or "N/A"
@@ -271,6 +283,7 @@ def format_today_summary_text(date: Optional[str] = None) -> str:
     analysis_context_summary = payload.get("analysis_context_summary", {}) or {}
     incidents = payload.get("trade_incidents", []) or []
     accounts_overview = payload.get("accounts_overview", {}) or {}
+    longterm_summary = payload.get("longterm_portfolio_summary", {}) or {}
     account_parts = []
     for item in accounts:
         server = str(item.get("server", "") or "?")
@@ -345,7 +358,18 @@ def format_today_summary_text(date: Optional[str] = None) -> str:
             f"positions={analysis_context_summary.get('positions_count', 0)} "
             f"trades={analysis_context_summary.get('today_trade_count', 0)}"
         ),
+        build_longterm_snapshot_text(longterm_summary),
     ]
+    if longterm_summary.get("available"):
+        rejected_summary = longterm_summary.get("rejected_reason_summary", []) or []
+        if rejected_summary:
+            lines.append(
+                "长线拒绝原因: "
+                + " | ".join(
+                    f"{str(item.get('reason', 'unknown'))}:{int(item.get('count', 0) or 0)}"
+                    for item in rejected_summary[:5]
+                )
+            )
     skipped_overall = (skipped_reason_summary.get("overall", []) if isinstance(skipped_reason_summary, dict) else []) or []
     if skipped_overall:
         lines.append(
@@ -398,4 +422,101 @@ def format_today_summary_text(date: Optional[str] = None) -> str:
         lines.extend(incident_lines)
     if watchlist_dir_warnings:
         lines.append(f"watchlists目录告警: {' | '.join(watchlist_dir_warnings[:3])}")
+    lines.extend(["", format_decision_monitor_text(slot="today-summary")])
+    return "\n".join(lines)
+
+
+def _code_list(rows: object, limit: int = 8) -> str:
+    codes = []
+    for item in rows or []:
+        code = item.get("code") if isinstance(item, dict) else item
+        if code and str(code) not in codes:
+            codes.append(str(code))
+    return "、".join(codes[:limit]) or "无"
+
+
+def _log_freshness_text(log_date: object) -> str:
+    raw = str(log_date or "").strip().replace("-", "")
+    try:
+        parsed = datetime.strptime(raw[:8], "%Y%m%d")
+    except ValueError:
+        return "策略日志日期无法验证，不能据此判断今天的交易动作。"
+    age = max(0, (datetime.now().date() - parsed.date()).days)
+    display = parsed.strftime("%Y-%m-%d")
+    if age == 0:
+        return f"策略日志为当日数据（{display}）。"
+    return f"最近策略日志停留在 {display}，距今 {age} 天；候选和成交结论按过期数据处理。"
+
+
+def format_today_summary_text(date: Optional[str] = None, *, fast: bool = False) -> str:
+    """Human-facing monitor summary; intentionally omits internal counters and file names."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        payload = get_today_summary(date=date, fast=fast)
+    final_candidates = payload.get("final_candidates", []) or []
+    submitted_buys = payload.get("submitted_buys", []) or []
+    filled_buys = payload.get("filled_buys", []) or []
+    skipped_buys = payload.get("skipped_buys", []) or []
+    accounts = payload.get("accounts", []) or []
+    reconciliation = payload.get("trade_reconciliation", {}) or {}
+    incidents = payload.get("trade_incidents", []) or []
+    longterm_summary = payload.get("longterm_portfolio_summary", {}) or {}
+    strategy = str(payload.get("strategy") or "").strip().lower()
+    strategy_text = {
+        "runner": "常规选股策略",
+        "mix": "多信号混合策略",
+        "nh": "NH 增强策略",
+    }.get(strategy, "当前策略无法识别" if not strategy else "自定义策略")
+    log_raw = str(payload.get("log_date") or "").replace("-", "")[:8]
+    log_is_today = log_raw == datetime.now().strftime("%Y%m%d")
+    record_scope = "当日记录" if log_is_today else "过期日志记录"
+
+    lines = [
+        "📡 交易监控概览",
+        "",
+        "**先看结论**",
+        f"- {_log_freshness_text(payload.get('log_date'))}",
+        f"- {record_scope}采用{strategy_text}；候选 {_code_list(final_candidates)}。",
+        f"- {record_scope}显示：已提交 {_code_list(submitted_buys)}；已成交 {_code_list(filled_buys)}；被过滤 {_code_list(skipped_buys)}。",
+        "",
+        "**账户可用性**",
+    ]
+    account_labels = {"guojin": "国金", "dongguan": "东莞"}
+    for item in accounts:
+        server = str(item.get("server") or "")
+        label = account_labels.get(server, "其他账户")
+        states = [item.get(name, {}) or {} for name in ("asset", "positions", "orders", "trades", "records_trades")]
+        reachable = any(bool(state.get("ok")) for state in states)
+        if not reachable:
+            lines.append(f"- {label}：交易接口不可用，持仓、委托和成交数量均不可验证，不按零处理。")
+            continue
+        positions = int((item.get("positions", {}) or {}).get("count", 0) or 0)
+        orders = int((item.get("orders", {}) or {}).get("count", 0) or 0)
+        trades = int((item.get("trades", {}) or {}).get("count", 0) or 0)
+        lines.append(f"- {label}：接口可用；持仓 {positions} 只，委托 {orders} 笔，成交 {trades} 笔。")
+    if not accounts:
+        lines.append("- 当前没有账户回读结果，无法核验持仓与成交。")
+
+    reconciliation_text = {
+        "consistent": "候选、委托与成交记录未发现冲突",
+        "inconsistent": "候选、委托或成交记录存在不一致，需要人工核对",
+    }.get(str(reconciliation.get("status") or "").lower(), "对账状态无法确认")
+    if not log_is_today and reconciliation_text.startswith("候选"):
+        reconciliation_text += "；但日志已经过期，不能代表今天的交易闭环"
+    lines.extend(["", "**交易闭环**", f"- {reconciliation_text}。"])
+    if skipped_buys:
+        lines.append(f"- 有 {len(skipped_buys)} 个候选被过滤；详情以策略日志与委托回读共同验证为准。")
+    if incidents:
+        lines.extend(["", "**需要处理的问题**"])
+        known = {
+            "qmt_trade_state_unavailable": "交易接口不可用，相关账户的持仓、委托和成交无法核验",
+            "trade_decision_stale": "最近策略决策日志已经过期，不能代表今天的交易动作",
+        }
+        for item in incidents[:4]:
+            lines.append(f"- {known.get(str(item.get('kind') or ''), '监控发现异常，需要查看服务状态')}。")
+
+    lines.extend(["", "**长线模拟组合**", f"- {build_longterm_snapshot_text(longterm_summary)}"])
+    rejected_text = format_longterm_rejected_reasons(longterm_summary, limit=4)
+    if rejected_text:
+        lines.append(f"- 风控拦截：{rejected_text}。")
+    lines.extend(["", format_decision_monitor_text(slot="交易监控")])
     return "\n".join(lines)

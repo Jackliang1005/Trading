@@ -91,10 +91,15 @@ def generate_predictions(
     pred_ids = save_predictions(predictions, model=model)
     for item, pred_id in zip(predictions, pred_ids):
         pred_type = item.get("prediction_type", "index")
+        trend = item.get("trend_3d", "?")
+        ret_3d = item.get("predicted_return_3d", 0) or 0
+        bp = item.get("buy_point", 0) or 0
+        sp = item.get("sell_point", 0) or 0
+        sl = item.get("stop_loss", 0) or 0
         print(
-            f"  📝 [{pred_type}] {item.get('name', item['code'])} {item['direction']} "
-            f"(策略:{item.get('strategy_used', 'technical')}, 置信度:{item['confidence']:.0%}, "
-            f"预测涨跌:{item.get('predicted_change', 0):+.2f}%) → ID:{pred_id}"
+            f"  📝 [{pred_type}] {item.get('name', item['code'])} 趋势:{trend} "
+            f"(3日收益:{ret_3d:+.2f}%, 置信度:{item['confidence']:.0%}) "
+            f"买{bp:.2f}/卖{sp:.2f}/止损{sl:.2f} → ID:{pred_id}"
         )
     index_count = sum(1 for p in predictions if p.get("prediction_type", "index") == "index")
     pos_count = sum(1 for p in predictions if p.get("prediction_type") == "position")

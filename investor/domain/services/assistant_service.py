@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 
 import db
 from domain.repository import get_analysis_context_repository
@@ -13,6 +13,12 @@ from domain.services.analysis_context_service import (
     normalize_trade_decision_summary,
 )
 from domain.services.evolution_service import generate_system_prompt, load_strategy_config
+from domain.services.longterm_portfolio_service import (
+    build_longterm_snapshot_text,
+    format_longterm_rejected_reasons,
+    load_longterm_snapshot,
+    summarize_longterm_snapshot,
+)
 from domain.services.prediction_prompt_service import build_market_context_text
 from domain.services.prediction_service import load_prediction_snapshot_data
 from knowledge_base import build_few_shot_prompt, build_rag_context
@@ -133,6 +139,7 @@ def dashboard() -> str:
     overall = db.get_overall_stats()
     snapshot_data = load_prediction_snapshot_data()
     market_source = snapshot_data.get("_source", "") if snapshot_data else ""
+    longterm_summary = summarize_longterm_snapshot(load_longterm_snapshot())
 
     lines = [
         "# 🦞 OpenClaw Investor 状态看板",
@@ -141,7 +148,7 @@ def dashboard() -> str:
         "## 📊 整体表现",
         f"- 总预测: {overall.get('total', 0) or 0}",
         f"- 正确: {overall.get('correct', 0) or 0}",
-        f"- 胜率: {overall.get('win_rate', 0) or 0}%",
+        f"- 3日趋势命中率: {overall.get('win_rate', 0) or 0}%",
         f"- 平均分: {overall.get('avg_score', 0) or 0}",
         "",
         "## ⚖️ 策略权重",
@@ -159,6 +166,32 @@ def dashboard() -> str:
         lines.append(f"- {rule['rule_text']} (置信度: {rule.get('confidence', 0):.0%})")
     if len(rules) > 5:
         lines.append(f"  ... 共 {len(rules)} 条")
+
+    # ── Latest predictions with buy/sell points ──
+    lines.append("\n## 🔮 最新预测（3日K线+买卖点）")
+    latest_preds = _get_latest_predictions(limit=6)
+    if latest_preds:
+        for p in latest_preds:
+            trend = p.get("trend_3d") or p.get("direction", "?")
+            ret_3d = p.get("predicted_return_3d")
+            bp = p.get("buy_point")
+            sp = p.get("sell_point")
+            sl = p.get("stop_loss")
+            name = p.get("target_name", p.get("target", "?"))
+            if ret_3d is not None:
+                pts = ""
+                if bp and sp and sl:
+                    pts = f" 买{bp:.2f}/卖{sp:.2f}/止损{sl:.2f}"
+                lines.append(
+                    f"- {name}: 趋势**{trend}** 3日收益{ret_3d:+.2f}% "
+                    f"置信度{(p.get('confidence', 0) or 0):.0%}{pts}"
+                )
+            else:
+                lines.append(
+                    f"- {name}: {trend} 置信度{(p.get('confidence', 0) or 0):.0%}"
+                )
+    else:
+        lines.append("- 暂无预测数据，请先运行 predict")
 
     lines.append("\n## 📡 最新数据快照")
     if snapshot_data:
@@ -181,4 +214,27 @@ def dashboard() -> str:
     else:
         lines.append("- 暂无数据，请先运行数据采集")
 
+    lines.append("\n## 🧭 长线组合（模拟盘）")
+    lines.append(f"- {build_longterm_snapshot_text(longterm_summary)}")
+    if longterm_summary.get("available"):
+        rejected_text = format_longterm_rejected_reasons(longterm_summary, limit=5)
+        if rejected_text:
+            lines.append(f"- 风控拦截：{rejected_text}。")
+        lines.append("- 这是模拟组合记录，不代表券商真实成交，也不会自动提交委托。")
+
     return "\n".join(lines)
+
+
+def _get_latest_predictions(limit: int = 6) -> List[Dict]:
+    """Get latest predictions with buy/sell point info."""
+    conn = db.get_conn()
+    rows = conn.execute(
+        """SELECT target, target_name, trend_3d, predicted_return_3d,
+                  buy_point, sell_point, stop_loss, confidence,
+                  direction, created_at
+           FROM prediction_log
+           ORDER BY created_at DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

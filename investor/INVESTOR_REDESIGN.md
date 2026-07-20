@@ -1182,6 +1182,15 @@ investor/
 
 ## 13. 当前实现状态
 
+**Phase 7 (旧代码清理) 已于 2026-05-17 完成：**
+- `SOUL.md` / `IDENTITY.md` / `AGENTS.md` / `HEARTBEAT.md` 身份文档统一
+- `predictor.py` / `reflection.py` / `evolution.py` 已瘦身为纯兼容转发层
+- `domain/services/__init__.py` 注册为服务层 canonical index
+- `trading_agents_cn/` 已归档至 `.archived/`
+- `main.py` CLI dispatch 已统一（直接依赖 `app/cli.py`）
+- 月度审计 cron 确认不重复执行 evolve
+- `HANDOFF.md` 模块地图与 CLI 命令表已更新
+
 截至当前版本，以下能力已经在代码中落地：
 
 - `monitor`

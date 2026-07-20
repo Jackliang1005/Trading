@@ -11,6 +11,7 @@ from domain.services.assistant_service import dashboard as dashboard_service
 from domain.services.evolution_service import evolve, generate_system_prompt
 from domain.services.prediction_orchestrator import generate_predictions
 from domain.services.reflection_service import daily_reflection, monthly_audit, weekly_attribution
+from domain.services.intraday_outlook_service import build_intraday_outlook
 from knowledge_base import KnowledgeBase, auto_memorize_news
 from sector_scanner import generate_sector_report
 
@@ -37,7 +38,8 @@ def cron_daily_predict() -> Dict[str, Any]:
     """每日预测生成（09:30收盘竞价后执行）"""
     init_system()
     prediction_ids = generate_predictions()
-    return {"prediction_ids": prediction_ids, "count": len(prediction_ids)}
+    outlook = build_intraday_outlook("0930", save=True)
+    return {"prediction_ids": prediction_ids, "count": len(prediction_ids), "outlook": outlook, "text": outlook.get("text", "")}
 
 
 def cron_daily_reflect() -> Dict[str, Any]:

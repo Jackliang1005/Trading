@@ -93,3 +93,61 @@ def collect_qmt_trade_logs(lines: int = 200, include_content: bool = True, date:
             }
         )
     return {"kind": "qmt_trade_log", "date": date, "servers": servers}
+
+
+
+def collect_qmttrader_v2_logs(
+    lines: int = 200,
+    include_content: bool = True,
+    date: str | None = None,
+    kind: str = "all",
+    max_files: int = 10,
+) -> Dict:
+    """Collect qmttrader_v2 runtime/strategy logs through qmt2http."""
+    timeout = float(os.getenv("QMT2HTTP_TIMEOUT", "15"))
+    date = date or datetime.now().strftime("%Y-%m-%d")
+    servers = []
+    for server in _candidate_servers():
+        params = urllib.parse.urlencode(
+            {
+                "lines": lines,
+                "include_content": "true" if include_content else "false",
+                "date": date,
+                "kind": kind,
+                "max_files": max_files,
+            }
+        )
+        url = f"{server['base_url']}/api/qmttrader_v2/logs?{params}"
+        started = time.time()
+        payload = None
+        error = None
+        status_code = None
+        try:
+            req = urllib.request.Request(url, headers=_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status_code = resp.status
+                raw = resp.read().decode("utf-8", errors="replace")
+                payload = json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            status_code = exc.code
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {}
+            except Exception:
+                payload = {"raw": raw}
+            error = f"HTTP {exc.code}"
+        except Exception as exc:
+            error = str(exc)
+        servers.append(
+            {
+                "server": server["name"],
+                "base_url": server["base_url"],
+                "url": url,
+                "http_status": status_code,
+                "latency_ms": round((time.time() - started) * 1000, 1),
+                "ok": bool(payload and payload.get("success")) and not error,
+                "error": error,
+                "response": payload,
+            }
+        )
+    return {"kind": "qmttrader_v2_logs", "date": date, "servers": servers}

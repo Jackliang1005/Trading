@@ -9,37 +9,52 @@ ERROR_MARKERS = ("Traceback", "ERROR", "CRITICAL", "系统运行错误", "Except
 
 def _extract_lines(response: Dict) -> List[str]:
     data = (response or {}).get("data") or {}
-    if data.get("is_dir"):
-        lines = []
-        for entry in data.get("entries", []):
-            lines.extend(entry.get("content", []) or [])
-        return lines
-    return data.get("content", []) or []
+    lines: List[str] = []
+    raw_lines = data.get("lines") if isinstance(data, dict) else None
+    if isinstance(raw_lines, list):
+        lines.extend(str(line) for line in raw_lines if line is not None)
+    entries = data.get("entries", []) if isinstance(data, dict) else []
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content")
+            if isinstance(content, list):
+                lines.extend(str(line) for line in content if line is not None)
+    content = data.get("content") if isinstance(data, dict) else None
+    if isinstance(content, list):
+        lines.extend(str(line) for line in content if line is not None)
+    return lines
 
 
 def analyze_trade_logs(trade_logs: Dict) -> List[Dict]:
     incidents = []
+    source_kind = str(trade_logs.get("kind") or "qmt_trade_log")
+    is_v2 = source_kind == "qmttrader_v2_logs"
+    unavailable_kind = "qmttrader_v2_log_unavailable" if is_v2 else "trade_log_unavailable"
+    error_kind = "qmttrader_v2_log_error" if is_v2 else "trade_log_error"
+    source_label = "qmttrader_v2 log" if is_v2 else "qmt2http trade log"
     for server in trade_logs.get("servers", []):
         if not server.get("ok"):
             incidents.append(
                 {
                     "severity": "P1",
-                    "kind": "trade_log_unavailable",
-                    "signature": f"trade_log_unavailable::{server.get('server','')}::{server.get('base_url','')}",
-                    "summary": f"trade log unavailable on {server.get('server')}: {server.get('error') or server.get('http_status')}",
+                    "kind": unavailable_kind,
+                    "signature": f"{unavailable_kind}::{server.get('server','')}::{server.get('base_url','')}",
+                    "summary": f"{source_label} unavailable on {server.get('server')}: {server.get('error') or server.get('http_status')}",
                     "evidence": server,
                 }
             )
             continue
-        lines = _extract_lines((server.get("response") or {}).get("response", {}))
+        lines = _extract_lines(server.get("response") or {})
         matches = [line for line in lines if any(marker in line for marker in ERROR_MARKERS)]
         if matches:
             incidents.append(
                 {
                     "severity": "P1",
-                    "kind": "trade_log_error",
-                    "signature": f"trade_log_error::{server.get('server','')}::{len(matches)}",
-                    "summary": f"detected {len(matches)} error lines in qmt2http trade log on {server.get('server')}",
+                    "kind": error_kind,
+                    "signature": f"{error_kind}::{server.get('server','')}::{len(matches)}",
+                    "summary": f"detected {len(matches)} error lines in {source_label} on {server.get('server')}",
                     "evidence": {"server": server.get("server"), "matches": matches[-20:]},
                 }
             )

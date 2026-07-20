@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-OpenClaw Investor - 主入口
+OpenClaw Investor — 主入口
 统一调度四个闭环：感知 → 记忆 → 反思 → 进化
+小龙虾 (XiaoLongXia) — A股投资助理
 """
 
 import json
+import contextlib
+import io
 import os
 import sys
 from typing import Dict
@@ -28,7 +31,14 @@ from domain.services.legacy_entry_service import (
     init_system,
 )
 from domain.services.reflection_service import backtest_predictions
-from legacy.compat.main_compat import handle_new_command, print_new_command_help
+
+# ── New-style CLI: import dispatch directly from app/cli.py ──
+from app.cli import (
+    NEW_COMMAND_SPECS,
+    is_new_command,
+    print_result,
+    run_command as run_new_command,
+)
 
 
 def init():
@@ -98,6 +108,13 @@ def cron_monthly_audit():
     return cron_monthly_audit_service()
 
 
+def _run_sync_logs():
+    """同步国金/东莞生产日志到本地。"""
+    from workflows.sync_production_logs import sync_date
+    from datetime import datetime
+    return sync_date(datetime.now().strftime("%Y-%m-%d"))
+
+
 # ──────────────── 状态看板 ────────────────
 
 def dashboard() -> str:
@@ -105,10 +122,9 @@ def dashboard() -> str:
     return build_dashboard()
 
 
-# ──────────────── CLI ────────────────
+# ──────────────── 统合命令注册 ────────────────
 
-
-COMMANDS = {
+LEGACY_COMMANDS = {
     "init": ("初始化系统", init),
     "collect": ("采集每日数据", cron_daily_collect),
     "predict": ("生成每日预测", cron_daily_predict),
@@ -119,35 +135,85 @@ COMMANDS = {
     "prompt": ("查看当前 system prompt", lambda: print(generate_system_prompt())),
     "backtest": ("回测预测", lambda: backtest_predictions()),
     "sector-scan": ("板块扫描+持仓诊断", cron_sector_scan),
+    "sync-logs": ("同步生产机器日志到本地", lambda: _run_sync_logs()),
 }
+
+# Commands handled by app/cli.py (new-style)
+NEW_COMMANDS = set(NEW_COMMAND_SPECS.keys())
+
+
+def _run_legacy_command(cmd: str):
+    """Execute a legacy command and return (has_output, result)."""
+    _, func = LEGACY_COMMANDS[cmd]
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured):
+            result = func()
+    except Exception:
+        details = captured.getvalue().strip()
+        if details:
+            print(details, file=sys.stderr)
+        raise
+    if isinstance(result, str):
+        print(result)
+    elif result and isinstance(result, dict):
+        if isinstance(result.get("text"), str) and result.get("text").strip():
+            print(result["text"])
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str)[:5000])
+
+
+def _print_unified_help():
+    """Print unified help showing all commands (legacy + new)."""
+    print("🦞 小龙虾 (XiaoLongXia) — OpenClaw Investor 投资助理")
+    print(f"\n用法: python3 {sys.argv[0]} <command> [args...]")
+    print("\n── 闭环命令 ──")
+    for cmd, (desc, _) in LEGACY_COMMANDS.items():
+        print(f"  {cmd:18s} {desc}")
+    print("\n── 监控与交易视图 ──")
+    for cmd, spec in NEW_COMMAND_SPECS.items():
+        print(f"  {cmd:18s} {spec['description']}")
+    print("\n提示: python3 main.py help <command> 查看命令详情")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("🦞 OpenClaw Investor — 自动学习投资助手")
-        print(f"\n用法: python3 {sys.argv[0]} <command>")
-        print("\n可用命令（legacy）:")
-        for cmd, (desc, _) in COMMANDS.items():
-            print(f"  {cmd:12s} — {desc}")
-        print_new_command_help()
+        _print_unified_help()
         return
 
     cmd = sys.argv[1]
 
-    if handle_new_command(cmd):
+    # "help" uses unified display
+    if cmd == "help":
+        target = sys.argv[2] if len(sys.argv) > 2 else ""
+        if target and is_new_command(target):
+            # Show detailed help for a specific new-style command
+            from app.cli import get_new_command_help
+            print(get_new_command_help(target))
+        else:
+            _print_unified_help()
         return
 
-    if cmd in COMMANDS:
-        _, func = COMMANDS[cmd]
-        result = func()
-        if isinstance(result, str):
-            print(result)
-        elif result and isinstance(result, dict):
-            print(json.dumps(result, ensure_ascii=False, indent=2, default=str)[:5000])
-    else:
-        print(f"❌ 未知命令: {cmd}")
-        print(f"可用: {', '.join(COMMANDS.keys())}")
-        print_new_command_help()
+    # Unified dispatch: try legacy first, then new-style
+    if cmd in LEGACY_COMMANDS:
+        _run_legacy_command(cmd)
+        return
+
+    if is_new_command(cmd):
+        try:
+            result = run_new_command(cmd)
+            print_result(result)
+        except ValueError as exc:
+            usage = NEW_COMMAND_SPECS.get(cmd, {}).get("usage", "")
+            message = str(exc).strip()
+            if message and message != usage:
+                print(f"❌ {message}")
+            if usage:
+                print(f"usage: {usage}")
+        return
+
+    print(f"❌ 未知命令: {cmd}")
+    _print_unified_help()
 
 
 if __name__ == "__main__":

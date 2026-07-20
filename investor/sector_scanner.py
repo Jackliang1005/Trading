@@ -22,7 +22,7 @@ from qmt_client import get_qmt_manager
 
 # ──────────────── 常量 ────────────────
 
-CONCEPTS_DB_PATH = "/root/qmttrader/concept_db/concepts.db"
+CONCEPTS_DB_PATH = "/root/qmttrader_v2/concept_db/concepts.db"
 
 # S&P 500 板块 ETF → A股板块映射
 US_SECTOR_ETFS = {

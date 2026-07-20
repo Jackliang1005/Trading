@@ -63,8 +63,14 @@ from domain.services.morning_brief_service import build_morning_brief, save_morn
 from domain.services.assistant_status_service import build_assistant_status
 from domain.services.watchlist_report_service import build_watchlist_report
 from domain.services.closing_brief_service import build_closing_brief, save_closing_brief
+from domain.services.decision_monitor_service import build_decision_monitor, format_decision_monitor_text
 from domain.services.global_impact_service import build_global_impact_brief
+from domain.services.intraday_outlook_service import build_intraday_outlook
 from domain.services.qmt_strategy_control_service import control_strategy
+from domain.services.qmt_position_monitor_exemptions_service import (
+    list_position_monitor_exemptions,
+    update_position_monitor_exemptions,
+)
 
 
 NEW_COMMAND_SPECS = {
@@ -115,6 +121,14 @@ NEW_COMMAND_SPECS = {
     "today-summary": {
         "description": "查看候选/买入/账户/告警简报（支持日期与 --text）",
         "usage": "python3 main.py today-summary [YYYY-MM-DD|YYYYMMDD] [--text]",
+    },
+    "decision-monitor": {
+        "description": "按昨收复盘计划生成盘中持仓监控与交易建议",
+        "usage": "python3 main.py decision-monitor [--slot 09:45] [--json]",
+    },
+    "intraday-outlook": {
+        "description": "生成09:30预测、10:30修正或14:30预测复盘与清仓评估",
+        "usage": "python3 main.py intraday-outlook <0930|1030|1430> [--json] [--no-save]",
     },
     "longterm-summary": {
         "description": "查看长线组合模拟盘聚合摘要",
@@ -204,6 +218,10 @@ NEW_COMMAND_SPECS = {
         "description": "Control qmt2http strategy service status/start/stop/restart",
         "usage": "python3 main.py strategy-control <status|start|stop|restart> <guojin|dongguan> [--confirm]",
     },
+    "position-monitor-exemptions": {
+        "description": "List or safely update qmttrader_v2 position-monitor exemptions",
+        "usage": "python3 main.py position-monitor-exemptions <list|set|append|remove> <guojin|dongguan> [symbols...] [--confirm]",
+    },
     "feishu-query": {
         "description": "Feishu plugin 查询入口（示例：'国金今天持仓'）",
         "usage": "python3 main.py feishu-query \"国金今天持仓\"",
@@ -217,8 +235,8 @@ NEW_COMMAND_SPECS = {
         "usage": "python3 main.py handoff-sync [--snapshot <path>] [--handoff <path>]",
     },
     "scheduled-briefing": {
-        "description": "定时交易简报（0945东莞策略 / 1320或1420国金ETF）",
-        "usage": "python3 main.py scheduled-briefing <0945|1320|1420> [YYYY-MM-DD|YYYYMMDD]",
+        "description": "定时交易简报（0935风控 / 0945东莞 / 1030趋势 / 1320、1420国金ETF）",
+        "usage": "python3 main.py scheduled-briefing <0935|0945|1030|1320|1420> [YYYY-MM-DD|YYYYMMDD] [--no-save]",
     },
     "event-scan": {
         "description": "扫描实时事件并生成投资提醒（可 --push）",
@@ -399,6 +417,17 @@ def run_command(command: str):
         if _has_flag("--text"):
             return format_today_summary_text(date=date)
         return get_today_summary(date=date)
+    if command == "decision-monitor":
+        slot = _flag_value("--slot", "") or _arg(2, "")
+        if slot.startswith("--"):
+            slot = ""
+        return build_decision_monitor(slot=slot) if _has_flag("--json") else format_decision_monitor_text(slot=slot or "manual")
+    if command == "intraday-outlook":
+        slot = _arg(2, "")
+        if not slot:
+            raise ValueError(get_new_command_usage("intraday-outlook"))
+        report = build_intraday_outlook(slot=slot, save=not _has_flag("--no-save"))
+        return report if _has_flag("--json") else report.get("text", "")
     if command == "longterm-summary":
         summary = summarize_longterm_snapshot(load_longterm_snapshot())
         return {
@@ -549,6 +578,20 @@ def run_command(command: str):
         account = _arg(3, "")
         result = control_strategy(account=account, action=action, confirm=_has_flag("--confirm"), reason="cli_strategy_control")
         return result if _has_flag("--json") else result.get("text", "")
+    if command == "position-monitor-exemptions":
+        action = _arg(2, "")
+        account = _arg(3, "")
+        if action == "list":
+            result = list_position_monitor_exemptions(account)
+        else:
+            symbols = [value for value in sys.argv[4:] if not value.startswith("--")]
+            result = update_position_monitor_exemptions(
+                account=account,
+                action=action,
+                symbols=symbols,
+                confirm=_has_flag("--confirm"),
+            )
+        return result if _has_flag("--json") else result.get("text", "")
     if command == "feishu-query":
         query = " ".join(sys.argv[2:]).strip()
         if not query:
@@ -584,7 +627,9 @@ def run_command(command: str):
         if not slot:
             raise ValueError(get_new_command_usage("scheduled-briefing"))
         date = _arg(3, "")
-        return run_scheduled_briefing(slot=slot, date_text=date)
+        if date.startswith("--"):
+            date = ""
+        return run_scheduled_briefing(slot=slot, date_text=date, save=not _has_flag("--no-save"))
     if command == "event-scan":
         source = _flag_value("--source", "")
         limit = int(_flag_value("--limit", "100") or 100)

@@ -73,8 +73,34 @@ def _item(name: str, status: str, evidence: List[str], action: str = "") -> Dict
     return {"name": name, "status": status, "evidence": evidence, "action": action}
 
 
+def _push_inventory_item() -> Dict[str, Any]:
+    result = _run(["python3", "scripts/report_push_inventory.py", "--json"], timeout=60, cwd=WORKSPACE)
+    try:
+        payload = json.loads(result.get("stdout") or "{}")
+    except json.JSONDecodeError:
+        payload = {"ok": False, "issues": ["入口校验器输出无法解析"]}
+    timers = payload.get("enabled_timers", []) or []
+    sources = payload.get("send_sources", []) or []
+    crons = payload.get("enabled_openclaw_crons", []) or []
+    issues = [str(item) for item in (payload.get("issues", []) or [])]
+    ok = bool(result.get("ok")) and bool(payload.get("ok")) and not issues
+    evidence = [
+        f"enabled systemd entries={len(timers)}",
+        f"enabled OpenClaw crons={len(crons)}",
+        f"registered send sources={len(sources)}",
+    ]
+    evidence.extend(issues[:8])
+    return _item(
+        "feishu_push_entry_inventory",
+        "ok" if ok else "warn",
+        evidence,
+        "Run scripts/report_push_inventory.py and register or disable every unknown push entry.",
+    )
+
+
 def build_audit() -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
+    items.append(_push_inventory_item())
 
     event_today = _run(["python3", "main.py", "event-today"], timeout=20, cwd=INVESTOR_DIR)
     event_service = _systemctl("investor-event-watch.service")
@@ -87,8 +113,8 @@ def build_audit() -> Dict[str, Any]:
         "Check event sources/Feishu target if event-today fails or no new events are stored.",
     ))
 
-    watchlist = _cli_contains(["python3", "main.py", "watchlist-report", "--top", "3"], "OpenClaw Event-driven Watchlist", timeout=20)
-    watchlist_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "watchlist-report", timeout=10)
+    watchlist = _cli_contains(["python3", "main.py", "watchlist-report", "--top", "3"], "事件驱动观察池", timeout=20)
+    watchlist_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "/关注", timeout=10)
     items.append(_item(
         "event_driven_watchlist",
         "ok" if watchlist.get("contains") and watchlist_menu.get("contains") else "warn",
@@ -99,7 +125,7 @@ def build_audit() -> Dict[str, Any]:
     global_timer = _systemctl("investor-global-event-scan.timer")
     global_help = _cli_contains(["python3", "main.py", "help"], "global-event-scan", timeout=10)
     global_brief = _cli_contains(["python3", "main.py", "global-event-brief", "--limit", "10", "--top", "1", "--json"], "top_events", timeout=35)
-    global_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "global-event-brief", timeout=10)
+    global_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "/影响", timeout=10)
     items.append(_item(
         "global_breaking_news_radar",
         "ok" if global_timer == "active" and global_help.get("contains") and global_brief.get("contains") and global_menu.get("contains") else "warn",
@@ -108,7 +134,7 @@ def build_audit() -> Dict[str, Any]:
     ))
 
     impact_brief = _cli_contains(["python3", "main.py", "global-impact-brief", "--limit", "10", "--top", "2", "--json"], "urgent_events", timeout=45)
-    impact_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "global-impact-brief", timeout=10)
+    impact_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "/影响", timeout=10)
     items.append(_item(
         "global_impact_command_center",
         "ok" if impact_brief.get("contains") and impact_menu.get("contains") else "warn",
@@ -128,7 +154,7 @@ def build_audit() -> Dict[str, Any]:
     ))
 
     closing_timer = _systemctl("investor-closing-brief.timer")
-    closing_brief = _cli_contains(["python3", "main.py", "closing-brief", "--json"], "Next-session global impact", timeout=60)
+    closing_brief = _cli_contains(["python3", "main.py", "closing-brief"], "A股收盘简报", timeout=60)
     items.append(_item(
         "post_market_closing_brief",
         "ok" if closing_timer == "active" and closing_brief.get("contains") else "warn",
@@ -137,7 +163,7 @@ def build_audit() -> Dict[str, Any]:
     ))
 
     morning_timer = _systemctl("investor-morning-brief.timer")
-    morning_brief = _cli_contains(["python3", "main.py", "morning-brief", "--json"], "Global impact command center", timeout=60)
+    morning_brief = _cli_contains(["python3", "main.py", "morning-brief"], "A股盘前简报", timeout=60)
     items.append(_item(
         "pre_market_morning_brief",
         "ok" if morning_timer == "active" and morning_brief.get("contains") else "warn",
@@ -154,7 +180,7 @@ def build_audit() -> Dict[str, Any]:
         "Inspect investor-risk-report.timer and risk-report CLI if portfolio risk report stops.",
     ))
 
-    timers = ["investor-health-alert.timer", "investor-morning-brief.timer", "investor-risk-report.timer", "investor-briefing-0945.timer", "investor-briefing-1320.timer", "investor-briefing-1420.timer", "trading-morning.timer", "trading-evening.timer", "investor-closing-brief.timer", "investor-weekly-report.timer"]
+    timers = ["investor-health-alert.timer", "investor-morning-brief.timer", "investor-risk-report.timer", "investor-decision-0935.timer", "investor-briefing-0945.timer", "investor-decision-1030.timer", "investor-briefing-1320.timer", "investor-briefing-1420.timer", "trading-morning.timer", "trading-evening.timer", "investor-closing-brief.timer", "investor-weekly-report.timer"]
     timer_evidence = [f"{u}={_systemctl(u)} next={_timer_next(u)}" for u in timers]
     items.append(_item(
         "intraday_timed_alerts",
@@ -191,8 +217,8 @@ def build_audit() -> Dict[str, Any]:
         "Current blocked state is expected while Guojin qmt2http/miniQMT trade endpoint is unhealthy.",
     ))
 
-    assistant_status = _cli_contains(["python3", "main.py", "assistant-status"], "OpenClaw Assistant Status", timeout=20)
-    status_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "assistant-status", timeout=10)
+    assistant_status = _cli_contains(["python3", "main.py", "assistant-status"], "投资助理运行状态", timeout=20)
+    status_menu = _cli_contains(["python3", "main.py", "assistant-menu"], "/状态", timeout=10)
     items.append(_item(
         "operator_status_overview",
         "ok" if assistant_status.get("contains") and status_menu.get("contains") else "warn",
@@ -200,12 +226,12 @@ def build_audit() -> Dict[str, Any]:
         "Inspect assistant-status CLI and status menu entry if status overview stops.",
     ))
 
-    menu = _cli_contains(["python3", "main.py", "assistant-menu"], "qmt2http_remote_recovery", timeout=10)
+    menu = _cli_contains(["python3", "main.py", "assistant-menu"], "实时数据｜不可达、非当日或回读不一致时明确降级", timeout=10)
     docs = [Path("/root/Agent.md"), WORKSPACE / "docs" / "investor_assistant_command_menu.md", WORKSPACE / "docs" / "guojin_qmt2http_recovery_runbook.md"]
     items.append(_item(
         "runbook_and_operator_menu",
         "ok" if menu.get("contains") and all(path.exists() for path in docs) else "warn",
-        [f"assistant-menu has recovery entry={menu.get('contains')}"] + [f"{path} exists={path.exists()} age_days={_file_age_days(path)}" for path in docs],
+        [f"assistant-menu has data-safety guidance={menu.get('contains')}"] + [f"{path} exists={path.exists()} age_days={_file_age_days(path)}" for path in docs],
         "Keep Agent.md and docs updated when services or recovery commands change.",
     ))
 
@@ -231,15 +257,40 @@ def write_reports(audit: Dict[str, Any]) -> None:
         if item.get("action"):
             lines.append(f"- action: {item['action']}")
         lines.append("")
+    remediation = audit.get("remediation")
+    if remediation:
+        lines.append("## automatic_remediation")
+        lines.append(f"- status: {remediation.get('status', 'unknown')}")
+        for action in remediation.get("actions", []):
+            lines.append(f"- {action}")
+        if remediation.get("note"):
+            lines.append(f"- note: {remediation['note']}")
+        lines.append("")
     LATEST_MD.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit OpenClaw investment assistant capabilities")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--remediate", action="store_true", help="run the constrained post-audit remediator")
     args = parser.parse_args()
     audit = build_audit()
     write_reports(audit)
+    if args.remediate:
+        remediation = _run(
+            ["python3", "scripts/investor_audit_remediator.py", "--audit-file", str(LATEST_JSON)],
+            timeout=190,
+            cwd=WORKSPACE,
+        )
+        try:
+            audit["remediation"] = json.loads(remediation["stdout"] or "{}")
+        except json.JSONDecodeError:
+            audit["remediation"] = {
+                "status": "remediator_error",
+                "actions": [],
+                "note": (remediation["stderr"] or remediation["stdout"] or "invalid remediator output")[:500],
+            }
+        write_reports(audit)
     if args.json:
         print(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True))
     else:
@@ -249,4 +300,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

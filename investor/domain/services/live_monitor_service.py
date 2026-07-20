@@ -17,7 +17,7 @@ from live_monitor.analyzers.runtime_phase_analyzer import analyze_runtime_phase
 from live_monitor.analyzers.trade_decision_analyzer import analyze_trade_decisions
 from live_monitor.collectors.observability_collector import collect_observability
 from live_monitor.collectors.qmt_health_collector import collect_qmt_health
-from live_monitor.collectors.qmt_trade_log_collector import collect_qmt_trade_logs
+from live_monitor.collectors.qmt_trade_log_collector import collect_qmt_trade_logs, collect_qmttrader_v2_logs
 from live_monitor.collectors.qmt_trade_state_collector import collect_qmt_trade_state
 from live_monitor.collectors.runtime_status_collector import collect_runtime_status
 from live_monitor.collectors.strategy_log_collector import collect_strategy_logs
@@ -356,17 +356,29 @@ def _trade_reconciliation_from_snapshot(snapshot: Dict) -> Dict:
     }
 
 
-def run_live_monitor(date: Optional[str] = None) -> Dict:
+def run_live_monitor(date: Optional[str] = None, *, fast: bool = False) -> Dict:
     db.init_db()
     monitor_repo = get_live_monitor_repository()
     monitor_repo.ensure_tables()
     requested_date = _normalize_monitor_date(date)
 
+    qmt_health = {"kind": "qmt_health", "servers": []} if fast else collect_qmt_health()
+    qmt_trade_log = (
+        {"kind": "qmt_trade_log", "date": requested_date, "servers": []}
+        if fast
+        else collect_qmt_trade_logs(date=requested_date or None)
+    )
+    qmttrader_v2_logs = (
+        {"kind": "qmttrader_v2_logs", "date": requested_date, "servers": []}
+        if fast
+        else collect_qmttrader_v2_logs(date=requested_date or None)
+    )
     snapshot = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
-        "qmt_health": collect_qmt_health(),
-        "qmt_trade_log": collect_qmt_trade_logs(date=requested_date or None),
-        "qmt_trade_state": collect_qmt_trade_state(),
+        "qmt_health": qmt_health,
+        "qmt_trade_log": qmt_trade_log,
+        "qmttrader_v2_logs": qmttrader_v2_logs,
+        "qmt_trade_state": collect_qmt_trade_state(timeout=0.75 if fast else None),
         "runtime_status": collect_runtime_status(),
         "observability": collect_observability(),
         "strategy_logs": collect_strategy_logs(),
@@ -378,6 +390,7 @@ def run_live_monitor(date: Optional[str] = None) -> Dict:
     incidents.extend(analyze_heartbeat(snapshot["runtime_status"]))
     incidents.extend(analyze_runtime_phase(snapshot["runtime_status"]))
     incidents.extend(analyze_trade_logs(snapshot["qmt_trade_log"]))
+    incidents.extend(analyze_trade_logs(snapshot["qmttrader_v2_logs"]))
     incidents.extend(analyze_qmt_trade_state(snapshot["qmt_trade_state"]))
     incidents.extend(analyze_strategy_logs(snapshot["strategy_logs"]))
     incidents.extend(analyze_trade_decisions(snapshot["trade_decisions"]))

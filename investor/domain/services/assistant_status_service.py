@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -26,14 +27,20 @@ TIMERS = [
     "investor-health-alert.timer",
     "investor-predict.timer",
     "trading-morning.timer",
+    "investor-decision-0935.timer",
     "investor-briefing-0945.timer",
+    "investor-decision-1030.timer",
     "investor-risk-report.timer",
     "investor-briefing-1320.timer",
     "investor-briefing-1420.timer",
+    "investor-outlook-1430.timer",
     "trading-evening.timer",
     "investor-closing-brief.timer",
     "qmttrader-v2-concepts.timer",
     "investor-daily-maintain.timer",
+    "investor-mootdx-finance-cache.timer",
+    "investor-mootdx-momentum-cache.timer",
+    "investor-mootdx-industry-cache.timer",
     "investor-reflect.timer",
     "investor-capability-audit.timer",
     "investor-weekly-report.timer",
@@ -46,6 +53,32 @@ REPORT_FILES = {
     "weekly": "investor_weekly_report_latest.md",
     "audit": "investor_assistant_capability_audit_latest.json",
     "health": "investor_assistant_health_latest.md",
+}
+
+CORE_UNIT_LABELS = {
+    "feishu-webhook.service": "飞书命令服务",
+    "investor-event-watch.service": "事件监控",
+    "trading-intraday.service": "盘中监控",
+}
+
+REPORT_TIMER_LABELS = {
+    "investor-morning-brief.timer": "08:30 晨报",
+    "investor-predict.timer": "09:30 开盘预测",
+    "investor-decision-1030.timer": "10:30 走势修正",
+    "investor-outlook-1430.timer": "14:30 预测复盘",
+    "investor-closing-brief.timer": "收盘简报",
+    "investor-risk-report.timer": "持仓风险报告",
+    "investor-reflect.timer": "每日交易复盘",
+    "investor-weekly-report.timer": "周报",
+}
+
+REPORT_FILE_LABELS = {
+    "morning": "晨报",
+    "risk": "风险报告",
+    "closing": "收盘简报",
+    "weekly": "周报",
+    "audit": "能力审计",
+    "health": "最近健康告警记录",
 }
 
 
@@ -69,6 +102,19 @@ def _timer_next(unit: str) -> str:
             parts = line.split()
             return " ".join(parts[:4]) if len(parts) >= 4 else line.strip()
     return "unknown"
+
+
+def _human_timer_next(value: object) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(20\d{2})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})", text)
+    if not match:
+        return "等待 systemd 给出下次时间" if text in {"", "unknown", "n/a"} else text
+    year, month, day, hm = match.groups()
+    try:
+        weekday = "一二三四五六日"[datetime(int(year), int(month), int(day)).weekday()]
+    except (ValueError, IndexError):
+        weekday = "?"
+    return f"{int(month)}月{int(day)}日（周{weekday}）{hm}"
 
 
 def _file_status(name: str) -> Dict[str, Any]:
@@ -118,24 +164,33 @@ def build_assistant_status() -> Dict[str, Any]:
 def format_assistant_status(status: Dict[str, Any]) -> str:
     audit = status.get("audit") or {}
     lines = [
-        "OpenClaw Assistant Status",
-        f"generated_at: {status.get('generated_at')}",
-        f"audit: {audit.get('overall')} | blocked={audit.get('blocked_count', 0)} warn={audit.get('warning_count', 0)}",
+        "🧭 OpenClaw 投资助理运行状态",
+        f"检查时间：{status.get('generated_at') or '未知'}",
+        "",
+        "**核心服务**",
     ]
-    if audit.get("blocked"):
-        lines.append("blocked_items: " + ", ".join(str(x) for x in audit.get("blocked") or []))
-    lines.extend(["", "core services:"])
     for unit, active in (status.get("units") or {}).items():
-        lines.append(f"- {unit}: {active}")
-    lines.extend(["", "key timers:"])
-    for unit in TIMERS:
+        label = CORE_UNIT_LABELS.get(unit, unit)
+        lines.append(f"- {label}：{'正常' if active == 'active' else '异常（' + str(active) + '）'}")
+    lines.extend(["", "**核心报告时间**"])
+    for unit, label in REPORT_TIMER_LABELS.items():
         item = (status.get("timers") or {}).get(unit, {})
-        lines.append(f"- {unit}: {item.get('active')} next={item.get('next')}")
-    lines.extend(["", "latest reports:"])
+        if item.get("active") == "active":
+            lines.append(f"- {label}：已启用，下次 {_human_timer_next(item.get('next'))}")
+        else:
+            lines.append(f"- {label}：未正常启用（{item.get('active') or '未知'}）")
+    lines.extend(["", "**最新报告**"])
     for key in ("morning", "risk", "closing", "weekly", "audit", "health"):
         item = (status.get("reports") or {}).get(key, {})
+        label = REPORT_FILE_LABELS.get(key, key)
         if item.get("exists"):
-            lines.append(f"- {key}: age={item.get('age_hours')}h mtime={item.get('mtime')} size={item.get('size')}")
+            lines.append(f"- {label}：{item.get('mtime')}，距今 {float(item.get('age_hours') or 0):.1f} 小时")
         else:
-            lines.append(f"- {key}: missing")
+            lines.append(f"- {label}：尚未生成")
+    blocked = int(audit.get("blocked_count", 0) or 0)
+    warnings = int(audit.get("warning_count", 0) or 0)
+    lines.extend(["", "**能力检查**", f"- 阻断 {blocked} 项，警告 {warnings} 项。"])
+    if blocked:
+        lines.append("- 存在阻断项时，相关报告应按数据不可用降级，不得补齐结论。")
+    lines.extend(["", "**说明**", "- 这是运行状态，不是交易信号；系统不会因状态检查自动下单。"])
     return "\n".join(lines)

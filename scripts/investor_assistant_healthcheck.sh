@@ -15,7 +15,9 @@ INVEST_UNITS=(
   investor-morning-brief.timer
   investor-predict.timer
   trading-morning.timer
+  investor-decision-0935.timer
   investor-briefing-0945.timer
+  investor-decision-1030.timer
   investor-briefing-1320.timer
   investor-briefing-1420.timer
   trading-evening.timer
@@ -80,7 +82,7 @@ section "Duplicate Process Check"
 } >> "$REPORT"
 
 run_block "Investment Timers" bash -lc "systemctl list-timers --all --no-pager | grep -Ei 'investor|trading|qmttrader-v2' || true"
-run_block "Scheduled Push Wrappers" bash -lc "for u in investor-collect.service investor-predict.service investor-briefing-0945.service investor-briefing-1320.service investor-briefing-1420.service investor-reflect.service; do echo --- \$u; systemctl show \$u -p ExecStart -p EnvironmentFiles --no-pager; done"
+run_block "Scheduled Push Wrappers" bash -lc "for u in investor-collect.service investor-predict.service investor-decision-0935.service investor-briefing-0945.service investor-decision-1030.service investor-briefing-1320.service investor-briefing-1420.service investor-reflect.service; do echo --- \$u; systemctl show \$u -p ExecStart -p EnvironmentFiles --no-pager; done"
 run_block "Relevant Processes" bash -lc "ps -eo pid,ppid,lstart,cmd | grep -Ei 'openclaw.*gateway|investor/main.py event-watch|feishu_webhook|trading_core_new.longterm.cli intraday-monitor' | grep -v grep || true"
 run_block "Listening Investment Ports" bash -lc "ss -lntp | grep -E '(:8788|:18789|:22)' || true"
 run_block "Investor Runtime Check" bash -lc "cd /root/.openclaw/workspace/investor && python3 main.py runtime-check"

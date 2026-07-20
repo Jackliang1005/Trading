@@ -27,16 +27,28 @@ WATCH_UNITS = [
     "investor-event-watch.service",
     "trading-intraday.service",
     "investor-collect.timer",
+    "investor-morning-brief.timer",
     "investor-predict.timer",
     "trading-morning.timer",
+    "investor-decision-0935.timer",
     "investor-briefing-0945.timer",
+    "investor-decision-1030.timer",
+    "investor-outlook-1430.timer",
     "investor-briefing-1320.timer",
     "investor-briefing-1420.timer",
+    "investor-risk-report.timer",
     "trading-evening.timer",
+    "investor-closing-brief.timer",
     "qmttrader-v2-concepts.timer",
     "investor-daily-maintain.timer",
     "investor-reflect.timer",
+    "investor-weekly-report.timer",
+    "investor-capability-audit.timer",
+    "investor-global-event-scan.timer",
 ]
+
+sys.path.insert(0, str(WORKSPACE / "trading"))
+from trading_core_new.longterm.notifier import build_diagnostic_card, push_feishu_rich, record_feishu_delivery
 
 
 def _run(cmd: List[str], timeout: int = 20, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -159,11 +171,26 @@ def _intraday_process_count() -> int:
     return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
+def _collect_trade_risk_alerts() -> Dict[str, Any]:
+    """Use the consolidated price/technical risk Skill during live A-share sessions."""
+    sys.path.insert(0, str(INVESTOR_DIR))
+    try:
+        from skill_api import _dispatch
+        result = _dispatch({"action": "risk_alert"})
+    except Exception as exc:
+        return {"checked": False, "error": type(exc).__name__, "alerts": []}
+    if not result.get("trading_session"):
+        return {"checked": True, "live": False, "alerts": []}
+    alerts = result.get("alerts") or []
+    return {"checked": True, "live": True, "alerts": alerts, "source": result.get("source")}
+
+
 def collect_health(timeout: float = 3.0) -> Dict[str, Any]:
     unit_states = [_systemctl_state(unit) for unit in WATCH_UNITS]
     qmt = _probe_qmt2http(timeout=timeout)
     concept_db = _concept_db_status()
     intraday_count = _intraday_process_count()
+    trade_risk = _collect_trade_risk_alerts()
     issues: List[str] = []
     for item in unit_states:
         if item["enabled"] not in ("enabled", "static", "generated"):
@@ -189,21 +216,52 @@ def collect_health(timeout: float = 3.0) -> Dict[str, Any]:
                     issues.append(f"{name}:qmttrader_v2_logs_empty_for_today")
     if not concept_db.get("ok"):
         issues.append(f"concept_db:{concept_db.get('issue', 'invalid_counts')}")
+    for alert in trade_risk.get("alerts", []):
+        qty = int(alert.get("suggested_qty") or 0)
+        triggers = ",".join(alert.get("triggers") or []) or "decision_reduce_priority"
+        issues.append(
+            f"trade_risk_reduce_priority:{alert.get('code')} change={float(alert.get('change_pct') or 0):+.2f}% "
+            f"relative={float(alert.get('relative_change_pct') or 0):+.2f}pct suggested_qty={qty} triggers={triggers}"
+        )
 
     fingerprint_payload = {"issues": sorted(set(issues))}
     fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-    return {"ok": not issues, "generated_at": datetime.now().strftime("%F %T %Z"), "issues": sorted(set(issues)), "fingerprint": fingerprint, "qmt": qmt, "concept_db": concept_db, "intraday_process_count": intraday_count}
+    return {"ok": not issues, "generated_at": datetime.now().strftime("%F %T %Z"), "issues": sorted(set(issues)), "fingerprint": fingerprint, "qmt": qmt, "concept_db": concept_db, "intraday_process_count": intraday_count, "trade_risk": trade_risk}
 
 
 def _format_message(health: Dict[str, Any], recovered: bool = False) -> str:
     if recovered:
-        return "[OpenClaw health recovered]\nAll watched investment assistant services and qmt2http probes are healthy."
-    lines = ["[OpenClaw health alert]", f"time: {health.get('generated_at', '')}", f"issue_count: {len(health.get('issues', []))}", ""]
+        return "✅ OpenClaw 投资助手已恢复\n此前异常的服务与数据链路已通过健康检查。"
+    lines = [
+        "🚨 OpenClaw 投资助手异常",
+        f"检查时间：{health.get('generated_at', '')}",
+        f"共发现 {len(health.get('issues', []))} 项异常；交易数据不可用时不会推断账户状态。",
+        "",
+        "**异常明细**",
+    ]
     for issue in (health.get("issues", []) or [])[:12]:
-        lines.append(f"- {issue}")
+        text = str(issue)
+        if text.startswith("unit_not_active:"):
+            text = "服务未运行｜" + text.removeprefix("unit_not_active:")
+        elif text.startswith("unit_not_enabled:"):
+            text = "服务未启用｜" + text.removeprefix("unit_not_enabled:")
+        elif text.startswith("intraday_process_count="):
+            text = "盘中监控进程数量异常｜" + text
+        elif text.startswith("concept_db:"):
+            text = "概念板块数据库异常｜" + text.removeprefix("concept_db:")
+        elif text.startswith("trade_risk_reduce_priority:"):
+            text = "持仓触发降风险条件｜" + text.removeprefix("trade_risk_reduce_priority:")
+        elif ":" in text and "_failed(" in text:
+            text = "QMT数据链路失败｜" + text
+        lines.append(f"- {text}")
     if len(health.get("issues", []) or []) > 12:
-        lines.append(f"- ... {len(health['issues']) - 12} more")
-    lines.extend(["", "Runbook:", "cd /root/.openclaw/workspace && scripts/investor_assistant_healthcheck.sh", "cd /root/.openclaw/workspace && python3 scripts/qmt2http_remote_recovery.py --server guojin --timeout 6", "cd /root/.openclaw/workspace/investor && python3 main.py runtime-check"])
+        lines.append(f"- 另有 {len(health['issues']) - 12} 项，详见本机健康检查。")
+    lines.extend([
+        "",
+        "**处理说明**",
+        "- 本告警只做诊断，不会启动QMT客户端或自动执行交易。",
+        "- 本机检查：`cd /root/.openclaw/workspace && scripts/investor_assistant_healthcheck.sh`",
+    ])
     return "\n".join(lines)
 
 
@@ -213,11 +271,32 @@ def _send_feishu(message: str, target: str) -> Dict[str, Any]:
         return {"pushed": False, "reason": "missing_target"}
     if not clean.startswith(("user:", "chat:")):
         clean = f"user:{clean}"
+    recovered = "已恢复" in message or "恢复正常" in message
+    title = "OpenClaw 投资助理已恢复" if recovered else "OpenClaw 投资助理异常"
+    card = build_diagnostic_card(title, message, recovered=recovered)
+    if push_feishu_rich(message, card=card, diagnostic=True, target=clean):
+        return {"pushed": True, "target": clean, "transport": "rich_card"}
     cmd = ["openclaw", "message", "send", "--channel", "feishu", "--target", clean, "-m", message]
     try:
         result = _run(cmd, timeout=30)
+        record_feishu_delivery(
+            text=message,
+            card=card,
+            diagnostic=True,
+            target=clean,
+            transport="health_raw_fallback",
+            sent=result.returncode == 0,
+        )
         return {"pushed": result.returncode == 0, "target": clean, "returncode": result.returncode, "stderr": result.stderr[-500:]}
     except Exception as exc:
+        record_feishu_delivery(
+            text=message,
+            card=card,
+            diagnostic=True,
+            target=clean,
+            transport="health_raw_fallback",
+            sent=False,
+        )
         return {"pushed": False, "target": clean, "error": str(exc)}
 
 
@@ -259,4 +338,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

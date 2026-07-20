@@ -164,10 +164,10 @@ class LiveMonitorRepository:
                         start = text.find(marker)
                         end = text.find(":", start)
                         module_name = text[start:end] if end != -1 else text[start:]
-                        candidate = "/root/qmttrader/" + module_name.replace(".", "/") + ".py"
+                        candidate = "/root/qmttrader_v2/" + module_name.replace(".", "/") + ".py"
                         files.append(candidate)
-                if "/root/qmttrader/" in text:
-                    start = text.find("/root/qmttrader/")
+                if "/root/qmttrader_v2/" in text:
+                    start = text.find("/root/qmttrader_v2/")
                     end = len(text)
                     for stop in (" ", "\"", "'", ",", ":", ")"):
                         pos = text.find(stop, start)
@@ -186,7 +186,7 @@ class LiveMonitorRepository:
         for path in files[:5]:
             commands.append(f"sed -n '1,220p' {path}")
         if not commands:
-            commands.append("rg -n 'Traceback|ERROR|CRITICAL|ImportError|AttributeError|KeyError|TypeError' /root/qmttrader -S")
+            commands.append("rg -n 'Traceback|ERROR|CRITICAL|ImportError|AttributeError|KeyError|TypeError' /root/qmttrader_v2 -S")
         return commands
 
     def save_codex_fix_tasks(self, incidents: List[Dict]) -> List[int]:

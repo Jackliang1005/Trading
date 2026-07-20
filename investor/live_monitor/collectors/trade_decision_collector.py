@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from live_monitor.config import QMTTRADER_LOG_ROOT
 
 
+LOG_ROOT = QMTTRADER_LOG_ROOT
 LIVE_LOG_DIR = QMTTRADER_LOG_ROOT / "live"
 
 FINAL_SELECTION_RE = re.compile(r"最终选股完成,\s*信号:\s*(\d+),\s*标的:\s*(\[[^\]]*\])")
@@ -224,19 +225,39 @@ def _parse_system_log(path: Path) -> Dict:
     }
 
 
-def collect_trade_decisions(date: str | None = None) -> Dict:
-    latest_system: Optional[Path] = None
-    normalized_date = _normalize_trade_date(date or "")
-    if LIVE_LOG_DIR.exists():
+def _candidate_system_logs(normalized_date: str = "") -> List[Path]:
+    roots = [LIVE_LOG_DIR, LOG_ROOT / "today-sim", LOG_ROOT]
+    patterns = ["system.log", "*_system.log"]
+    candidates: List[Path] = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
         if normalized_date:
-            candidate = LIVE_LOG_DIR / normalized_date / "system.log"
-            if candidate.exists():
-                latest_system = candidate
-        elif latest_system is None:
-            candidates = sorted(LIVE_LOG_DIR.glob("*/system.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if candidates:
-                latest_system = candidates[0]
+            date_dirs = [root / normalized_date]
+            dashed = f"{normalized_date[:4]}-{normalized_date[4:6]}-{normalized_date[6:]}" if len(normalized_date) == 8 else normalized_date
+            date_dirs.append(root / dashed)
+            for date_dir in date_dirs:
+                if not date_dir.exists():
+                    continue
+                for pattern in patterns:
+                    for path in date_dir.glob(pattern):
+                        if path.is_file() and path not in seen:
+                            seen.add(path)
+                            candidates.append(path)
+        else:
+            for pattern in ("*/system.log", "*/*_system.log", "**/system.log", "**/*_system.log"):
+                for path in root.glob(pattern):
+                    if path.is_file() and path not in seen:
+                        seen.add(path)
+                        candidates.append(path)
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
 
+
+def collect_trade_decisions(date: str | None = None) -> Dict:
+    normalized_date = _normalize_trade_date(date or "")
+    candidates = _candidate_system_logs(normalized_date)
+    latest_system = candidates[0] if candidates else None
     system_summary = _parse_system_log(latest_system) if latest_system else {}
     log_sources = {"entries": [system_summary] if system_summary else []}
     watchlist_entries = system_summary.get("watchlists", []) if system_summary else []

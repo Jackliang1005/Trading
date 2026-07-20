@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -16,13 +17,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
 import db
+from domain.services.report_style_service import build_report_card, event_impact_label, report_quality_issues
 
 DEFAULT_EVENT_SOURCES = [
     "https://wap.eastmoney.com/",
 ]
+OPENCLAW_FEISHU_SEND_TIMEOUT = int(os.environ.get("OPENCLAW_FEISHU_SEND_TIMEOUT", "180"))
 
 DEFAULT_GLOBAL_EVENT_SOURCES = [
     "https://finance.yahoo.com/news/rssindex",
@@ -45,7 +49,7 @@ THEME_MAP = {
         ],
     },
     "AI算力": {
-        "keywords": ["AI", "OpenAI", "Microsoft", "Meta", "Apple", "Alphabet", "Amazon", "加息", "光模块", "光模块", "GPU", "光模块", "加息"],
+        "keywords": ["AI", "OpenAI", "算力", "数据中心", "光模块", "大模型"],
         "chains": ["AI服务器", "液冷散热", "光模块", "数据中心"],
         "stocks": [
             {"code": "000977.SZ", "name": "浪潮信息", "reason": "AI服务器"},
@@ -76,47 +80,47 @@ THEME_MAP = {
         "keywords": ["Federal Reserve", "Fed", "ECB", "central bank", "rate cut", "rate hike", "inflation", "CPI", "PPI", "tariff", "recession", "Treasury", "dollar", "yield"],
         "chains": ["global liquidity", "RMB FX", "risk appetite", "gold", "banks"],
         "stocks": [
-            {"code": "518880.SH", "name": "Gold ETF", "reason": "real rates / safe haven"},
-            {"code": "512800.SH", "name": "Bank ETF", "reason": "rates and NIM"},
-            {"code": "513100.SH", "name": "Nasdaq ETF", "reason": "global risk appetite"},
+            {"code": "518880.SH", "name": "黄金ETF", "reason": "实际利率与避险需求"},
+            {"code": "512800.SH", "name": "银行ETF", "reason": "利率与净息差"},
+            {"code": "513100.SH", "name": "纳指ETF", "reason": "全球风险偏好"},
         ],
     },
     "AI Chips": {
         "keywords": ["Nvidia", "NVDA", "GPU", "Blackwell", "AI chip", "accelerator", "HBM", "semiconductor equipment", "TSMC", "ASML", "Micron", "export control"],
         "chains": ["AI servers", "optical modules", "advanced packaging", "HBM memory", "semiconductor equipment"],
         "stocks": [
-            {"code": "300502.SZ", "name": "Eoptolink", "reason": "AI optical module supply chain"},
-            {"code": "300308.SZ", "name": "Zhongji Innolight", "reason": "high-speed optical modules"},
-            {"code": "300394.SZ", "name": "TFC", "reason": "optical components"},
-            {"code": "002371.SZ", "name": "NAURA", "reason": "semiconductor equipment localization"},
+            {"code": "300502.SZ", "name": "新易盛", "reason": "AI光模块供应链"},
+            {"code": "300308.SZ", "name": "中际旭创", "reason": "高速光模块"},
+            {"code": "300394.SZ", "name": "天孚通信", "reason": "光器件"},
+            {"code": "002371.SZ", "name": "北方华创", "reason": "半导体设备国产化"},
         ],
     },
     "Energy Commodities": {
         "keywords": ["oil", "OPEC", "Brent", "WTI", "natural gas", "copper", "gold", "commodity", "shipping", "Red Sea", "sanction"],
         "chains": ["oil and gas", "non-ferrous metals", "gold", "shipping", "chemicals"],
         "stocks": [
-            {"code": "600028.SH", "name": "Sinopec", "reason": "oil/refining"},
-            {"code": "601857.SH", "name": "PetroChina", "reason": "oil and gas prices"},
-            {"code": "601899.SH", "name": "Zijin Mining", "reason": "copper/gold prices"},
-            {"code": "601919.SH", "name": "COSCO Shipping", "reason": "freight disruption"},
+            {"code": "600028.SH", "name": "中国石化", "reason": "油价与炼化"},
+            {"code": "601857.SH", "name": "中国石油", "reason": "油气价格"},
+            {"code": "601899.SH", "name": "紫金矿业", "reason": "铜价与金价"},
+            {"code": "601919.SH", "name": "中远海控", "reason": "航运供应扰动"},
         ],
     },
     "Geopolitics": {
         "keywords": ["war", "missile", "attack", "ceasefire", "sanctions", "Taiwan", "South China Sea", "Middle East", "Ukraine", "Russia", "Israel", "Iran"],
         "chains": ["defense", "gold safe haven", "oil and gas", "shipping", "localization"],
         "stocks": [
-            {"code": "512660.SH", "name": "Defense ETF", "reason": "geopolitical risk"},
-            {"code": "518880.SH", "name": "Gold ETF", "reason": "safe haven"},
-            {"code": "601919.SH", "name": "COSCO Shipping", "reason": "shipping disruption"},
+            {"code": "512660.SH", "name": "军工ETF", "reason": "地缘风险"},
+            {"code": "518880.SH", "name": "黄金ETF", "reason": "避险需求"},
+            {"code": "601919.SH", "name": "中远海控", "reason": "航运扰动"},
         ],
     },
     "Global EV": {
         "keywords": ["Tesla", "EV", "electric vehicle", "battery", "lithium", "solid-state battery", "autonomous driving", "robotaxi"],
         "chains": ["new energy vehicles", "lithium batteries", "autonomous driving", "robotaxi"],
         "stocks": [
-            {"code": "300750.SZ", "name": "CATL", "reason": "global power battery"},
-            {"code": "002594.SZ", "name": "BYD", "reason": "EV and battery"},
-            {"code": "002050.SZ", "name": "Sanhua", "reason": "thermal management / robotics chain"},
+            {"code": "300750.SZ", "name": "宁德时代", "reason": "全球动力电池"},
+            {"code": "002594.SZ", "name": "比亚迪", "reason": "新能源汽车与电池"},
+            {"code": "002050.SZ", "name": "三花智控", "reason": "热管理与机器人链"},
         ],
     },
 }
@@ -125,6 +129,16 @@ HIGH_IMPACT_WORDS = [
     "发布", "发表", "推出", "突破", "首发", "量产", "中标", "合作", "签约", "升级",
     "新技术", "新产品", "涨价", "订单", "超预期", "监管", "制裁",
 ]
+
+MARKET_CATALYST_WORDS = (
+    "earnings", "revenue", "guidance", "order", "supply", "shortage", "price", "tariff",
+    "sanction", "regulation", "rate cut", "rate hike", "investment", "acquisition", "deal",
+    "valuation", "launches", "unveils", "new model", "出口管制", "业绩", "订单", "涨价",
+    "降息", "加息", "制裁", "监管", "量产", "中标", "签约", "发布", "推出", "突破",
+    "attacks", "hostilities", "blockade", "supply disruption", "sell-off", "plunge", "rally",
+)
+NON_MARKET_STORY_WORDS = ("jacket", "auction", "wedding", "birthday", "celebrity", "sports")
+DIGEST_TITLE_PATTERN = re.compile(r"^(?:早报|午报|晚报|财经早餐|盘前必读|每日财经|市场早报)\s*[丨|：:]", re.IGNORECASE)
 
 
 @dataclass
@@ -183,6 +197,15 @@ def _normalize_event_title(title: str) -> str:
     return text.strip()
 
 
+def _near_duplicate_title(left: Any, right: Any) -> bool:
+    def tokens(value: Any) -> set[str]:
+        return set(re.findall(r"[a-z\u4e00-\u9fff]+", str(value or "").lower()))
+    a, b = tokens(left), tokens(right)
+    if len(a) < 5 or len(b) < 5:
+        return False
+    return len(a & b) / len(a | b) >= 0.85
+
+
 def _parse_time(value: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -202,6 +225,15 @@ def _parse_time(value: str) -> str:
         except Exception:
             continue
     return text[:19]
+
+
+def _event_datetime(value: Any) -> datetime | None:
+    """Parse normalized event timestamps for freshness gates."""
+    text = _parse_time(str(value or ""))
+    try:
+        return datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
 
 
 def _http_get_text(url: str, timeout: float = 10.0) -> str:
@@ -394,6 +426,23 @@ def _theme_matches(text: str) -> List[Dict[str, Any]]:
         for word in config.get("keywords", []):
             if _keyword_in_text(str(word), text, lower):
                 hit_words.append(word)
+        if theme == "AI算力" and {str(word).lower() for word in hit_words}.issubset({"ai"}):
+            compute_context = (
+                "gpu", "ai chip", "semiconductor", "data center", "datacenter",
+                "server", "compute", "computing", "inference", "training",
+                "accelerator", "hbm", "算力", "数据中心", "光模块", "服务器",
+                "芯片", "半导体", "液冷", "训练", "推理",
+            )
+            if not any(_keyword_in_text(word, text, lower) for word in compute_context):
+                hit_words = []
+        if theme == "Geopolitics" and {str(word).lower() for word in hit_words}.issubset({"taiwan"}):
+            conflict_context = (
+                "taiwan strait", "military", "invasion", "blockade", "conflict",
+                "tension", "drill", "missile", "sovereignty", "台海", "军演",
+                "封锁", "冲突", "导弹", "军事",
+            )
+            if not any(_keyword_in_text(word, text, lower) for word in conflict_context):
+                hit_words = []
         if hit_words:
             matches.append({
                 "theme": theme,
@@ -404,15 +453,38 @@ def _theme_matches(text: str) -> List[Dict[str, Any]]:
     return matches
 
 
+def _is_multi_story_digest_title(title: object) -> bool:
+    text = re.sub(r"^\d{1,2}:\s*\d{2}\s+", "", str(title or "").strip())
+    separators = text.count("；") + text.count(";")
+    return bool(DIGEST_TITLE_PATTERN.search(text) and separators >= 2)
+
+
+def _independent_theme_count(themes: Sequence[Dict[str, Any]]) -> int:
+    """Collapse overlapping taxonomies so one AI story is not scored three times."""
+    groups = set()
+    for item in themes:
+        name = str(item.get("theme") or "")
+        groups.add("AI/semiconductor" if name in {"AI算力", "AI Chips", "半导体"} else name)
+    return len(groups)
+
+
 def _score_event(text: str, theme_count: int, holding_hit: bool = False) -> int:
     score = 20
     score += min(theme_count, 3) * 20
     score += sum(8 for word in HIGH_IMPACT_WORDS if word in text)
     if holding_hit:
         score += 25
-    if any(word in text for word in ("加息", "加息", "OpenAI", "加息", "加息", "Nvidia", "Federal Reserve", "Fed", "ECB", "Tesla", "TSMC", "ASML", "OPEC")):
+    entities = ("OpenAI", "Nvidia", "Federal Reserve", "Fed", "ECB", "Tesla", "TSMC", "ASML", "OPEC")
+    if any(word in text for word in ("加息", "降息")) or (any(word in text for word in entities) and any(word.lower() in text.lower() for word in MARKET_CATALYST_WORDS)):
         score += 15
     return min(score, 100)
+
+
+def _is_market_relevant_event(text: str, theme_count: int) -> bool:
+    lower = text.lower()
+    if any(word in lower for word in NON_MARKET_STORY_WORDS):
+        return False
+    return any(word.lower() in lower for word in MARKET_CATALYST_WORDS)
 
 
 def _severity(score: int) -> str:
@@ -467,7 +539,8 @@ def _position_codes(positions: Sequence[Dict[str, Any]]) -> set[str]:
 
 def analyze_event(raw_event: RawEvent, positions: Sequence[Dict[str, Any]] | None = None) -> Dict[str, Any]:
     text = f"{raw_event.title} {raw_event.summary}".strip()
-    themes = _theme_matches(text)
+    is_digest = _is_multi_story_digest_title(raw_event.title)
+    themes = [] if is_digest else _theme_matches(text)
     pos_codes = _position_codes(positions or [])
     related_stocks = []
     holding_hit = False
@@ -482,7 +555,7 @@ def analyze_event(raw_event: RawEvent, positions: Sequence[Dict[str, Any]] | Non
             item["holding"] = code.upper() in pos_codes or code.split(".", 1)[0] in pos_codes
             holding_hit = holding_hit or bool(item["holding"])
             related_stocks.append(item)
-    score = _score_event(text, len(themes), holding_hit=holding_hit)
+    score = 0 if is_digest else _score_event(text, _independent_theme_count(themes), holding_hit=holding_hit)
     event_id = _stable_id(_normalize_event_title(raw_event.title), raw_event.url or raw_event.source)
     return {
         "event_id": event_id,
@@ -497,6 +570,7 @@ def analyze_event(raw_event: RawEvent, positions: Sequence[Dict[str, Any]] | Non
         "score": score,
         "severity": _severity(score),
         "should_push": score >= int(os.environ.get("INVESTOR_EVENT_PUSH_SCORE", "65")),
+        "is_multi_story_digest": is_digest,
         "status": "new",
     }
 
@@ -524,8 +598,10 @@ def save_event_alert(event: Dict[str, Any]) -> None:
 
 
 def format_event_alert(event: Dict[str, Any]) -> str:
+    from domain.services.report_style_service import event_summary_cn, join_cn, theme_label
+
     themes = event.get("themes", []) or []
-    theme_names = "、".join(str(item.get("theme", "")) for item in themes[:4] if item.get("theme")) or "未匹配"
+    theme_names = join_cn((theme_label(item.get("theme")) for item in themes[:4] if item.get("theme")), "未匹配")
     chains = []
     for item in themes:
         chains.extend(item.get("chains", []) or [])
@@ -536,16 +612,61 @@ def format_event_alert(event: Dict[str, Any]) -> str:
         for item in stocks[:8]
     ) or "暂无内置映射"
     lines = [
-        f"【{event.get('severity', 'P3')} 事件提醒】{event.get('title', '')}",
-        f"主题: {theme_names}",
-        f"影响链条: {chain_text}",
-        f"相关A股: {stock_text}",
-        f"评分: {event.get('score', 0)}/100",
-        f"时间: {event.get('published_at', '')}",
+        f"⚠️ {event_impact_label(event.get('severity'))}事件提醒",
+        f"**{event_summary_cn(event.get('title'), (item.get('theme') for item in themes))}**",
+        "",
+        f"- 主题：{theme_names}",
+        f"- 影响链：{chain_text}",
+        f"- A股映射：{stock_text}",
+        f"- 发布时间：{event.get('published_at', '') or '无法确认'}｜影响程度：{event_impact_label(event.get('severity'))}",
+        "- 操作原则：先验证板块与量价，不因单条新闻直接追涨。",
     ]
     if event.get("url"):
-        lines.append(f"来源: {event.get('url')}")
+        lines.append(f"- 来源：{event.get('url')}")
     return "\n".join(lines)
+
+
+def _push_event_rich(message: str, card: Dict[str, Any], target: str) -> bool:
+    """Use the shared Feishu rich-card transport when the trading package is available."""
+    trading_root = Path(__file__).resolve().parents[3] / "trading"
+    trading_path = str(trading_root)
+    if trading_path not in sys.path:
+        sys.path.insert(0, trading_path)
+    try:
+        from trading_core_new.longterm.notifier import push_feishu_rich
+
+        return bool(push_feishu_rich(message, card=card, target=target))
+    except Exception:
+        return False
+
+
+def _record_event_delivery(
+    message: str,
+    card: Dict[str, Any] | None,
+    target: str,
+    transport: str,
+    sent: bool,
+    quality_issues: list[str] | None = None,
+) -> None:
+    """Record final fallback/gate outcomes without retaining event text or target IDs."""
+    trading_root = Path(__file__).resolve().parents[3] / "trading"
+    trading_path = str(trading_root)
+    if trading_path not in sys.path:
+        sys.path.insert(0, trading_path)
+    try:
+        from trading_core_new.longterm.notifier import record_feishu_delivery
+
+        record_feishu_delivery(
+            text=message,
+            card=card,
+            diagnostic=False,
+            target=target,
+            transport=transport,
+            sent=sent,
+            quality_issues=quality_issues,
+        )
+    except Exception:
+        return
 
 
 def push_event_to_feishu(event: Dict[str, Any], target: str = "") -> Dict[str, Any]:
@@ -554,14 +675,41 @@ def push_event_to_feishu(event: Dict[str, Any], target: str = "") -> Dict[str, A
         return {"pushed": False, "reason": "missing INVESTOR_FEISHU_TARGET"}
     if not clean_target.startswith(("user:", "chat:")):
         clean_target = f"user:{clean_target}"
+    message = format_event_alert(event)
+    quality_issues = report_quality_issues(message)
+    if quality_issues:
+        _record_event_delivery(message, None, clean_target, "quality_gate", False, quality_issues)
+        return {
+            "pushed": False,
+            "target": clean_target,
+            "reason": "quality_gate_failed",
+            "quality_issues": quality_issues,
+        }
+    card = build_report_card(
+        message,
+        title="OpenClaw - 事件提醒",
+        template="orange",
+    )
+    if _push_event_rich(message, card, clean_target):
+        return {
+            "pushed": True,
+            "target": clean_target,
+            "transport": "rich_card",
+        }
     cmd = [
         "openclaw", "message", "send",
         "--channel", "feishu",
         "--target", clean_target,
-        "-m", format_event_alert(event),
+        "-m", message,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=OPENCLAW_FEISHU_SEND_TIMEOUT,
+        )
+        _record_event_delivery(message, card, clean_target, "event_raw_fallback", result.returncode == 0)
         return {
             "pushed": result.returncode == 0,
             "target": clean_target,
@@ -569,6 +717,7 @@ def push_event_to_feishu(event: Dict[str, Any], target: str = "") -> Dict[str, A
             "stderr": result.stderr[-500:],
         }
     except Exception as exc:
+        _record_event_delivery(message, card, clean_target, "event_raw_fallback", False)
         return {"pushed": False, "target": clean_target, "error": str(exc)}
 
 
@@ -634,7 +783,7 @@ _GLOBAL_THEME_GUIDANCE = {
     },
     "AI\u7b97\u529b": {
         "impact": "\u76f4\u63a5\u6620\u5c04\u5230 A\u80a1 AI \u670d\u52a1\u5668\u3001\u5149\u6a21\u5757\u3001\u6db2\u51b7\u548c\u6570\u636e\u4e2d\u5fc3\u94fe\u6761",
-        "watch": "\u89c2\u5bdf\u9ad8\u5206\u4e8b\u4ef6\u662f\u5426\u6709\u8ba2\u5355\u3001\u4ef7\u683c\u3001\u4f9b\u5e94\u9650\u5236\u6216\u4e1a\u7ee9\u6307\u5f15\u53d8\u5316",
+        "watch": "\u89c2\u5bdf\u76f8\u5173\u4e8b\u4ef6\u662f\u5426\u5e26\u6765\u8ba2\u5355\u3001\u4ef7\u683c\u3001\u4f9b\u5e94\u9650\u5236\u6216\u4e1a\u7ee9\u6307\u5f15\u53d8\u5316",
     },
     "Energy Commodities": {
         "impact": "\u5f71\u54cd\u539f\u6cb9\u3001\u9ec4\u91d1\u3001\u6709\u8272\u3001\u5316\u5de5\u548c\u822a\u8fd0\u94fe\u6761",
@@ -678,7 +827,7 @@ def _event_guidance_text(event: Dict[str, Any]) -> str:
             watches.append(str(guidance["watch"]))
     impact = "\uff1b".join(dict.fromkeys(impacts).keys()) or "\u9700\u7ed3\u5408\u76d8\u524d\u5e02\u573a\u8868\u73b0\u4e8c\u6b21\u786e\u8ba4"
     watch = "\uff1b".join(dict.fromkeys(watches).keys()) or "\u89c2\u5bdf\u76f8\u5173\u6807\u7684\u653e\u91cf\u3001\u8d44\u91d1\u6d41\u5411\u548c\u540c\u677f\u5757\u6269\u6563"
-    return f"\u4f20\u5bfc: {impact}\n\u52a8\u4f5c: {watch}"
+    return f"\u4f20\u5bfc\uff1a{impact}\n   \u9a8c\u8bc1\uff1a{watch}"
 
 
 def build_global_event_brief(limit: int = 80, min_score: int = 45, top_n: int = 6) -> Dict[str, Any]:
@@ -691,8 +840,26 @@ def build_global_event_brief(limit: int = 80, min_score: int = 45, top_n: int = 
     raw_events = fetch_events(source_urls=get_global_event_sources())[: max(1, limit)]
     candidates: List[Dict[str, Any]] = []
     low_score_count = 0
+    stale_count = 0
+    duplicate_raw_count = 0
+    irrelevant_count = 0
+    seen_event_ids: set[str] = set()
+    seen_titles: List[str] = []
+    now = datetime.now()
     for raw_event in raw_events:
         event = analyze_event(raw_event, positions=positions)
+        published = _event_datetime(event.get("published_at"))
+        if published is None or published < now - timedelta(hours=48) or published > now + timedelta(hours=6):
+            stale_count += 1
+            continue
+        if event["event_id"] in seen_event_ids or any(_near_duplicate_title(event.get("title"), title) for title in seen_titles):
+            duplicate_raw_count += 1
+            continue
+        seen_event_ids.add(event["event_id"])
+        seen_titles.append(str(event.get("title") or ""))
+        if not _is_market_relevant_event(f"{event.get('title', '')} {event.get('summary', '')}", _independent_theme_count(event.get("themes") or [])):
+            irrelevant_count += 1
+            continue
         if event["score"] < min_score:
             low_score_count += 1
             continue
@@ -706,32 +873,38 @@ def build_global_event_brief(limit: int = 80, min_score: int = 45, top_n: int = 
         "raw_count": len(raw_events),
         "candidate_count": len(candidates),
         "low_score_count": low_score_count,
+        "stale_count": stale_count,
+        "duplicate_raw_count": duplicate_raw_count,
+        "irrelevant_count": irrelevant_count,
         "top_events": top_events,
     }
 
 
 def format_global_event_brief(brief: Dict[str, Any]) -> str:
+    from domain.services.report_style_service import event_summary_cn, join_cn, theme_label
+
     lines = [
-        "\u5168\u7403\u7a81\u53d1\u8d22\u7ecf\u96f7\u8fbe",
-        f"\u65f6\u95f4: {brief.get('detected_at', '')}",
-        f"\u6765\u6e90={brief.get('source_count')} \u539f\u59cb={brief.get('raw_count')} \u9ad8\u5206={brief.get('candidate_count')} \u4f4e\u5206={brief.get('low_score_count')}",
+        "🌐 全球财经事件雷达",
+        f"扫描时间：{brief.get('detected_at', '')}",
+        "",
+        "**重点事件**",
     ]
     events = brief.get("top_events", []) or []
     if not events:
         lines.append("\u6682\u65e0\u8fbe\u5230\u9608\u503c\u7684\u5168\u7403\u7a81\u53d1\u8d22\u7ecf\u4e8b\u4ef6\u3002")
         return "\n".join(lines)
     for idx, event in enumerate(events, 1):
-        duplicate = "\u5df2\u5165\u5e93" if event.get("is_duplicate") else "\u65b0\u4e8b\u4ef6"
-        theme_text = "\u3001".join(_event_theme_names(event)[:4]) or "\u672a\u5339\u914d"
+        theme_text = join_cn((theme_label(item) for item in _event_theme_names(event)[:4]), "未匹配")
         lines.extend([
             "",
-            f"{idx}. [{event.get('severity', 'P3')}/{event.get('score', 0)} {duplicate}] {event.get('title', '')}",
-            f"\u4e3b\u9898: {theme_text}",
-            f"A\u80a1\u6620\u5c04: {_event_related_stock_text(event)}",
-            _event_guidance_text(event),
+            f"{idx}. **{event_summary_cn(event.get('title'), _event_theme_names(event))}**｜{event_impact_label(event.get('severity'))}",
+            f"   主题：{theme_text}",
+            f"   A股映射：{_event_related_stock_text(event)}",
+            "   " + _event_guidance_text(event),
         ])
         if event.get("url"):
-            lines.append(f"\u6765\u6e90: {event.get('url')}")
+            lines.append(f"   来源：{event.get('url')}")
+    lines.extend(["", "**使用原则**", "- 仅保留经过新鲜度、去重和主题相关性筛选的事件；映射结果不是买入信号。"])
     return "\n".join(lines)
 
 

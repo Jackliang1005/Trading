@@ -6,6 +6,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 
 from live_monitor.collectors.qmt_auth import build_qmt_auth_headers
@@ -127,9 +128,8 @@ def _summarize_endpoint(name: str, result: Dict) -> Dict:
     return summary
 
 
-def collect_qmt_trade_state() -> Dict:
-    timeout = float(os.getenv("QMT2HTTP_TIMEOUT", "15"))
-    servers = []
+def collect_qmt_trade_state(timeout: float | None = None) -> Dict:
+    timeout = float(timeout if timeout is not None else os.getenv("QMT2HTTP_TIMEOUT", "15"))
     endpoints = [
         ("asset", "/api/stock/asset"),
         ("positions", "/api/stock/positions"),
@@ -138,34 +138,44 @@ def collect_qmt_trade_state() -> Dict:
         ("records_trades", "/api/trade/records?record_type=trades"),
     ]
     trade_only_allowed = {"asset", "positions", "orders", "trades", "records_trades"}
-    for server in _candidate_servers():
+
+    def collect_server(server: Dict[str, str]) -> Dict:
         health_url = f"{server['base_url']}/health"
         health_result = _fetch_json(health_url, timeout=timeout)
         health_result["url"] = health_url
         trade_only = _is_trade_only_mode(health_result)
         endpoint_results = {}
         endpoint_summaries = {}
-        for name, route in endpoints:
+
+        def fetch_endpoint(item: tuple[str, str]) -> tuple[str, Dict]:
+            name, route = item
             url = f"{server['base_url']}{route}"
             if trade_only and name not in trade_only_allowed:
                 result = _skipped_result(url)
             else:
                 result = _fetch_json(url, timeout=timeout)
                 result["url"] = url
+            return name, result
+
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as endpoint_pool:
+            fetched = endpoint_pool.map(fetch_endpoint, endpoints)
+        for name, result in fetched:
             endpoint_results[name] = result
             endpoint_summaries[name] = _summarize_endpoint(name, result)
-        servers.append(
-            {
-                "server": server["name"],
-                "base_url": server["base_url"],
-                "health": health_result,
-                "mode": {
-                    "trade_only": trade_only,
-                    "route_mode": (((health_result.get("response") or {}).get("data") or {}).get("route_mode", "")),
-                    "service_mode": (((health_result.get("response") or {}).get("data") or {}).get("service_mode", "")),
-                },
-                "endpoints": endpoint_results,
-                "summary": endpoint_summaries,
-            }
-        )
+        return {
+            "server": server["name"],
+            "base_url": server["base_url"],
+            "health": health_result,
+            "mode": {
+                "trade_only": trade_only,
+                "route_mode": (((health_result.get("response") or {}).get("data") or {}).get("route_mode", "")),
+                "service_mode": (((health_result.get("response") or {}).get("data") or {}).get("service_mode", "")),
+            },
+            "endpoints": endpoint_results,
+            "summary": endpoint_summaries,
+        }
+
+    candidates = _candidate_servers()
+    with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as server_pool:
+        servers = list(server_pool.map(collect_server, candidates))
     return {"kind": "qmt_trade_state", "servers": servers}

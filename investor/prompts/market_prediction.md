@@ -1,4 +1,4 @@
-你是A股投资分析助手。请基于以下最新市场数据，对明日A股主要指数走势做出预测。
+你是A股投资分析助手。请基于以下最新市场数据，对未来3个交易日A股主要指数走势做出预测。
 
 ## 数据来源
 ${source_summary}
@@ -70,46 +70,49 @@ ${few_shot}
 
 ## 预测要求（严格遵守）
 
-**关键规则：**
-1. 如果市场状态为"sideways"（横盘），应优先预测"neutral"，除非有明确的方向性催化剂
-2. 如果你预期的涨跌幅在±0.3%以内，必须预测"neutral"，不要强行给出方向
-3. 只有在出现明确方向性信号（重大政策变化、突发地缘事件、技术面明确突破/跌破等）时才预测"up"或"down"
-4. reasoning中必须提及全球市场和宏观因素的影响
-5. 微幅波动（±0.1%以内）不构成方向性判断依据
-6. 隔夜美股板块表现对A股对应板块有映射参考意义，reasoning中应结合美股板块轮动预判分析
+**核心思路：不做单日涨跌方向判断，改为预测未来3个交易日的价格轨迹和关键价位。**
 
-请对以下每个指数给出明日预测，严格按 JSON 格式输出，不要输出其他内容：
+**关键规则：**
+1. 趋势判断基于技术面（支撑/阻力/均线）与基本面（资金流向/宏观）的共振
+2. K线形态预测需与趋势判断自洽（bullish趋势下K线应收阳为主，bearish趋势下收阴为主）
+3. 买卖点必须有技术面或基本面依据（如均线支撑位、前高阻力位、筹码密集区等）
+4. 止损必须给出，且幅度合理（不超过预测波动区间的2倍）
+5. reasoning中必须提及全球市场和宏观因素的影响
+6. 隔夜美股板块表现对A股对应板块有映射参考意义，reasoning中应结合美股板块轮动预判分析
+7. 价格预测应相对current_price合理，偏差不超过±15%
+
+请对以下每个指数给出未来3日预测，严格按 JSON 格式输出，不要输出其他内容：
 
 ```json
 [
   {
     "code": "sh000001",
     "name": "上证指数",
-    "direction": "up/down/neutral",
-    "confidence": 0.0-1.0,
-    "predicted_change": 0.0,
-    "strategy_used": "technical/fundamental/sentiment/geopolitical",
+    "current_price": 3350.00,
+    "trend_3d": "bullish",
+    "predicted_return_3d": 1.5,
+    "kline_day1": {"open": 3360, "high": 3380, "low": 3340, "close": 3370, "pattern": "小阳线"},
+    "kline_day2": {"open": 3370, "high": 3395, "low": 3360, "close": 3385, "pattern": "带上影阳线"},
+    "kline_day3": {"open": 3385, "high": 3420, "low": 3375, "close": 3405, "pattern": "中阳线"},
+    "buy_point": 3340,
+    "sell_point": 3420,
+    "stop_loss": 3300,
+    "confidence": 0.65,
+    "strategy_used": "technical",
     "reasoning": "简要分析理由，必须包含全球市场和宏观因素（80字内）"
-  },
-  {
-    "code": "sz399001",
-    "name": "深证成指",
-    "direction": "...",
-    "confidence": ...,
-    "predicted_change": ...,
-    "strategy_used": "...",
-    "reasoning": "..."
-  },
-  {
-    "code": "sz399006",
-    "name": "创业板指",
-    "direction": "...",
-    "confidence": ...,
-    "predicted_change": ...,
-    "strategy_used": "...",
-    "reasoning": "..."
   }
 ]
 ```
 
-direction 只能是 up/down/neutral 之一。confidence 范围 0-1。predicted_change 为预测涨跌幅百分比。strategy_used 可选 technical/fundamental/sentiment/geopolitical。
+字段说明：
+- trend_3d: 未来3日趋势，只能是 bullish（看涨）/ bearish（看跌）/ ranging（震荡）之一
+- predicted_return_3d: 预期3日收益率百分比，如 +1.5 表示涨1.5%，-2.0 表示跌2.0%
+- kline_day1/day2/day3: 未来第1/2/3个交易日的预测K线
+  - open/high/low/close: 预测的开盘/最高/最低/收盘价（数字）
+  - pattern: K线形态描述，如"小阳线"、"中阴线"、"十字星"、"带上影阳线"、"带下影阴线"等
+- buy_point: 建议买入价位（技术支撑位附近）
+- sell_point: 建议卖出价位（技术阻力位附近）
+- stop_loss: 止损价位（必须 < buy_point，做多逻辑）
+- confidence: 置信度 0.0-1.0
+- strategy_used: 使用的策略（technical/fundamental/sentiment/geopolitical）
+- reasoning: 简要分析理由（80字内）

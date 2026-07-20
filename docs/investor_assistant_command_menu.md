@@ -18,10 +18,14 @@ OpenClaw A股个人投资助理
 - /复盘: 收盘后生成预测/交易反思 | python3 main.py reflect
 - /审计: 查看投资助理能力审计与阻塞项 | python3 main.py capability-audit
 - /周报: 生成一周事件、预测、长线组合和阻塞项报告 | python3 main.py weekly-report --save
+- /日内预测 0930 / 1030 / 1430: 开盘预测、走势修正、预测复盘与仓位评估 | python3 main.py intraday-outlook <0930|1030|1430>
+- /推送状态: 查看最近飞书卡片的实际送达和质量门禁结果 | python3 main.py feishu-query /推送状态
+- /推送验收: 按交易日逐时核对所有必达报告，条件性空报告允许静默 | python3 main.py feishu-query /推送验收
 
 【服务器 CLI 快捷命令】
 - /root/.openclaw/workspace/scripts/investor_assistant_healthcheck.sh: 生成一键健康巡检报告 | /root/.openclaw/workspace/scripts/investor_assistant_healthcheck.sh
 - /root/.openclaw/workspace/scripts/investor_assistant_audit.py: 生成投资助理能力覆盖审计 | /root/.openclaw/workspace/scripts/investor_assistant_audit.py
+- /root/.openclaw/workspace/scripts/report_live_acceptance.py --date YYYY-MM-DD: 只读核对真实飞书投递账本 | /root/.openclaw/workspace/scripts/report_live_acceptance.py --date YYYY-MM-DD
 - /root/.openclaw/workspace/scripts/investor_health_alert.py --dry-run: Preview lightweight health alert probe | /root/.openclaw/workspace/scripts/investor_health_alert.py --dry-run
 - /root/.openclaw/workspace/scripts/qmt2http_remote_recovery.py --server guojin --timeout 6: Read-only Guojin qmt2http recovery probe | /root/.openclaw/workspace/scripts/qmt2http_remote_recovery.py --server guojin --timeout 6
 - systemctl list-timers --all | grep -Ei 'investor|trading|qmttrader-v2': 查看投资助理定时任务 | systemctl list-timers --all | grep -Ei 'investor|trading|qmttrader-v2'
@@ -30,15 +34,18 @@ OpenClaw A股个人投资助理
 
 【自动化时间表】
 - 07:30: 采集每日市场与账户数据 | investor-collect.timer
-- 08:55: 交易日盘前投资助理早报与飞书推送 | investor-morning-brief.timer
-- 09:30: 生成每日预测 | investor-predict.timer
+- 08:30: 交易日盘前简报，汇总新闻、美股收盘、日韩开盘与组合风险 | investor-morning-brief.timer
+- 09:30: 开盘预测与验证条件 | investor-predict.timer
 - 09:00-15:45: 交易时段 qmt2http、日志与服务健康告警 | investor-health-alert.timer
-- 10:35/14:35: 盘中持仓风险报告与飞书推送 | investor-risk-report.timer
+- 10:36/14:36 左右: 盘中持仓风险报告与飞书推送 | investor-risk-report.timer
 - 24/7 every 15m: 全球突发财经新闻扫描与飞书推送 | investor-global-event-scan.timer
 - 09:35: 长线早盘复核 | trading-morning.timer
+- 09:35: 开盘持仓风险检查 | investor-decision-0935.timer
 - 09:45: 东莞策略简报 | investor-briefing-0945.timer
+- 10:30: 根据开盘实际走势修正预测 | investor-decision-1030.timer
 - 13:20: 国金 ETF 午盘简报 | investor-briefing-1320.timer
 - 14:20: 国金 ETF 尾盘简报 | investor-briefing-1420.timer
+- 14:30: 复盘当日预测并评估降仓或清仓条件 | investor-outlook-1430.timer
 - 15:35: 长线收盘决策 | trading-evening.timer
 - 16:05: 收盘后快速复盘简报与飞书推送 | investor-closing-brief.timer
 - 18:05: 更新 qmttrader_v2 热点概念库 | qmttrader-v2-concepts.timer

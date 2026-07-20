@@ -9,12 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from live_monitor.config import QMTTRADER_ROOT
 from live_monitor.remediation.escalation_policy import should_require_human_review
 from live_monitor.remediation.patch_validator import build_validation_plan
 
 
 DB_PATH = Path("/root/.openclaw/workspace/investor/data/investor.db")
-QMTTRADER_ROOT = Path("/root/qmttrader")
 
 
 def _ensure_fix_task_columns(conn: sqlite3.Connection) -> None:

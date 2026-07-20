@@ -268,9 +268,18 @@ class QMTManager:
         total_pnl = 0.0
         for pos in positions:
             mv = float(pos.get("market_value", 0) or 0)
-            cost = float(pos.get("cost_value", 0) or 0)
+            reported_pnl = pos.get("unrealized_pnl", pos.get("float_profit", pos.get("m_dFloatProfit")))
+            if reported_pnl is not None:
+                pnl = float(reported_pnl or 0)
+            else:
+                cost = float(pos.get("cost_value", 0) or 0)
+                if not cost:
+                    avg_price = float(pos.get("avg_price", pos.get("m_dAvgPrice", 0)) or 0)
+                    volume = float(pos.get("volume", pos.get("m_nVolume", 0)) or 0)
+                    cost = avg_price * volume
+                pnl = mv - cost
             total_market_value += mv
-            total_pnl += mv - cost
+            total_pnl += pnl
 
         # Trade direction breakdown
         buy_count = 0

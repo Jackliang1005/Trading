@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import db
+from domain.services.report_style_service import join_cn, money, pct, risk_label, source_label
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"
@@ -62,7 +63,7 @@ def build_risk_report() -> Dict[str, Any]:
     _init_db_quietly()
     snapshot = db.get_latest_portfolio_snapshot(account_scope="combined")
     if not snapshot:
-        return {"available": False, "text": "Portfolio risk report: no portfolio snapshot available"}
+        return {"available": False, "text": "持仓风险报告生成失败：没有可用的组合快照。不会依据历史持仓推断当前风险。"}
     data = snapshot.get("data", {}) or {}
     positions = data.get("qmt_positions", data.get("positions", [])) or []
     positions = [p for p in positions if isinstance(p, dict) and _market_value(p) > 0]
@@ -130,19 +131,36 @@ def build_risk_report() -> Dict[str, Any]:
 
 def format_risk_report(report: Dict[str, Any]) -> str:
     if not report.get("available"):
-        return str(report.get("text") or "Portfolio risk report unavailable")
+        return str(report.get("text") or "持仓风险报告不可用。")
+    flags = [risk_label(item) for item in report.get("risk_flags") or []]
+    age = report.get("snapshot_age_days")
+    freshness = "日期未知" if age is None else ("当日快照" if age == 0 else f"距今 {age} 天")
     lines = [
-        "OpenClaw Portfolio Risk Report",
-        f"as_of: {report.get('as_of')} | snapshot_age_days: {report.get('snapshot_age_days')}",
-        f"positions: {report.get('positions_count')} | market_value: {report.get('total_market_value'):.2f} | effective_total: {report.get('effective_total_asset'):.2f}",
-        f"cash: {report.get('cash'):.2f} ({report.get('cash_ratio', 0) * 100:.1f}%) | unrealized_pnl: {report.get('total_unrealized_pnl'):.2f}",
-        f"concentration: top1={report.get('top1_ratio', 0) * 100:.1f}% top3={report.get('top3_ratio', 0) * 100:.1f}%",
-        "source split: " + " | ".join(f"{k}:count={v['count']} mv={v['market_value']:.2f} pnl={v['pnl']:.2f}" for k, v in sorted((report.get('by_source') or {}).items())),
-        "risk_flags: " + ", ".join(report.get("risk_flags") or []),
-        "top positions:",
+        "🛡️ 持仓风险报告",
+        f"数据日：{report.get('as_of') or '未知'}（{freshness}）",
+        "",
+        "**核心结论**",
+        f"- {join_cn(flags)}。",
+        f"- 当前 {report.get('positions_count')} 只持仓，市值 {money(report.get('total_market_value'))}，浮动盈亏 {money(report.get('total_unrealized_pnl'))}。",
+        "",
+        "**仓位结构**",
+        f"- 现金 {money(report.get('cash'))}（{pct(report.get('cash_ratio', 0) * 100)}）；第一大持仓 {pct(report.get('top1_ratio', 0) * 100)}，前三大持仓 {pct(report.get('top3_ratio', 0) * 100)}。",
     ]
+    source_parts = []
+    for key, value in sorted((report.get("by_source") or {}).items()):
+        source_parts.append(f"{source_label(key)} {value['count']} 只 / {money(value['market_value'])} / 盈亏 {money(value['pnl'])}")
+    if source_parts:
+        lines.append("- 账户分布：" + "；".join(source_parts) + "。")
+    lines.extend(["", "**重点持仓**"])
     for p in report.get("top_positions", [])[:8]:
-        lines.append(f"- {p['code']} {p['name']} source={p['source']} weight={p['weight']*100:.1f}% mv={p['market_value']:.2f} pnl={p['pnl']:.2f}")
+        lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{source_label(p['source'])}")
+    lines.extend(["", "**执行原则**"])
+    if report.get("top1_ratio", 0) >= 0.30:
+        lines.append("- 优先降低单票集中度；弱于所属板块且无放量承接时，不用补仓摊低成本。")
+    if report.get("total_unrealized_pnl", 0) < 0:
+        lines.append("- 组合浮亏阶段先控制回撤，再考虑新增高波动仓位。")
+    if not any((report.get("top1_ratio", 0) >= 0.30, report.get("total_unrealized_pnl", 0) < 0)):
+        lines.append("- 当前快照未触发主要风险阈值，继续观察集中度与回撤变化。")
     return "\n".join(lines)
 
 

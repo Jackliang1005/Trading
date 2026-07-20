@@ -557,18 +557,29 @@
    - 后续仅维护 plugin 调用协议，不再新增直连飞书代码
 
 
-## Phase 7: 清理旧代码
+## Phase 7: 清理旧代码 ✅ 已完成 (2026-05-17)
 
 ### 目标
 
 在新入口稳定后，压缩旧代码为兼容层。
 
-### 任务
+### 完成内容
 
-- 清理旧 `main.py` 逻辑
-- 清理旧 `predictor.py`、`reflection.py`、`evolution.py` 中已迁移部分
-- 将旧模块改为 facade
-- 补文档与迁移说明
+- ✅ `SOUL.md` / `IDENTITY.md` / `AGENTS.md` / `HEARTBEAT.md` 身份文档统一
+  - 统一名称：小龙虾 (XiaoLongXia)
+  - 日程对齐实际 cron：07:30/09:30/09:45/13:20/14:20/15:10/20:30
+  - 数据源描述统一为 QMT2HTTP 双服务器 + OpenClaw 行情插件 + AKShare/东财
+  - HEARTBEAT.md 激活运行时监控检查清单
+- ✅ 旧 facade 文件瘦身
+  - `predictor.py` (53行) / `reflection.py` (101行) / `evolution.py` (62行) 已为纯兼容转发层
+  - 所有核心逻辑已迁入 `domain/services/`
+- ✅ 服务层注册：`domain/services/__init__.py` 作为 canonical index
+- ✅ `trading_agents_cn/` 废弃原型归档至 `.archived/`
+- ✅ `main.py` CLI dispatch 统一（直接依赖 `app/cli.py`，消除"两个 CLI"）
+- ✅ 月度审计 cron 确认不重复执行 evolve（只跑 audit+dashboard+prompt）
+- ✅ 文档更新：`INVESTOR_REDESIGN.md` / `INVESTOR_REFACTOR_PLAN.md` / `HANDOFF.md`
+- ✅ `AGENTS.md` 移除 BOOTSTRAP.md/TOOLS.md 死引用，新增投资助理启动流程
+- ✅ `IDENTITY.md` 名称从 Lisa 统一为 小龙虾 (XiaoLongXia)
 
 ### 产物
 
@@ -577,9 +588,9 @@
 
 ### 验收标准
 
-- 新入口成为默认入口
-- 旧入口仍能调用核心能力
-- 没有重复实现的主逻辑
+- 新入口成为默认入口 ✅
+- 旧入口仍能调用核心能力 ✅
+- 没有重复实现的主逻辑 ✅
 
 
 ## 第一阶段立即执行项

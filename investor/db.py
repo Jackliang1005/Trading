@@ -22,6 +22,24 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_prediction_log_columns(conn: sqlite3.Connection):
+    """Add new 3d-kline prediction columns if they don't exist (idempotent)."""
+    new_cols = [
+        ("trend_3d", "TEXT"),
+        ("predicted_return_3d", "REAL"),
+        ("kline_day1", "TEXT"),
+        ("kline_day2", "TEXT"),
+        ("kline_day3", "TEXT"),
+        ("buy_point", "REAL"),
+        ("sell_point", "REAL"),
+        ("stop_loss", "REAL"),
+    ]
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(prediction_log)")}
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE prediction_log ADD COLUMN {col_name} {col_type}")
+
+
 def init_db():
     """初始化所有表"""
     global _INIT_DB_LOGGED
@@ -33,13 +51,13 @@ def init_db():
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         target TEXT NOT NULL,            -- 标的：如 sh000001, 600519
         target_name TEXT,                -- 标的名称
-        direction TEXT NOT NULL,         -- up / down / neutral
+        direction TEXT NOT NULL,         -- up / down / neutral (legacy, kept for old rows)
         confidence REAL NOT NULL,        -- 置信度 0-1
         reasoning TEXT,                  -- 推理过程
         strategy_used TEXT,              -- 使用的策略名称
         model_used TEXT,                 -- 使用的模型
-        timeframe TEXT DEFAULT '1d',     -- 预测时间框架
-        predicted_change REAL,           -- 预测涨跌幅 %
+        timeframe TEXT DEFAULT '3d',     -- 预测时间框架
+        predicted_change REAL,           -- 预测涨跌幅 % (legacy)
         -- 回测结果（后续填入）
         actual_price_at_predict REAL,
         actual_price_at_check REAL,
@@ -47,7 +65,16 @@ def init_db():
         is_correct INTEGER,              -- 1=正确 0=错误
         score REAL,                      -- 综合评分 0-100
         checked_at TEXT,                 -- 回测时间
-        check_note TEXT                  -- 回测备注
+        check_note TEXT,                 -- 回测备注
+        -- 新字段：3日K线+买卖点预测
+        trend_3d TEXT,                   -- bullish / bearish / ranging
+        predicted_return_3d REAL,        -- 预期3日收益率 %
+        kline_day1 TEXT,                 -- JSON: {open,high,low,close,pattern}
+        kline_day2 TEXT,
+        kline_day3 TEXT,
+        buy_point REAL,                  -- 建议买入价
+        sell_point REAL,                 -- 建议卖出价
+        stop_loss REAL                   -- 止损价
     );
 
     -- 策略表
@@ -231,6 +258,9 @@ def init_db():
         ON strategy_performance_metrics(as_of_date, strategy_name);
     """)
 
+    # ── 迁移：为旧数据库添加 3日K线+买卖点 新字段 ──
+    _migrate_prediction_log_columns(conn)
+
     # 初始化默认策略
     strategies = [
         ("technical", "technical", "技术分析：基于价格走势、成交量、K线形态、均线系统等", 0.30),
@@ -285,18 +315,33 @@ def init_db():
 
 def add_prediction(target: str, direction: str, confidence: float,
                    reasoning: str = "", strategy_used: str = "",
-                   model_used: str = "", timeframe: str = "1d",
+                   model_used: str = "", timeframe: str = "3d",
                    predicted_change: float = None,
                    actual_price: float = None,
-                   target_name: str = "") -> int:
+                   target_name: str = "",
+                   # New 3d-kline fields
+                   trend_3d: str = None,
+                   predicted_return_3d: float = None,
+                   kline_day1: str = None,
+                   kline_day2: str = None,
+                   kline_day3: str = None,
+                   buy_point: float = None,
+                   sell_point: float = None,
+                   stop_loss: float = None,
+                   ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO prediction_log
            (target, target_name, direction, confidence, reasoning, strategy_used,
-            model_used, timeframe, predicted_change, actual_price_at_predict)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            model_used, timeframe, predicted_change, actual_price_at_predict,
+            trend_3d, predicted_return_3d, kline_day1, kline_day2, kline_day3,
+            buy_point, sell_point, stop_loss)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (target, target_name, direction, confidence, reasoning, strategy_used,
-         model_used, timeframe, predicted_change, actual_price),
+         model_used, timeframe, predicted_change, actual_price,
+         trend_3d, predicted_return_3d,
+         kline_day1, kline_day2, kline_day3,
+         buy_point, sell_point, stop_loss),
     )
     conn.commit()
     pid = cur.lastrowid

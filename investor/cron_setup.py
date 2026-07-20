@@ -324,6 +324,47 @@ cd {INVESTOR_DIR} && python3 main.py scheduled-briefing 1420
                 "to": "ou_f7d5ef82efd4396dea7a604691c56f75",
             },
         },
+
+        # ────────── 收盘后同步生产日志 (15:10) ──────────
+        {
+            "id": str(uuid.uuid4()),
+            "agentId": "main",
+            "name": "investor-sync-production-logs",
+            "description": "每个交易日15:10将国金/东莞生产机器日志同步到本地",
+            "enabled": True,
+            "createdAtMs": int(datetime.now().timestamp() * 1000),
+            "updatedAtMs": int(datetime.now().timestamp() * 1000),
+            "schedule": {
+                "kind": "cron",
+                "expr": "10 15 * * 1-5",
+                "tz": "Asia/Shanghai",
+            },
+            "sessionTarget": "isolated",
+            "wakeMode": "now",
+            "payload": {
+                "kind": "agentTurn",
+                "message": f"""【日志同步】请运行以下命令，将今天生产机器的日志同步到本地：
+
+```
+cd {INVESTOR_DIR} && python3 main.py sync-logs
+```
+
+同步目标：
+- 国金 (39.105.48.176:8085) → /root/qmttrader_v2/logs/guojin/
+- 东莞 (150.158.31.115:8085) → /root/qmttrader_v2/logs/dongguan/
+
+如果同步失败，报告具体是哪台机器失败及错误信息。
+同步成功后，回复：✅ 日志同步完成，国金/东莞各 X KB。""",
+                "model": "deepseek/deepseek-chat",
+                "timeoutSeconds": 120,
+            },
+            "delivery": {
+                "skipIf": "HEARTBEAT_OK",
+                "mode": "announce",
+                "channel": "feishu",
+                "to": "ou_f7d5ef82efd4396dea7a604691c56f75",
+            },
+        },
     ]
 
     return jobs

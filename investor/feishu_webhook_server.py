@@ -29,6 +29,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Dict
+import urllib.request
 from urllib.parse import urlparse
 
 # ── config ──────────────────────────────────────────────────
@@ -36,6 +37,7 @@ TRADING_BASE_DIR = Path(os.environ.get("TRADING_BASE_DIR", "/root/.openclaw/work
 INVESTOR_DIR = Path(os.environ.get("INVESTOR_ROOT", "/root/.openclaw/workspace/investor")).resolve()
 LOG_PATH = INVESTOR_DIR / "logs" / "feishu_webhook.log"
 DEFAULT_FEISHU_TARGET = "ou_f7d5ef82efd4396dea7a604691c56f75"
+OPENCLAW_FEISHU_SEND_TIMEOUT = int(os.environ.get("OPENCLAW_FEISHU_SEND_TIMEOUT", "180"))
 
 FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
 FEISHU_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
@@ -45,12 +47,27 @@ _SEEN_EVENTS: Dict[str, float] = {}
 _SEEN_EVENTS_MAX = 1000
 _SEEN_EVENTS_TTL = 600
 
+# ── image+command pairing cache ─────────────────────────────
+# Feishu sends text and image separately. Cache one, wait for the other.
+# Keyed by sender_id.
+_PENDING_IMAGES: Dict[str, tuple] = {}      # sender_id -> (image_key, timestamp)
+_PENDING_COMMANDS: Dict[str, tuple] = {}    # sender_id -> (command_type, timestamp)
+_PAIR_TIMEOUT = 60  # seconds to wait for the counterpart
+
 # ── investor imports ────────────────────────────────────────
 sys.path.insert(0, str(INVESTOR_DIR))
 from domain.services.feishu_query_service import handle_feishu_query
+from domain.services.report_style_service import (
+    build_report_card,
+    is_diagnostic_message,
+    report_quality_issues,
+)
+sys.path.insert(0, str(TRADING_BASE_DIR))
+from trading_core_new.longterm.notifier import push_feishu_rich, record_feishu_delivery
 
 # ── trading imports (lazy, only if needed) ──────────────────
 _trading_service = None
+_longterm_manual_handler = None
 
 def _get_trading_service():
     global _trading_service
@@ -64,20 +81,317 @@ def _get_trading_service():
     return _trading_service
 
 
+def _get_longterm_manual_handler():
+    global _longterm_manual_handler
+    if _longterm_manual_handler is None:
+        sys.path.insert(0, str(TRADING_BASE_DIR))
+        from trading_core_new.longterm.cli import handle_feishu_manual_command
+        _longterm_manual_handler = handle_feishu_manual_command
+    return _longterm_manual_handler
+
+
+_longterm_settle_module = None
+
+
+def _handle_longterm_settle(image_key: str, text: str, sender_id: str) -> str:
+    """Download Feishu image, extract trades via vision LLM, apply to portfolio."""
+    global _longterm_settle_module
+    if _longterm_settle_module is None:
+        sys.path.insert(0, str(TRADING_BASE_DIR))
+        from trading_core_new.longterm import cli as _m
+        from trading_core_new.longterm import repository as _repo_m
+        _longterm_settle_module = (_m, _repo_m)
+
+    cli_mod, repo_mod = _longterm_settle_module
+
+    # Download image from Feishu
+    image_bytes = _download_feishu_image(image_key)
+    if not image_bytes:
+        return "无法从飞书下载交割截图，请确认图片已上传"
+
+    # Save to temp
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.write(image_bytes)
+    tmp.close()
+
+    try:
+        # Extract trades using vision LLM
+        repo = repo_mod.LongTermRepository()
+        repo.init_if_missing()
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        records = cli_mod._extract_trades_from_image(tmp_path, trade_date)
+
+        if not records:
+            return "未能从截图中识别出成交记录，请确认截图清晰并包含完整交易信息（代码、数量、价格、方向）"
+
+        # Summary
+        buys = [r for r in records if r.side == "buy"]
+        sells = [r for r in records if r.side == "sell"]
+        lines = [f"📸 从截图中识别到 {len(records)} 条成交记录:"]
+        total_buy = total_sell = 0.0
+        for r in sells:
+            amt = r.price * r.quantity
+            total_sell += amt
+            lines.append(f"  🔴 卖出 {r.code} {r.quantity}股 @{r.price:.3f}")
+        for r in buys:
+            amt = r.price * r.quantity
+            total_buy += amt
+            lines.append(f"  🟢 买入 {r.code} {r.quantity}股 @{r.price:.3f}")
+        lines.append(f"  卖出总额: ¥{total_sell:,.2f}")
+        lines.append(f"  买入总额: ¥{total_buy:,.2f}")
+
+        # Apply
+        result = cli_mod._apply_manual_records(
+            repo, records=records, as_of=trade_date, source="feishu-settle-image"
+        )
+        next_state = result["portfolio"]
+        lines.append(f"\n✅ 已回填: NAV ¥{next_state.nav:,.2f} 持仓{len(next_state.positions)}只 现金¥{next_state.cash:,.2f}")
+        return "\n".join(lines)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _handle_longterm_test(image_key: str, text: str, sender_id: str) -> str:
+    """Preview-only: download image, extract trades, show result WITHOUT applying."""
+    global _longterm_settle_module
+    if _longterm_settle_module is None:
+        sys.path.insert(0, str(TRADING_BASE_DIR))
+        from trading_core_new.longterm import cli as _m
+        from trading_core_new.longterm import repository as _repo_m
+        _longterm_settle_module = (_m, _repo_m)
+
+    cli_mod, repo_mod = _longterm_settle_module
+
+    image_bytes = _download_feishu_image(image_key)
+    if not image_bytes:
+        return "无法从飞书下载截图，请确认图片已上传"
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.write(image_bytes)
+    tmp.close()
+
+    try:
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        records = cli_mod._extract_trades_from_image(tmp_path, trade_date)
+
+        if not records:
+            return "未能从截图中识别出成交记录，请确认截图清晰并包含完整交易信息"
+
+        buys = [r for r in records if r.side == "buy"]
+        sells = [r for r in records if r.side == "sell"]
+        lines = [f"🧪 测试模式（未修改持仓）"]
+        lines.append(f"📸 从截图中识别到 {len(records)} 条成交记录:")
+        total_buy = total_sell = 0.0
+        for r in sells:
+            amt = r.price * r.quantity
+            total_sell += amt
+            lines.append(f"  🔴 卖出 {r.code} {r.quantity}股 @{r.price:.3f}  ¥{amt:,.2f}")
+        for r in buys:
+            amt = r.price * r.quantity
+            total_buy += amt
+            lines.append(f"  🟢 买入 {r.code} {r.quantity}股 @{r.price:.3f}  ¥{amt:,.2f}")
+        lines.append(f"  卖出总额: ¥{total_sell:,.2f}")
+        lines.append(f"  买入总额: ¥{total_buy:,.2f}")
+        lines.append(f"  净额: ¥{total_sell - total_buy:,.2f}")
+        lines.append(f"\n⚠️ 以上仅预览，未回填持仓。确认无误后请用 /长线交割 正式执行")
+        return "\n".join(lines)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _handle_longterm_position_sync(image_key: str, text: str, sender_id: str) -> str:
+    """Download Feishu image, extract positions + cash via vision LLM, sync to portfolio."""
+    global _longterm_settle_module
+    if _longterm_settle_module is None:
+        sys.path.insert(0, str(TRADING_BASE_DIR))
+        from trading_core_new.longterm import cli as _m
+        from trading_core_new.longterm import repository as _repo_m
+        _longterm_settle_module = (_m, _repo_m)
+
+    cli_mod, repo_mod = _longterm_settle_module
+
+    image_bytes = _download_feishu_image(image_key)
+    if not image_bytes:
+        return "无法从飞书下载持仓截图，请确认图片已上传"
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.write(image_bytes)
+    tmp.close()
+
+    try:
+        repo = repo_mod.LongTermRepository()
+        repo.init_if_missing()
+        reply = cli_mod.handle_feishu_position_sync(tmp_path, repo)
+        return reply
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 # ── investor command detection ──────────────────────────────
 INVESTOR_KEYWORDS = (
     "持仓", "账户", "成交", "委托", "预测", "胜率", "风险", "策略",
-    "复盘", "摘要", "监控", "候选", "买入", "敞口", "集中度", "回撤", "ETF", "etf",
-    "权重", "简报", "报告",
+    "复盘", "摘要", "监控", "候选", "买入", "交易建议", "持仓建议", "建议", "行情", "技术分析", "技术面", "MACD", "KDJ", "RSI", "布林", "涨停", "连板", "情绪", "回测", "财务", "基本面", "估值", "PE", "PB", "PEG", "ROE", "毛利率", "负债率", "公告", "业绩预告", "减持", "解读", "筛选", "选股", "宏观", "CPI", "PPI", "M2", "社融", "LPR", "社零", "敞口", "集中度", "回撤", "ETF", "etf", "global", "breaking", "全球", "突发", "海外", "审计", "能力审计", "阻塞项", "audit", "capability",
+    "权重", "简报", "报告", "健康", "全球", "突发", "海外", "帮助", "菜单", "命令",
 )
 INVESTOR_PREFIX_RE = re.compile(
-    r"^(/持仓|/账户|/成交|/委托|/预测|/胜率|/风险|/策略|/复盘|/摘要|/监控|/候选|/买入|/etf|/ETF|/帮助)"
+    r"^(/持仓|/账户|/成交|/委托|/预测|/胜率|/风险|/策略|/复盘|/摘要|/监控|/候选|/买入|/交易建议|/建议|/行情|/报价|/技术|/情绪|/涨停|/连板|/回测|/backtest|/财务|/基本面|/公告|/解读|/筛选|/选股|/etf|/ETF|/帮助|/菜单|/命令|/健康|/全球|/突发|/海外)"
 )
+LONGTERM_MANUAL_RE = re.compile(r"^\s*/?(长线成交|长线执行|长线回填|长线帮助|长线命令)\b", re.IGNORECASE)
+LONGTERM_SETTLE_RE = re.compile(r"^\s*/?长线交割\b", re.IGNORECASE)
+LONGTERM_TEST_RE = re.compile(r"^\s*/?长线测试\b", re.IGNORECASE)
+LONGTERM_POSITION_SYNC_RE = re.compile(r"^\s*/?(更新持仓|同步持仓)\b", re.IGNORECASE)
 
 def _is_investor_query(text: str) -> bool:
     if INVESTOR_PREFIX_RE.match(text):
         return True
     return any(k in text for k in INVESTOR_KEYWORDS)
+
+
+def _is_longterm_manual_command(text: str) -> bool:
+    return bool(LONGTERM_MANUAL_RE.match(str(text or "").strip()))
+
+
+def _is_longterm_settle_command(text: str) -> bool:
+    return bool(LONGTERM_SETTLE_RE.match(str(text or "").strip()))
+
+
+def _is_longterm_test_command(text: str) -> bool:
+    return bool(LONGTERM_TEST_RE.match(str(text or "").strip()))
+
+
+def _is_longterm_position_sync_command(text: str) -> bool:
+    return bool(LONGTERM_POSITION_SYNC_RE.match(str(text or "").strip()))
+
+
+def _pair_image_with_command(sender_id: str, image_key: str = "", text: str = "") -> tuple[str, str] | None:
+    """Pair an image with a command. Either arrives first; the second triggers processing.
+    Returns (image_key, command_type) when paired, or None if waiting."""
+    now = time.time()
+
+    # Cleanup stale entries
+    for cache in (_PENDING_IMAGES, _PENDING_COMMANDS):
+        stale = [k for k, v in cache.items() if now - v[1] > _PAIR_TIMEOUT]
+        for k in stale:
+            del cache[k]
+
+    cmd_type = ""
+    if _is_longterm_test_command(text):
+        cmd_type = "test"
+    elif _is_longterm_settle_command(text):
+        cmd_type = "settle"
+    elif _is_longterm_position_sync_command(text):
+        cmd_type = "position_sync"
+
+    # Case 1: text command arrives, check for pending image
+    if cmd_type and not image_key:
+        if sender_id in _PENDING_IMAGES:
+            cached_key, _ = _PENDING_IMAGES.pop(sender_id)
+            log_line(f"PAIR: command arrived second, found pending image for {sender_id}")
+            return (cached_key, cmd_type)
+        # Store command, wait for image
+        _PENDING_COMMANDS[sender_id] = (cmd_type, now)
+        log_line(f"PAIR: command '{cmd_type}' waiting for image from {sender_id}")
+        return None
+
+    # Case 2: image arrives, check for pending command
+    if image_key and not cmd_type:
+        if sender_id in _PENDING_COMMANDS:
+            cached_cmd, _ = _PENDING_COMMANDS.pop(sender_id)
+            log_line(f"PAIR: image arrived second, found pending command '{cached_cmd}' for {sender_id}")
+            return (image_key, cached_cmd)
+        # Store image, wait for command
+        _PENDING_IMAGES[sender_id] = (image_key, now)
+        log_line(f"PAIR: image waiting for command from {sender_id}")
+        return None
+
+    # Case 3: both already in same message (unlikely but handle)
+    if cmd_type and image_key:
+        return (image_key, cmd_type)
+
+    return None
+
+
+def _extract_image_key(payload: dict) -> str:
+    """Extract image_key from Feishu v2 event payload (message with image)."""
+    event = payload.get("event", {}) if isinstance(payload, dict) else {}
+    if isinstance(event, dict):
+        message = event.get("message", {})
+        if isinstance(message, dict):
+            content = message.get("content", "")
+            if isinstance(content, str) and content:
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        # Single image in message
+                        image_key = parsed.get("image_key", "")
+                        if image_key:
+                            return str(image_key).strip()
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    return ""
+
+
+def _get_feishu_tenant_token() -> str:
+    """Obtain Feishu tenant_access_token."""
+    app_id = os.getenv("FEISHU_APP_ID", "").strip()
+    app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        cfg_path = Path("~/.openclaw/openclaw.json").expanduser()
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        feishu = ((cfg.get("channels", {}) or {}).get("feishu", {}) or {})
+        app_id = str(feishu.get("appId", "") or "").strip()
+        app_secret = str(feishu.get("appSecret", "") or "").strip()
+    if not app_id or not app_secret:
+        return ""
+    try:
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return str(data.get("tenant_access_token", "") or "").strip()
+    except Exception as exc:
+        log_line(f"_get_feishu_tenant_token error: {exc}")
+        return ""
+
+
+def _download_feishu_image(image_key: str) -> bytes | None:
+    """Download image bytes from Feishu by image_key."""
+    token = _get_feishu_tenant_token()
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://open.feishu.cn/open-apis/im/v1/images/{image_key}",
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except Exception as exc:
+        log_line(f"_download_feishu_image error: {exc}")
+        return None
 
 
 # ── logging ─────────────────────────────────────────────────
@@ -89,13 +403,34 @@ def log_line(text: str) -> None:
 
 
 def _send_feishu(target: str, message: str) -> bool:
-    """Send message to Feishu via openclaw."""
+    """Send a unified rich card; retain raw diagnostics only on failure paths."""
     if not message or not message.strip():
         return False
     # Ensure target has user: or chat: prefix
     clean = str(target or "").strip()
     if clean and not clean.startswith(("user:", "chat:")):
         clean = f"user:{clean}"
+    diagnostic = is_diagnostic_message(message)
+    issues = [] if diagnostic else report_quality_issues(message)
+    send_text = str(message)
+    if issues:
+        send_text = "正常查询结果未通过报告质量检查，原始正文未发送。\n" + "\n".join(f"- {item}" for item in issues)
+    normal_template = "green" if send_text.startswith("✅") else "orange" if send_text.startswith("⚠️") else "blue"
+    card = build_report_card(
+        send_text,
+        template="red" if diagnostic else "orange" if issues else normal_template,
+        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    if push_feishu_rich(
+        send_text,
+        card=card,
+        diagnostic=diagnostic or bool(issues),
+        target=clean,
+    ):
+        return True
+    if issues:
+        log_line(f"_send_feishu quality gate blocked fallback: {issues}")
+        return False
     cmd = [
         "openclaw", "message", "send",
         "--channel", "feishu",
@@ -103,12 +438,33 @@ def _send_feishu(target: str, message: str) -> bool:
         "-m", message,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=OPENCLAW_FEISHU_SEND_TIMEOUT,
+        )
         ok = result.returncode == 0
+        record_feishu_delivery(
+            text=message,
+            card=card,
+            diagnostic=diagnostic,
+            target=clean,
+            transport="webhook_raw_fallback",
+            sent=ok,
+        )
         if not ok:
             log_line(f"_send_feishu failed: rc={result.returncode} stderr={result.stderr[:200]}")
         return ok
     except Exception as exc:
+        record_feishu_delivery(
+            text=message,
+            card=card,
+            diagnostic=diagnostic,
+            target=clean,
+            transport="webhook_raw_fallback",
+            sent=False,
+        )
         log_line(f"_send_feishu exception: {exc}")
         return False
 
@@ -241,6 +597,40 @@ class Handler(BaseHTTPRequestHandler):
         # --- extract ---
         text = _extract_text(payload)
         sender_id = _extract_sender_id(payload)
+        image_key = _extract_image_key(payload)
+
+        # Debug: log raw payload summary for image messages
+        if image_key or (not text):
+            msg_type = ""
+            event = payload.get("event", {})
+            if isinstance(event, dict):
+                msg = event.get("message", {})
+                if isinstance(msg, dict):
+                    msg_type = msg.get("message_type", "")
+            log_line(f"DEBUG event_id={event_id} sender={sender_id} text=[{text[:80]}] image_key=[{image_key[:20]}] msg_type={msg_type}")
+
+        # --- pairing: handle pure image (no text) ---
+        if not text and image_key:
+            paired = _pair_image_with_command(sender_id, image_key=image_key)
+            if paired:
+                paired_key, cmd_type = paired
+                try:
+                    if cmd_type == "test":
+                        reply = _handle_longterm_test(paired_key, "/长线测试", sender_id)
+                    elif cmd_type == "position_sync":
+                        reply = _handle_longterm_position_sync(paired_key, "/更新持仓", sender_id)
+                    else:
+                        reply = _handle_longterm_settle(paired_key, "/长线交割", sender_id)
+                except Exception as exc:
+                    reply = f"处理失败: {exc}"
+                    log_line(f"longterm pair(error) cmd={cmd_type}: {exc}")
+                sent = _send_feishu(sender_id, reply)
+                log_line(f"longterm paired image-first replied={sent}")
+                self._send_json(200, {"ok": True, "route": "longterm_paired_image", "replied": sent})
+                return
+            # Image stored in pending cache, wait for command
+            self._send_json(200, {"ok": True, "route": "pending_image"})
+            return
 
         if not text:
             log_line(f"empty text, sender={sender_id}")
@@ -248,6 +638,74 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         log_line(f"event_id={event_id} sender={sender_id} text={text[:100]}")
+
+        # --- route: longterm test (preview only) ---
+        if _is_longterm_test_command(text):
+            paired = _pair_image_with_command(sender_id, image_key=image_key, text=text)
+            if paired is None:
+                # No image yet, stored command in pending cache
+                _send_feishu(sender_id, "已收到 /长线测试 指令，请发送交割截图")
+                self._send_json(200, {"ok": True, "route": "longterm_test_waiting"})
+                return
+            paired_key, _ = paired
+            try:
+                reply = _handle_longterm_test(paired_key, text, sender_id)
+            except Exception as exc:
+                reply = f"测试失败: {exc}"
+                log_line(f"longterm test error: {exc}")
+            sent = _send_feishu(sender_id, reply)
+            log_line(f"longterm_test replied={sent}")
+            self._send_json(200, {"ok": True, "route": "longterm_test", "replied": sent})
+            return
+
+        # --- route: longterm settle from image ---
+        if _is_longterm_settle_command(text):
+            paired = _pair_image_with_command(sender_id, image_key=image_key, text=text)
+            if paired is None:
+                _send_feishu(sender_id, "已收到 /长线交割 指令，请发送交割截图")
+                self._send_json(200, {"ok": True, "route": "longterm_settle_waiting"})
+                return
+            paired_key, _ = paired
+            try:
+                reply = _handle_longterm_settle(paired_key, text, sender_id)
+            except Exception as exc:
+                reply = f"交割图片处理失败: {exc}"
+                log_line(f"longterm settle error: {exc}")
+            sent = _send_feishu(sender_id, reply)
+            log_line(f"longterm_settle replied={sent}")
+            self._send_json(200, {"ok": True, "route": "longterm_settle", "replied": sent})
+            return
+
+        # --- route: longterm position sync from image ---
+        if _is_longterm_position_sync_command(text):
+            paired = _pair_image_with_command(sender_id, image_key=image_key, text=text)
+            if paired is None:
+                _send_feishu(sender_id, "已收到 /更新持仓 指令，请发送持仓截图")
+                self._send_json(200, {"ok": True, "route": "longterm_position_sync_waiting"})
+                return
+            paired_key, _ = paired
+            try:
+                reply = _handle_longterm_position_sync(paired_key, text, sender_id)
+            except Exception as exc:
+                reply = f"持仓截图处理失败: {exc}"
+                log_line(f"longterm position_sync error: {exc}")
+            sent = _send_feishu(sender_id, reply)
+            log_line(f"longterm_position_sync replied={sent}")
+            self._send_json(200, {"ok": True, "route": "longterm_position_sync", "replied": sent})
+            return
+
+        # --- route: longterm manual command ---
+        if _is_longterm_manual_command(text):
+            try:
+                handler = _get_longterm_manual_handler()
+                reply = handler(text)
+            except Exception as exc:
+                reply = f"长线成交命令处理失败: {exc}"
+                log_line(f"longterm manual error: {exc}")
+            sent = _send_feishu(sender_id, reply)
+            log_line(f"longterm_manual replied={sent} text={text[:60]}")
+            self._send_json(200, {"ok": True, "route": "longterm_manual", "replied": sent})
+            return
 
         # --- route: investor query ---
         if _is_investor_query(text):
@@ -298,7 +756,7 @@ def main() -> int:
     print(f"签名校验: {sig_status}")
     print(f"Token校验: {token_status}")
     print(f"事件去重: TTL={_SEEN_EVENTS_TTL}s max={_SEEN_EVENTS_MAX}")
-    print(f"路由规则: /持仓等→investor | T开头→trading")
+    print(f"路由规则: /长线交割+图片→settle | /长线成交→manual | /持仓等→investor | T开头→trading")
     print(f"日志: {LOG_PATH}")
     print(f"监听: http://{args.host}:{args.port}/feishu/trading")
 

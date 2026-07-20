@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -11,12 +12,14 @@ from typing import Any, Dict, List, Tuple
 from domain.services.event_service import build_global_event_brief
 from domain.services.risk_report_service import build_risk_report
 from domain.services.watchlist_report_service import build_watchlist_report
+from domain.services.concept_momentum_service import THEME_CONCEPT_KEYWORDS, build_concept_momentum_candidates
 
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"
 GLOBAL_IMPACT_JSON = REPORTS_DIR / "investor_global_impact_latest.json"
 GLOBAL_IMPACT_MD = REPORTS_DIR / "investor_global_impact_latest.md"
+CACHE_SCHEMA_VERSION = 9
 
 
 THEME_ACTIONS = {
@@ -124,6 +127,8 @@ def load_global_impact_cache(max_age_minutes: int = 90) -> Dict[str, Any] | None
         payload = json.loads(GLOBAL_IMPACT_JSON.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if payload.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return None
     payload["cache"] = {"used": True, "age_minutes": age, "path": str(GLOBAL_IMPACT_JSON)}
     if not payload.get("text"):
         payload["text"] = format_global_impact_brief(payload)
@@ -163,17 +168,36 @@ def build_global_impact_brief(limit: int = 80, min_score: int = 45, top_n: int =
             portfolio_hits.append(enriched)
     events.sort(key=lambda item: (int(item.get("priority", 0)), int(item.get("score", 0))), reverse=True)
     watchlist = build_watchlist_report(limit_events=limit, top_n=6)
+    active_themes: Counter[str] = Counter()
+    for event in events:
+        for theme in _theme_names(event):
+            active_themes[theme] += 1
+    active_theme_heat = active_themes.most_common(8)
+    concept_momentum = build_concept_momentum_candidates(active_theme_heat, top_n=8)
     report = {
+        "schema_version": CACHE_SCHEMA_VERSION,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "base_detected_at": base.get("detected_at"),
         "source_count": base.get("source_count"),
         "raw_count": base.get("raw_count"),
         "candidate_count": base.get("candidate_count"),
+        "stale_count": base.get("stale_count", 0),
+        "duplicate_raw_count": base.get("duplicate_raw_count", 0),
+        "irrelevant_count": base.get("irrelevant_count", 0),
         "holding_count": len({str(v.get("code") or "") for v in holdings.values() if v.get("code")}),
         "urgent_events": events[: max(1, top_n)],
         "portfolio_hits": portfolio_hits[:6],
         "watchlist": watchlist.get("watchlist", [])[:6],
-        "theme_heat": watchlist.get("theme_heat", []),
+        "watchlist_meta": {
+            "event_count": watchlist.get("event_count", 0),
+            "raw_event_count": watchlist.get("raw_event_count", 0),
+            "stale_excluded": watchlist.get("stale_excluded", 0),
+            "duplicates_excluded": watchlist.get("duplicates_excluded", 0),
+            "window_hours": watchlist.get("window_hours", 48),
+        },
+        "theme_heat": active_theme_heat,
+        "historical_theme_heat": watchlist.get("theme_heat", []),
+        "concept_momentum": concept_momentum,
     }
     report["text"] = format_global_impact_brief(report)
     report["cache"] = {"used": False, "age_minutes": 0, "path": str(GLOBAL_IMPACT_JSON)}
@@ -199,32 +223,63 @@ def _stock_text(stocks: List[Dict[str, Any]], limit: int = 6) -> str:
 
 
 def format_global_impact_brief(report: Dict[str, Any]) -> str:
+    from domain.services.report_style_service import event_impact_label, event_summary_cn, join_cn, pct, theme_label, trend_label
+
+    def candidate_chain(item: Dict[str, Any], momentum: Dict[str, Any]) -> str:
+        concepts = [str(value or "") for value in item.get("concepts") or []]
+        themes = []
+        for theme in momentum.get("themes") or []:
+            keywords = THEME_CONCEPT_KEYWORDS.get(str(theme), [])
+            if any(keyword.lower() in concept.lower() for keyword in keywords for concept in concepts):
+                themes.append(theme_label(theme))
+        return f"{join_cn(themes, '事件主题')} → {join_cn(concepts, '概念待确认')}"
+
     lines = [
-        "OpenClaw \u5168\u7403\u7a81\u53d1\u5f71\u54cd\u6307\u6325\u53f0",
-        f"generated_at: {report.get('generated_at')} | sources={report.get('source_count')} raw={report.get('raw_count')} candidates={report.get('candidate_count')} holdings={report.get('holding_count')}",
+        "🌍 全球事件对A股影响",
+        f"生成时间：{report.get('generated_at')}",
+        "",
+        "**持仓影响**",
     ]
     hits = report.get("portfolio_hits", []) or []
     if hits:
-        lines.append("\u6301\u4ed3\u547d\u4e2d:")
         for event in hits[:3]:
-            lines.append(f"- {event.get('severity')}/{event.get('score')} priority={event.get('priority')} {event.get('title')}")
-            lines.append(f"  {_stock_text(event.get('holding_hits') or [])}")
+            lines.append(f"- **{event_summary_cn(event.get('title'), _theme_names(event))}**｜{_stock_text(event.get('holding_hits') or [])}")
     else:
-        lines.append("\u6301\u4ed3\u547d\u4e2d: \u672a\u53d1\u73b0\u9ad8\u5206\u4e8b\u4ef6\u76f4\u63a5\u547d\u4e2d\u5f53\u524d\u5feb\u7167\u6301\u4ed3")
+        lines.append("- 未发现重要事件直接命中当前持仓。")
 
-    lines.append("\n\u7d27\u6025\u4e8b\u4ef6:")
-    for idx, event in enumerate(report.get("urgent_events", []) or [], 1):
+    lines.append("\n**重点事件与验证点**")
+    displayed = 0
+    seen_summaries: set[str] = set()
+    for event in report.get("urgent_events", []) or []:
         related = event.get("related_stocks", []) or []
         guidance = event.get("guidance") or {}
-        lines.append(f"{idx}. [{event.get('severity')}/{event.get('score')} priority={event.get('priority')}] {event.get('title')}")
-        lines.append(f"   \u4e3b\u9898: {event.get('themes_text')}")
-        lines.append(f"   A\u80a1: {_stock_text(related)}")
-        lines.append(f"   \u4f20\u5bfc: {guidance.get('impact')}")
-        lines.append(f"   \u89c2\u5bdf: {guidance.get('watch')}")
-    watchlist = report.get("watchlist", []) or []
+        themes = join_cn((theme_label(item) for item in str(event.get('themes_text') or '').split('、')))
+        summary = event_summary_cn(event.get('title'), _theme_names(event))
+        if summary in seen_summaries:
+            continue
+        seen_summaries.add(summary)
+        displayed += 1
+        lines.append(f"{displayed}. **{summary}**｜{themes}｜{event_impact_label(event.get('severity'))}")
+        lines.append(f"   传导：{guidance.get('impact')}")
+        lines.append(f"   验证：{guidance.get('watch')}")
+    watchlist = [item for item in (report.get("watchlist", []) or []) if item.get("direct_event_count", 0) > 0]
     if watchlist:
-        lines.append("\n\u4eca\u65e5\u4e8b\u4ef6\u5173\u6ce8\u6807\u7684:")
+        lines.append("\n**事件映射标的**")
         for item in watchlist[:6]:
             holding = " [\u6301\u4ed3]" if item.get("holding") else ""
-            lines.append(f"- {item.get('code')} {item.get('name')} priority={item.get('priority')} events={item.get('event_count')}{holding}")
+            lines.append(f"- **{item.get('name')}（{item.get('code')}）**{holding}｜需板块与量价二次确认")
+    concept_momentum = report.get("concept_momentum") or {}
+    lines.append("\n**概念板块动量候选**")
+    if not concept_momentum.get("available"):
+        lines.append("- 概念或动量数据不可用，本次不推荐个股。")
+    elif not concept_momentum.get("candidates"):
+        lines.append("- 没有通过 20/60 日正动量与过热过滤的候选")
+    else:
+        for item in (concept_momentum.get("candidates") or [])[:8]:
+            lines.append(
+                f"- **{item.get('name')}（{item.get('code')}）**｜{trend_label(item.get('trend'))}｜"
+                f"20日 {pct(item.get('momentum_20d'), signed=True)}｜60日 {pct(item.get('momentum_60d'), signed=True)}"
+            )
+            lines.append(f"  依据：{candidate_chain(item, concept_momentum)}；需再确认板块成交与个股承接。")
+    lines.extend(["", "**使用原则**", "- 新闻只决定观察方向；候选还必须经过板块强弱、个股动量与盘中量价确认，不直接追涨。"])
     return "\n".join(lines)

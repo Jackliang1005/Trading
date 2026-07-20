@@ -349,6 +349,65 @@ def fetch_akshare_daily(symbol: str = "sh000001") -> Dict:
     return {}
 
 
+def fetch_historical_kline(symbol: str, start_date: str, end_date: str) -> List[Dict]:
+    """Fetch K-line data for any target (index or stock) between two dates.
+    symbol: 'sh000001', 'sz399001', or stock code like '600519'
+    Returns list of {date, open, high, low, close, volume, change_pct}.
+    """
+    try:
+        import akshare as ak
+        start = start_date.replace("-", "")
+        end = end_date.replace("-", "")
+        if symbol.startswith("sh") or symbol.startswith("sz"):
+            clean = symbol[2:]
+            df = ak.stock_zh_index_daily(symbol=f"{symbol[:2]}{clean}")
+            if df is None or df.empty:
+                return []
+            df = df[(df["date"] >= start) & (df["date"] <= end)]
+            records = []
+            for _, row in df.iterrows():
+                records.append({
+                    "date": str(row.get("date", "")),
+                    "open": float(row.get("open", 0)),
+                    "high": float(row.get("high", 0)),
+                    "low": float(row.get("low", 0)),
+                    "close": float(row.get("close", 0)),
+                    "volume": float(row.get("volume", 0)),
+                    "change_pct": 0,
+                })
+            # Calculate change_pct
+            for i, rec in enumerate(records):
+                if i > 0 and records[i - 1]["close"] > 0:
+                    rec["change_pct"] = round(
+                        (rec["close"] - records[i - 1]["close"]) / records[i - 1]["close"] * 100, 3
+                    )
+                elif i == 0:
+                    rec["change_pct"] = round(
+                        (rec["close"] - rec["open"]) / rec["open"] * 100, 3
+                    ) if rec["open"] > 0 else 0
+            return records
+        else:
+            df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                                     start_date=start, end_date=end, adjust="qfq")
+            if df is None or df.empty:
+                return []
+            records = []
+            for _, row in df.iterrows():
+                records.append({
+                    "date": str(row.get("日期", "")),
+                    "open": float(row.get("开盘", 0)),
+                    "high": float(row.get("最高", 0)),
+                    "low": float(row.get("最低", 0)),
+                    "close": float(row.get("收盘", 0)),
+                    "volume": float(row.get("成交量", 0)),
+                    "change_pct": float(row.get("涨跌幅", 0)),
+                })
+            return records
+    except Exception as e:
+        print(f"  ⚠️ 历史K线获取失败 {symbol} [{start_date}~{end_date}]: {e}")
+    return []
+
+
 def fetch_akshare_stock_history(symbol: str, days: int = 5) -> List[Dict]:
     """获取个股最近N天历史数据"""
     try:
