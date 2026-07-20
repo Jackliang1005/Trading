@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Investor T-monitor poll every three minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+Persistent=true
+Unit=investor-t-monitor-poll.service
+
+[Install]
+WantedBy=timers.target
