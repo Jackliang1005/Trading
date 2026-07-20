@@ -45,6 +45,7 @@ from domain.services.qmt_position_monitor_exemptions_service import (
     handle_position_monitor_exemptions_query,
     is_position_monitor_exemptions_query,
 )
+from domain.services.qmt_t_monitor_service import handle_t_monitor_query, is_t_monitor_query
 
 
 DEFAULT_BASE_URLS = {
@@ -277,6 +278,8 @@ def _normalize_intent(text: str) -> str:
         return "intraday_outlook"
     if is_position_monitor_exemptions_query(query):
         return "position_monitor_exemptions"
+    if is_t_monitor_query(query):
+        return "t_monitor"
     if any(key in query for key in ("推送验收", "投递验收")):
         return "live_delivery_acceptance"
     if any(key in query for key in ("推送状态", "投递状态")):
@@ -1427,6 +1430,8 @@ def handle_feishu_query(query_text: str) -> str:
         return handle_strategy_control_query(query)
     if intent == "position_monitor_exemptions":
         return handle_position_monitor_exemptions_query(query)
+    if intent == "t_monitor":
+        return handle_t_monitor_query(query)
 
     # 分析类查询（不需要 qmt2http token）
     if intent == "predictions":

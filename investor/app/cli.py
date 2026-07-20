@@ -71,6 +71,7 @@ from domain.services.qmt_position_monitor_exemptions_service import (
     list_position_monitor_exemptions,
     update_position_monitor_exemptions,
 )
+from domain.services.qmt_t_monitor_service import get_t_monitor
 
 
 NEW_COMMAND_SPECS = {
@@ -221,6 +222,10 @@ NEW_COMMAND_SPECS = {
     "position-monitor-exemptions": {
         "description": "List or safely update qmttrader_v2 position-monitor exemptions",
         "usage": "python3 main.py position-monitor-exemptions <list|set|append|remove> <guojin|dongguan> [symbols...] [--confirm]",
+    },
+    "t-monitor": {
+        "description": "Read qmttrader_v2 T-monitor advisory without placing orders",
+        "usage": "python3 main.py t-monitor <guojin|dongguan> [symbol]",
     },
     "feishu-query": {
         "description": "Feishu plugin 查询入口（示例：'国金今天持仓'）",
@@ -591,6 +596,9 @@ def run_command(command: str):
                 symbols=symbols,
                 confirm=_has_flag("--confirm"),
             )
+        return result if _has_flag("--json") else result.get("text", "")
+    if command == "t-monitor":
+        result = get_t_monitor(account=_arg(2, ""), symbol=_arg(3, ""))
         return result if _has_flag("--json") else result.get("text", "")
     if command == "feishu-query":
         query = " ".join(sys.argv[2:]).strip()
