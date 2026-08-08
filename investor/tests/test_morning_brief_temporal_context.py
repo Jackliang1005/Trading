@@ -42,3 +42,24 @@ def test_post_close_manual_brief_targets_following_trading_day(monkeypatch):
     assert context["target_date"] == "2026-08-11"
     assert "已收盘" in context["status"]
     assert context["is_current_trading_day"] is False
+
+
+def test_overseas_timestamps_are_labeled_as_source_market_time(monkeypatch):
+    monkeypatch.setattr(service, "is_cn_trading_day", lambda day: (True, "test_calendar"))
+    payload = _payload("2026-08-10 08:30:00")
+    payload["overseas"] = {
+        "us": {
+            "available": True,
+            "items": [
+                {"name": "道琼斯", "change_pct": 0.3, "as_of": "2026-08-07 16:50:36"},
+                {"name": "标普500", "change_pct": 0.6, "as_of": "2026-08-07 16:50:24"},
+            ],
+        }
+    }
+
+    text = service.format_morning_brief(payload)
+
+    assert "市场交易日 2026-08-07" in text
+    assert "源站市场时间 2026-08-07 16:50:36、2026-08-07 16:50:24" in text
+    assert "未统一换算为北京时间" in text
+    assert "数据时间 2026-08-07" not in text

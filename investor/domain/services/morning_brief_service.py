@@ -204,7 +204,13 @@ def format_morning_brief(payload: Dict[str, Any]) -> str:
                 for item in group.get("items") or []
             )
             observed = join_cn((str(item.get("as_of") or "") for item in group.get("items") or []), "时间待确认")
-            lines.append(f"- {group_name}（数据时间 {observed}）：{summary}。")
+            market_dates = join_cn(
+                dict.fromkeys(str(item.get("as_of") or "")[:10] for item in group.get("items") or [] if item.get("as_of")),
+                "交易日待确认",
+            )
+            lines.append(
+                f"- {group_name}（市场交易日 {market_dates}；源站市场时间 {observed}，未统一换算为北京时间）：{summary}。"
+            )
         else:
             lines.append(f"- {group_name}：数据不可用（{group.get('reason') or '原因未知'}），不作走势推断。")
     lines.extend([
@@ -248,7 +254,7 @@ def format_morning_brief(payload: Dict[str, Any]) -> str:
         "",
         "**数据边界**",
     ])
-    lines.append("- 海外指数均标注各自数据时间；行情为空、过期或尚未开盘时不做方向推断。")
+    lines.append("- 海外指数时间保留源站市场时区，不冒充北京时间；行情为空、过期或尚未开盘时不做方向推断。")
     lines.append(f"- 交易日历来源：{session.get('calendar_source')}；所有 09:25/09:35/10:30 动作均属于计划交易日 {session.get('target_date')}。")
     lines.append("- 国金实时链路未恢复稳定前按降级处理；禁止用历史数据冒充实时状态。")
     return "\n".join(lines)
