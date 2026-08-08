@@ -14,6 +14,8 @@ def test_action_level_requires_live_evidence_and_actionable_quantity():
 
 
 def test_cross_account_position_never_generates_one_combined_sell_quantity():
+    policy = service.load_advisor_policy()
+    policy["profile_status"] = "user_confirmed"
     hint = service._reduce_execution_hint(
         {
             "weight": 0.62,
@@ -22,6 +24,7 @@ def test_cross_account_position_never_generates_one_combined_sell_quantity():
             "sources": ["main", "trade"],
         },
         "reduce_priority",
+        policy=policy,
     )
 
     assert hint["actionable"] is False
@@ -121,7 +124,7 @@ def test_market_closed_keeps_severe_drawdown_review_visible_without_quantity():
     )
 
     assert state == "market_closed_loss_review"
-    assert "累计回撤 30.0% 已达到复核门槛" in suggestion
+    assert "累计持仓亏损 30.0% 已达到复核门槛" in suggestion
     assert "不生成卖出数量" in suggestion
 
 
@@ -143,7 +146,7 @@ def test_market_closed_report_prioritizes_loss_review_and_shows_cost_risk():
                 "source": "trade",
                 "weight": 0.05,
                 "action_level": "observe",
-                "suggestion": "非交易时段：累计回撤 30.0% 已达到复核门槛；当前不生成卖出数量。",
+                "suggestion": "非交易时段：累计持仓亏损 30.0% 已达到复核门槛；当前不生成卖出数量。",
                 "quote": {"available": False},
                 "loss_review": {"required": True, "pnl_ratio": -0.30},
                 "execution_hint": {"actionable": False, "note": ""},
@@ -166,7 +169,7 @@ def test_market_closed_report_prioritizes_loss_review_and_shows_cost_risk():
     with patch.object(service, "build_decision_monitor", return_value=monitor):
         text = service.format_decision_monitor_text(slot="Feishu 查询")
 
-    assert "1 只持仓的累计回撤达到复核门槛" in text
+    assert "1 只持仓的累计持仓亏损达到复核门槛" in text
     assert "累计盈亏 -30.0%｜下次复核 优先" in text
     assert "累计盈亏 -0.01%（成本噪声）｜下次复核 常规" in text
     assert "盘外不生成价格触发或卖出数量" in text

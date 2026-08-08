@@ -285,6 +285,7 @@ def _action_for_position(
     policy: Dict[str, Any] | None = None,
 ) -> Tuple[str, str]:
     active_policy = policy or load_advisor_policy()
+    profile_confirmed = str(active_policy.get("profile_status") or "system_default") == "user_confirmed"
     weight = _safe_float(position.get("weight"))
     loss_evidence = loss_review_evidence(position, active_policy)
     loss_ratio = loss_evidence.get("pnl_ratio")
@@ -293,7 +294,7 @@ def _action_for_position(
     if not trading_session:
         if loss_evidence["required"]:
             action = (
-                f"非交易时段：累计回撤 {loss_label} 已达到复核门槛；下个交易时段优先核验承接与相对强弱，"
+                f"非交易时段：累计持仓亏损 {loss_label} 已达到复核门槛；下个交易时段优先核验承接与相对强弱，"
                 "当前不执行盘外价格判断，也不生成卖出数量。"
             )
             state = "market_closed_loss_review"
@@ -311,7 +312,7 @@ def _action_for_position(
             action = "交易建议: 减仓候选。已取得实时持仓价，但读口未提供日内涨跌；高集中度仓位按 09:35/10:30 的复盘纪律优先降风险。"
             state = "reduce_candidate_no_intraday_change"
         elif loss_evidence["required"]:
-            action = f"交易建议: 不补仓。累计回撤 {loss_label} 已达到复核门槛，但缺少日内涨跌证据；反弹无量仍以减仓修复组合为先。"
+            action = f"交易建议: 不补仓。累计持仓亏损 {loss_label} 已达到复核门槛，但缺少日内涨跌证据；反弹无量仍以减仓修复组合为先。"
             state = "hold_or_reduce_no_intraday_change"
         else:
             action = "交易建议: 实时价格已核验，暂不触发价格阈值；等待下一次盘中复核。"
@@ -323,16 +324,15 @@ def _action_for_position(
             action = "交易建议: 减仓优先。日内表现明显偏弱（跌幅超过 3% 或较市场低 2pct），不补仓，先降风险。"
             state = "reduce_priority"
         elif weight >= float(active_policy["single_position_prepare_ratio"]) and (change_pct < -1 or relative_change < -1):
-            action = (
-                "交易建议: 减仓候选。高集中持仓弱于昨收或弱于市场，若 30 分钟内不能修复，"
-                f"优先降权到 {float(active_policy['single_position_reduce_target_ratio']):.0%} 以下。"
-            )
+            action = "交易建议: 减仓候选。高集中持仓弱于昨收或弱于市场，若 30 分钟内不能修复，优先降低集中度。"
+            if profile_confirmed:
+                action += f" 已确认风险画像的降风险目标为 {float(active_policy['single_position_reduce_target_ratio']):.0%} 以下。"
             state = "reduce_candidate"
         elif change_pct >= 3:
             action = "交易建议: 不追涨。等待回踩承接或量价继续确认，已有仓位可分批锁定部分浮盈。"
             state = "no_chasing"
         elif loss_evidence["required"]:
-            action = f"交易建议: 不补仓。累计回撤 {loss_label} 已达到复核门槛；只有价格转强且承接稳定时才保留，反弹无量仍以减仓修复组合为先。"
+            action = f"交易建议: 不补仓。累计持仓亏损 {loss_label} 已达到复核门槛；只有价格转强且承接稳定时才保留，反弹无量仍以减仓修复组合为先。"
             state = "hold_or_reduce"
         elif source == "trade":
             action = "交易建议: 按交易仓处理。高开不追；跌破昨收且无承接时优先降低风险。"
@@ -340,6 +340,14 @@ def _action_for_position(
         else:
             action = "交易建议: 继续观察。价格未触发风险阈值，等待走势与市场方向进一步确认。"
             state = "observe"
+    if trading_session and state in {
+        "reduce_priority",
+        "reduce_candidate",
+        "reduce_candidate_no_intraday_change",
+        "hold_or_reduce",
+        "hold_or_reduce_no_intraday_change",
+    } and not profile_confirmed:
+        action += " 个人风险画像尚未确认；本次只提示风险方向，不生成目标仓位或卖出数量。"
     if cash_ratio is not None and cash_ratio < float(active_policy["minimum_cash_ratio"]):
         action += " 当前现金不足，新机会只能通过减仓腾挪资金。"
     return state, action
@@ -348,6 +356,20 @@ def _action_for_position(
 def _reduce_execution_hint(position: Dict[str, Any], state: str, policy: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Convert a risk state into a broker-evidence-backed quantity reference."""
     active_policy = policy or load_advisor_policy()
+    execution_states = {
+        "reduce_priority",
+        "reduce_candidate",
+        "reduce_candidate_no_intraday_change",
+        "hold_or_reduce",
+        "hold_or_reduce_no_intraday_change",
+    }
+    if state in execution_states and str(active_policy.get("profile_status") or "system_default") != "user_confirmed":
+        return {
+            "actionable": False,
+            "target_weight": None,
+            "suggested_qty": 0,
+            "note": "个人风险画像尚未确认；只提示集中度或亏损风险，不生成精确目标仓位或卖出数量。",
+        }
     weight = _safe_float(position.get("weight"))
     volume = int(_safe_float(position.get("volume")))
     if state in {"reduce_priority", "reduce_candidate", "reduce_candidate_no_intraday_change"}:
@@ -735,7 +757,7 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
         lines.append(f"- {len(verify)} 只持仓进入“核验”层级；证据或可执行数量尚不完整，不生成执行候选。")
     elif not monitor.get("trading_session") and loss_review_positions:
         lines.append(
-            f"- {len(loss_review_positions)} 只持仓的累计回撤达到复核门槛；已列为下个交易时段优先核验，"
+            f"- {len(loss_review_positions)} 只持仓的累计持仓亏损达到复核门槛；已列为下个交易时段优先核验，"
             "当前盘外不生成价格触发或卖出数量。"
         )
     else:

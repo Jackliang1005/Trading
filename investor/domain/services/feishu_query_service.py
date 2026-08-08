@@ -1121,11 +1121,13 @@ def _query_advisor_profile(query: str) -> str:
         f"{float(policy.get('single_position_reduce_target_ratio', 0))*100:.0f}%",
         f"- 亏损仓权重复核 / 降风险目标：{float(policy.get('loss_position_review_ratio', 0))*100:.0f}% / "
         f"{float(policy.get('loss_position_reduce_target_ratio', 0))*100:.0f}%",
-        f"- 累计回撤触发：普通 {float(policy.get('loss_review_drawdown_ratio', 0.05))*100:.0f}% / "
-        f"严重 {float(policy.get('severe_loss_drawdown_ratio', 0.20))*100:.0f}%（严重回撤不受仓位下限限制）",
+        f"- 累计持仓亏损触发：普通 {float(policy.get('loss_review_drawdown_ratio', 0.05))*100:.0f}% / "
+        f"严重 {float(policy.get('severe_loss_drawdown_ratio', 0.20))*100:.0f}%（严重持仓亏损不受仓位下限限制）",
         f"- 前三持仓预警：{float(policy.get('top3_position_alert_ratio', 0))*100:.0f}%｜最低现金参考："
         f"{float(policy.get('minimum_cash_ratio', 0))*100:.0f}%",
     ]
+    if policy.get("profile_status") != "user_confirmed":
+        lines.append("- 以上降风险比例是未授权的参数预览；只用于风险提示，不生成目标仓位或卖出数量。")
     if selected and not confirmed:
         lines.extend(
             [

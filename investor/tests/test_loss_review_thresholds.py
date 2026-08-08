@@ -78,7 +78,7 @@ def test_intraday_decision_uses_drawdown_evidence_instead_of_pnl_sign():
     assert tiny_state == "trade_position_watch"
     assert "\u4e0d\u8865\u4ed3" not in tiny_text
     assert severe_state == "hold_or_reduce"
-    assert "\u7d2f\u8ba1\u56de\u64a4 30.0%" in severe_text
+    assert "\u7d2f\u8ba1\u6301\u4ed3\u4e8f\u635f 30.0%" in severe_text
 
 
 def test_closing_plan_marks_severe_small_position_for_verification_but_not_fake_quantity():
@@ -97,7 +97,7 @@ def test_closing_plan_marks_severe_small_position_for_verification_but_not_fake_
     assert decisions[0]["action_level"] == "verify"
     assert decisions[0]["loss_review"]["severity"] == "severe"
     assert decisions[0]["quantity_actionable"] is False
-    assert "\u7d2f\u8ba1\u56de\u64a4 30.0%" in decisions[0]["advice"]
+    assert "\u7d2f\u8ba1\u6301\u4ed3\u4e8f\u635f 30.0%" in decisions[0]["advice"]
 
 
 def test_closing_plan_describes_tiny_loss_as_cost_noise_not_trend_failure():
@@ -150,4 +150,4 @@ def test_profile_view_explains_weight_and_drawdown_are_different_thresholds():
     )
 
     assert "\u4e8f\u635f\u4ed3\u6743\u91cd\u590d\u6838 / \u964d\u98ce\u9669\u76ee\u6807\uff1a18% / 15%" in text
-    assert "\u7d2f\u8ba1\u56de\u64a4\u89e6\u53d1\uff1a\u666e\u901a 5% / \u4e25\u91cd 20%" in text
+    assert "\u7d2f\u8ba1\u6301\u4ed3\u4e8f\u635f\u89e6\u53d1\uff1a\u666e\u901a 5% / \u4e25\u91cd 20%" in text

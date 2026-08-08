@@ -117,6 +117,9 @@ def test_next_session_monitor_inherits_plan_but_gates_cross_account_quantity(mon
     monkeypatch.setattr(monitor_service, "_fetch_live_cash", lambda: (None, False, "main unavailable"))
     monkeypatch.setattr(monitor_service, "_fetch_realtime_quotes", lambda codes: (quotes, ""))
     monkeypatch.setattr(monitor_service, "is_cn_trading_day", lambda value: (True, "test"))
+    confirmed_policy = monitor_service.load_advisor_policy()
+    confirmed_policy["profile_status"] = "user_confirmed"
+    monkeypatch.setattr(monitor_service, "load_advisor_policy", lambda: confirmed_policy)
 
     monitor = monitor_service.build_decision_monitor(slot="1030")
     tracked = monitor["tracked_positions"][0]

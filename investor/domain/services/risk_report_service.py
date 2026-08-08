@@ -524,8 +524,8 @@ def format_risk_report(report: Dict[str, Any]) -> str:
         f"前三持仓预警 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)}。"
     )
     lines.append(
-        f"- 亏损仓复核需同时满足权重 {pct(float(policy.get('loss_position_review_ratio', 0.18)) * 100)} 和累计回撤 "
-        f"{pct(float(policy.get('loss_review_drawdown_ratio', 0.05)) * 100)}；累计回撤达到 "
+        f"- 亏损仓复核需同时满足权重 {pct(float(policy.get('loss_position_review_ratio', 0.18)) * 100)} 和累计持仓亏损幅度 "
+        f"{pct(float(policy.get('loss_review_drawdown_ratio', 0.05)) * 100)}；累计持仓亏损幅度达到 "
         f"{pct(float(policy.get('severe_loss_drawdown_ratio', 0.20)) * 100)} 时不受仓位下限限制。"
     )
     if not report.get("position_coverage_complete", True):

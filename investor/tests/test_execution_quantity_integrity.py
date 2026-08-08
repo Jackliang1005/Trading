@@ -3,6 +3,12 @@ from domain.services import decision_monitor_service as monitor
 from domain.services import risk_report_service as risk_service
 
 
+def _confirmed_policy():
+    policy = monitor.load_advisor_policy()
+    policy["profile_status"] = "user_confirmed"
+    return policy
+
+
 def test_risk_exposure_preserves_fresh_sellable_quantity_by_account():
     rows = [
         {
@@ -36,6 +42,7 @@ def test_intraday_quantity_requires_broker_available_volume_evidence():
     hint = monitor._reduce_execution_hint(
         {"weight": 0.50, "volume": 1000, "source": "trade", "sources": ["trade"]},
         "reduce_priority",
+        policy=_confirmed_policy(),
     )
 
     assert hint["actionable"] is False
@@ -55,6 +62,7 @@ def test_intraday_quantity_is_capped_by_sellable_shares_without_claiming_target(
             "sources": ["trade"],
         },
         "reduce_priority",
+        policy=_confirmed_policy(),
     )
 
     assert hint["actionable"] is True
@@ -78,6 +86,7 @@ def test_intraday_quantity_rounds_up_to_reach_target_instead_of_under_selling():
             "sources": ["trade"],
         },
         "reduce_candidate",
+        policy=_confirmed_policy(),
     )
 
     assert hint["suggested_qty"] == 13600
@@ -96,6 +105,7 @@ def test_intraday_stale_or_sub_lot_availability_stays_non_actionable():
             "sources": ["main"],
         },
         "reduce_priority",
+        policy=_confirmed_policy(),
     )
     sub_lot = monitor._reduce_execution_hint(
         {
@@ -107,6 +117,7 @@ def test_intraday_stale_or_sub_lot_availability_stays_non_actionable():
             "sources": ["trade"],
         },
         "reduce_priority",
+        policy=_confirmed_policy(),
     )
 
     assert stale["actionable"] is False

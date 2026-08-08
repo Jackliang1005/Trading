@@ -30,6 +30,7 @@ def test_policy_loader_validates_ratios_and_target_order(tmp_path):
 
 def test_execution_quantity_uses_the_shared_reduction_target():
     policy = load_advisor_policy()
+    policy["profile_status"] = "user_confirmed"
     policy["single_position_reduce_target_ratio"] = 0.20
 
     hint = decision_monitor_service._reduce_execution_hint(

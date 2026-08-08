@@ -258,15 +258,23 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     )
     profile_name = str(policy.get("profile_name") or "").strip()
     policy_identity = f"{profile_name}，{policy_status}" if profile_name else policy_status
+    if str(policy.get("profile_status") or "system_default") == "user_confirmed":
+        lines.append(
+            f"- 风险政策：单票 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)} 预警 / "
+            f"{pct(float(policy.get('single_position_reduce_target_ratio', 0.25)) * 100)} 降风险目标，"
+            f"前三持仓 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)} 预警，"
+            f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}（{policy_identity}）。"
+        )
+    else:
+        lines.append(
+            f"- 风险政策：系统默认预警基线为单票 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)}、"
+            f"前三持仓 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)}、"
+            f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}；"
+            "个人画像未确认，不把默认降风险比例当作执行目标，也不生成卖出数量。"
+        )
     lines.append(
-        f"- 风险政策：单票 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)} 预警 / "
-        f"{pct(float(policy.get('single_position_reduce_target_ratio', 0.25)) * 100)} 降风险目标，"
-        f"前三持仓 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)} 预警，"
-        f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}（{policy_identity}）。"
-    )
-    lines.append(
-        f"- 亏损仓复核：权重达到 {pct(float(policy.get('loss_position_review_ratio', 0.18)) * 100)} 且累计回撤达到 "
-        f"{pct(float(policy.get('loss_review_drawdown_ratio', 0.05)) * 100)}，或累计回撤直接达到严重阈值 "
+        f"- 亏损仓复核：权重达到 {pct(float(policy.get('loss_position_review_ratio', 0.18)) * 100)} 且累计持仓亏损幅度达到 "
+        f"{pct(float(policy.get('loss_review_drawdown_ratio', 0.05)) * 100)}，或累计持仓亏损幅度直接达到严重阈值 "
         f"{pct(float(policy.get('severe_loss_drawdown_ratio', 0.20)) * 100)}；不会因数元浮亏触发减仓。"
     )
 
