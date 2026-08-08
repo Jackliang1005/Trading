@@ -82,6 +82,14 @@ REPORT_FILE_LABELS = {
     "health": "最近自动健康探针",
 }
 
+AUDIT_ITEM_LABELS = {
+    "holdings_account_monitor": "持仓与账户监控",
+    "feishu_push_entry_inventory": "飞书推送入口清单",
+    "global_impact_command_center": "全球事件影响指挥台",
+    "post_market_closing_brief": "盘后收盘简报",
+    "pre_market_morning_brief": "盘前晨报",
+}
+
 
 def _run(args: List[str], timeout: int = 10) -> Dict[str, Any]:
     try:
@@ -192,6 +200,14 @@ def format_assistant_status(status: Dict[str, Any]) -> str:
     blocked = int(audit.get("blocked_count", 0) or 0)
     warnings = int(audit.get("warning_count", 0) or 0)
     lines.extend(["", "**能力检查**", f"- 阻断 {blocked} 项，警告 {warnings} 项。"])
+    warning_names = [AUDIT_ITEM_LABELS.get(str(name), str(name)) for name in (audit.get("warning") or []) if name]
+    blocked_names = [AUDIT_ITEM_LABELS.get(str(name), str(name)) for name in (audit.get("blocked") or []) if name]
+    if warning_names:
+        lines.append(f"- 警告项：{'、'.join(warning_names)}。")
+    if blocked_names:
+        lines.append(f"- 阻断项：{'、'.join(blocked_names)}。")
+    if audit.get("generated_at"):
+        lines.append(f"- 审计时间：{audit.get('generated_at')}。")
     if blocked:
         lines.append("- 存在阻断项时，相关报告应按数据不可用降级，不得补齐结论。")
     lines.extend(["", "**说明**", "- 这是运行状态，不是交易信号；系统不会因状态检查自动下单。"])

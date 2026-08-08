@@ -102,3 +102,24 @@ def test_log_payload_surfaces_qmt_root_cause_signatures():
 
     assert summary["error_hits"] == 2
     assert summary["error_signatures"] == ["QMT交易连接失败", "行情服务不可用"]
+
+
+def test_assistant_status_names_audit_warning_and_time():
+    text = assistant_status.format_assistant_status(
+        {
+            "generated_at": "2026-08-08 18:20:00",
+            "units": {},
+            "timers": {},
+            "reports": {},
+            "audit": {
+                "blocked_count": 0,
+                "warning_count": 1,
+                "blocked": [],
+                "warning": ["holdings_account_monitor"],
+                "generated_at": "2026-08-08 16:25:35 +0800",
+            },
+        }
+    )
+
+    assert "警告项：持仓与账户监控" in text
+    assert "审计时间：2026-08-08 16:25:35 +0800" in text
