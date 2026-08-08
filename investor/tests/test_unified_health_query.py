@@ -1,4 +1,5 @@
 from domain.services import feishu_query_service as service
+from domain.services import assistant_status_service as assistant_status
 
 
 def test_health_keeps_local_status_when_token_is_missing(monkeypatch):
@@ -35,3 +36,32 @@ def test_health_combines_gateway_positions_and_logs(monkeypatch):
     assert "实时接口返回 1 条持仓记录" in text
     assert "读取 18 行，未命中异常关键词" in text
     assert "不会触发下单或改变仓位" in text
+
+
+def test_log_errors_before_latest_healthy_heartbeat_are_recovered():
+    summary = service._summarize_log_errors(
+        [
+            "subscribeQuote ERROR invalid stockcode",
+            "signal-server heartbeat status=ok positions=4",
+        ]
+    )
+
+    assert summary["error_hits"] == 0
+    assert summary["recovered_error_hits"] == 1
+
+
+def test_log_errors_after_latest_healthy_heartbeat_remain_active():
+    summary = service._summarize_log_errors(
+        [
+            "signal-server heartbeat status=ok positions=4",
+            "ProviderUnavailable Exception: 无法连接行情服务",
+        ]
+    )
+
+    assert summary["error_hits"] == 1
+    assert summary["recovered_error_hits"] == 0
+    assert summary["error_categories"] == {"连接链路": 1}
+
+
+def test_assistant_status_uses_automatic_health_probe_state():
+    assert assistant_status.REPORT_FILES["health"] == str(assistant_status.HEALTH_STATE_PATH)

@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"
+HEALTH_STATE_PATH = WORKSPACE / "runtime" / "investor_health_alert_state.json"
 
 CORE_UNITS = [
     "feishu-webhook.service",
@@ -52,7 +53,7 @@ REPORT_FILES = {
     "closing": "investor_closing_brief_latest.md",
     "weekly": "investor_weekly_report_latest.md",
     "audit": "investor_assistant_capability_audit_latest.json",
-    "health": "investor_assistant_health_latest.md",
+    "health": str(HEALTH_STATE_PATH),
 }
 
 CORE_UNIT_LABELS = {
@@ -78,7 +79,7 @@ REPORT_FILE_LABELS = {
     "closing": "收盘简报",
     "weekly": "周报",
     "audit": "能力审计",
-    "health": "最近健康告警记录",
+    "health": "最近自动健康探针",
 }
 
 
@@ -118,7 +119,8 @@ def _human_timer_next(value: object) -> str:
 
 
 def _file_status(name: str) -> Dict[str, Any]:
-    path = REPORTS_DIR / name
+    candidate = Path(name)
+    path = candidate if candidate.is_absolute() else REPORTS_DIR / candidate
     if not path.exists():
         return {"exists": False, "path": str(path)}
     stat = path.stat()

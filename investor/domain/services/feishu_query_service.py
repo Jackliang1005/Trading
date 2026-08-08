@@ -250,20 +250,45 @@ def _collect_trade_logs(base_url: str, token: str, days: int = 3) -> List[Dict]:
                     if isinstance(content, list) and content:
                         lines = [str(item) for item in content if item is not None]
                         break
-        err_hits = [
-            str(line)
-            for line in lines
-            if any(key in str(line) for key in ("Traceback", "ERROR", "Exception", "失败", "超时", "断开"))
-        ]
+        error_summary = _summarize_log_errors(lines)
         rows.append(
             {
                 "date": d,
                 "ok": bool(payload.get("success")),
                 "line_count": len(lines),
-                "error_hits": len(err_hits),
+                **error_summary,
             }
         )
     return rows
+
+
+def _summarize_log_errors(lines: List[str]) -> Dict:
+    """Separate active failures from startup errors followed by a healthy heartbeat."""
+    error_keys = ("Traceback", "ERROR", "Exception", "失败", "超时", "断开")
+    error_indexes = [index for index, line in enumerate(lines) if any(key in str(line) for key in error_keys)]
+    healthy_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if "heartbeat status=ok" in str(line).lower() or "heartbeat_status=ok" in str(line).lower()
+    ]
+    last_healthy_index = max(healthy_indexes, default=-1)
+    active_indexes = [index for index in error_indexes if index > last_healthy_index]
+    recovered_indexes = [index for index in error_indexes if index <= last_healthy_index]
+
+    categories = {"连接链路": 0, "数据质量": 0, "运行异常": 0}
+    for index in active_indexes:
+        text = str(lines[index]).lower()
+        if any(key in text for key in ("无法连接", "断开", "超时", "providerunavailable", "connection")):
+            categories["连接链路"] += 1
+        elif any(key in text for key in ("invalid stockcode", "invalid symbol", "无效代码")):
+            categories["数据质量"] += 1
+        else:
+            categories["运行异常"] += 1
+    return {
+        "error_hits": len(active_indexes),
+        "recovered_error_hits": len(recovered_indexes),
+        "error_categories": {key: value for key, value in categories.items() if value},
+    }
 
 
 def _normalize_account(text: str) -> str:
@@ -554,8 +579,20 @@ def _query_logs(account: str, token: str, days: int) -> str:
             parts.append(f"- {item.get('date')}：日志接口{_connection_error_cn(item.get('error'))}，当天状态无法核验。")
             continue
         error_hits = int(item.get("error_hits", 0) or 0)
+        recovered_hits = int(item.get("recovered_error_hits", 0) or 0)
         if error_hits:
-            parts.append(f"- {item.get('date')}：读取 {int(item.get('line_count', 0) or 0)} 行，命中 {error_hits} 条异常关键词，需要检查。")
+            category_text = "、".join(
+                f"{name} {count} 条" for name, count in (item.get("error_categories") or {}).items()
+            )
+            if category_text:
+                parts.append(f"- {item.get('date')}：读取 {int(item.get('line_count', 0) or 0)} 行，存在 {error_hits} 条活跃异常（{category_text}），需要检查。")
+            else:
+                parts.append(f"- {item.get('date')}：读取 {int(item.get('line_count', 0) or 0)} 行，命中 {error_hits} 条异常关键词，需要检查。")
+        elif recovered_hits:
+            parts.append(
+                f"- {item.get('date')}：读取 {int(item.get('line_count', 0) or 0)} 行；"
+                f"早前 {recovered_hits} 条异常后已有健康心跳，当前按已恢复记录。"
+            )
         else:
             parts.append(f"- {item.get('date')}：读取 {int(item.get('line_count', 0) or 0)} 行，未命中异常关键词。")
     parts.append("- 这里只做日志关键词检查，不等同于交易与行情链路完整可用。")
@@ -588,10 +625,17 @@ def _query_account_health_evidence(account: str, token: str) -> str:
     else:
         line_count = int(log_item.get("line_count", 0) or 0)
         error_hits = int(log_item.get("error_hits", 0) or 0)
+        recovered_hits = int(log_item.get("recovered_error_hits", 0) or 0)
         if line_count < 1:
             lines.append("- 当日策略日志：接口可用但未读到日志行，需要结合是否为交易日与策略进程继续核验。")
         elif error_hits:
-            lines.append(f"- 当日策略日志：读取 {line_count} 行，命中 {error_hits} 条异常关键词，需要检查。")
+            category_text = "、".join(
+                f"{name} {count} 条" for name, count in (log_item.get("error_categories") or {}).items()
+            )
+            suffix = f"（{category_text}）" if category_text else ""
+            lines.append(f"- 当日策略日志：读取 {line_count} 行，存在 {error_hits} 条活跃异常{suffix}，需要检查。")
+        elif recovered_hits:
+            lines.append(f"- 当日策略日志：早前 {recovered_hits} 条异常后已有健康心跳，当前按已恢复记录。")
         else:
             lines.append(f"- 当日策略日志：读取 {line_count} 行，未命中异常关键词。")
     return "\n".join(lines)
