@@ -42,7 +42,9 @@ def test_legacy_strategy_labels_are_not_reported_as_strategy_performance(monkeyp
     assert summary["qualified_total"] == 0
     assert summary["unqualified_total"] == 2
     assert summary["strategy_comparison_ready"] is False
-    assert "整体正确率 50.0%" in text
+    assert "旧版或未画像化方向记录 2 条（正确 1 条）" in text
+    assert "不输出整体正确率" in text
+    assert "整体正确率 50.0%" not in text
     assert "历史或未画像化市场预测" in text
     assert "情绪 1/1" not in text
     assert "技术 0/1" not in text
@@ -125,3 +127,25 @@ def test_wrong_profile_or_missing_run_id_is_not_qualified(monkeypatch):
 
     assert summary["qualified_total"] == 0
     assert summary["unqualified_total"] == 2
+
+
+def test_weekly_report_labels_longterm_portfolio_as_simulation():
+    report = _report({"total": 0, "strategies": []})
+    report["longterm"] = {
+        "summary": {
+            "available": True,
+            "as_of": "2026-08-08",
+            "nav": 176818.51,
+            "cash": 89401.84,
+            "cash_ratio": 0.506,
+            "holdings_count": 2,
+            "actions_count": 0,
+            "rejected_actions_count": 0,
+        }
+    }
+
+    text = service.format_weekly_report(report)
+
+    assert "长线模拟盘（非实盘账户）" in text
+    assert "模拟盘数据日 2026-08-08" in text
+    assert "不代表国金、东莞实盘资产" in text

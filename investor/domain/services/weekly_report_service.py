@@ -342,9 +342,20 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
     longterm = report.get("longterm", {}) or {}
     verified = int(predictions.get("total", 0) or 0)
     qualified = int(predictions.get("qualified_total", 0) or 0)
-    if verified:
+    unqualified = int(predictions.get("unqualified_total", max(0, verified - qualified)) or 0)
+    comparison_ready = bool(predictions.get("strategy_comparison_ready"))
+    if comparison_ready:
         prediction_summary = (
-            f"市场方向已验证 {verified} 条，整体正确率 {predictions.get('win_rate', 0)}%。"
+            f"画像化策略样本 {qualified} 条，已达到分策略比较门槛；具体结果见预测复盘。"
+        )
+    elif qualified:
+        prediction_summary = (
+            f"画像化策略样本 {qualified}/{predictions.get('minimum_total', 20)}，尚未达到比较门槛，不输出胜率。"
+        )
+    elif verified:
+        prediction_summary = (
+            f"旧版或未画像化方向记录 {verified} 条（正确 {predictions.get('correct', 0)} 条），"
+            "仅作迁移审计，不输出整体正确率。"
         )
     elif int(intraday.get("total", 0) or 0):
         prediction_summary = (
@@ -353,11 +364,13 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
         )
     else:
         prediction_summary = "本周暂无完成验证的预测样本，不把零样本写成 0% 正确率。"
-    prediction_detail = (
-        f"市场预测已验证 {verified} 条，正确 {predictions.get('correct', 0)} 条，整体正确率 {predictions.get('win_rate', 0)}%。"
-        if verified
-        else "策略归因样本：暂无；本周不输出分策略胜率结论。"
-    )
+    if verified:
+        prediction_detail = (
+            f"本周验证记录 {verified} 条：画像化 {qualified} 条，旧版或未画像化 {unqualified} 条；"
+            "未达到完整策略比较门槛前，不输出混合口径的整体正确率。"
+        )
+    else:
+        prediction_detail = "策略归因样本：暂无；本周不输出分策略胜率结论。"
     lines = [
         "📅 OpenClaw A股投资周报",
         f"统计区间：{report.get('period_start')} 至 {report.get('period_end')}",
@@ -437,7 +450,7 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "**长线组合**",
+        "**长线模拟盘（非实盘账户）**",
         _format_longterm_weekly(longterm.get("summary") or {}),
         "",
         "**下周行动**",
@@ -447,19 +460,20 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
         "**数据边界**",
     ])
     lines.append(f"- 统计区间为 {report.get('period_start')} 至 {report.get('period_end')}；报告生成时间 {report.get('generated_at')}。")
+    lines.append("- 长线模拟盘的净值与现金只用于策略实验，不代表国金、东莞实盘资产，也不参与实盘现金充足度判断。")
     lines.append("- 实时账户或行情链路降级时，只保留已落地历史数据，不推断交易已经完成。")
     return "\n".join(lines)
 
 
 def _format_longterm_weekly(summary: Dict[str, Any]) -> str:
     if not summary.get("available"):
-        return "- 长线组合快照不可用。"
+        return "- 长线模拟盘快照不可用。"
     nav = float(summary.get("nav", 0) or 0)
     cash = float(summary.get("cash", 0) or 0)
     cash_ratio = float(summary.get("cash_ratio", 0) or 0) * 100
     holdings = int(summary.get("holdings_count", summary.get("holdings", 0)) or 0)
     rejected = int(summary.get("rejected_actions_count", summary.get("rejected_actions", summary.get("rejected", 0))) or 0)
-    return f"- 数据日 {summary.get('as_of') or '未知'}；净值 {nav:,.2f}，现金 {cash:,.2f}（{cash_ratio:.1f}%），持仓 {holdings} 只；{longterm_plan_status(summary)}，风控拒绝 {rejected} 笔。"
+    return f"- 模拟盘数据日 {summary.get('as_of') or '未知'}；净值 {nav:,.2f}，现金 {cash:,.2f}（{cash_ratio:.1f}%），持仓 {holdings} 只；{longterm_plan_status(summary)}，风控拒绝 {rejected} 笔。"
 
 def save_weekly_report(report: Dict[str, Any]) -> str:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
