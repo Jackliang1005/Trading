@@ -415,6 +415,23 @@ def build_risk_report() -> Dict[str, Any]:
         flags.append("portfolio_unrealized_loss")
     if not flags:
         flags.append("no_major_snapshot_risk_flag")
+    position_summaries = [
+        {
+            "code": str(p.get("code") or ""),
+            "name": str(p.get("name") or p.get("code") or ""),
+            "source": str((p.get("sources") or ["unknown"])[0]) if len(p.get("sources") or []) == 1 else "combined",
+            "sources": list(p.get("sources") or []),
+            "volume": int(p.get("volume") or 0),
+            "available_volume": int(p.get("available_volume") or 0),
+            "available_volume_complete": bool(p.get("available_volume_complete")),
+            "stale_sources": list(p.get("stale_sources") or []),
+            "account_positions": list(p.get("account_positions") or []),
+            "market_value": round(float(p.get("market_value") or 0), 2),
+            "weight": round((float(p.get("market_value") or 0) / effective_total) if effective_total else 0.0, 4),
+            "pnl": round(float(p.get("pnl") or 0), 2),
+        }
+        for p in sorted_positions
+    ]
     report = {
         "available": True,
         "data_status": "fallback_snapshot" if fallback_snapshot else "current_snapshot",
@@ -441,23 +458,10 @@ def build_risk_report() -> Dict[str, Any]:
         "top1_ratio": round(top1_ratio, 4),
         "top3_ratio": round(top3_ratio, 4),
         "by_source": {k: {"count": v["count"], "market_value": round(v["market_value"], 2), "pnl": round(v["pnl"], 2)} for k, v in by_source.items()},
-        "top_positions": [
-            {
-                "code": str(p.get("code") or ""),
-                "name": str(p.get("name") or p.get("code") or ""),
-                "source": str((p.get("sources") or ["unknown"])[0]) if len(p.get("sources") or []) == 1 else "combined",
-                "sources": list(p.get("sources") or []),
-                "volume": int(p.get("volume") or 0),
-                "available_volume": int(p.get("available_volume") or 0),
-                "available_volume_complete": bool(p.get("available_volume_complete")),
-                "stale_sources": list(p.get("stale_sources") or []),
-                "account_positions": list(p.get("account_positions") or []),
-                "market_value": round(float(p.get("market_value") or 0), 2),
-                "weight": round((float(p.get("market_value") or 0) / effective_total) if effective_total else 0.0, 4),
-                "pnl": round(float(p.get("pnl") or 0), 2),
-            }
-            for p in sorted_positions[:8]
-        ],
+        # ``positions`` is the complete normalized inventory for decision
+        # coverage. ``top_positions`` remains a compact display view.
+        "positions": position_summaries,
+        "top_positions": position_summaries[:8],
         "risk_flags": flags,
         "advisor_policy": policy,
     }

@@ -88,8 +88,36 @@ def _benchmark_for(code: str) -> str:
 
 
 def _current_position_map(risk: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    rows = risk.get("top_positions") or []
+    rows = risk.get("positions") or risk.get("top_positions") or []
     return {_code_key(_position_key(item)): item for item in rows if _position_key(item)}
+
+
+def _tracked_position_seeds(
+    plan_positions: List[Dict[str, Any]],
+    current_positions: Dict[str, Dict[str, Any]],
+    risk: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Prefer current broker inventory and retain plan-only rows only when coverage is uncertain."""
+    plan_map = {
+        _code_key(_position_key(item)): dict(item)
+        for item in plan_positions
+        if isinstance(item, dict) and _position_key(item)
+    }
+    seeds: List[Dict[str, Any]] = []
+    for key, current in current_positions.items():
+        merged = dict(plan_map.get(key) or {})
+        merged.update(current)
+        merged["_plan_only"] = False
+        seeds.append(merged)
+
+    preserve_plan_only = not risk.get("available") or not risk.get("position_coverage_complete", True)
+    if preserve_plan_only:
+        for key, planned in plan_map.items():
+            if key in current_positions:
+                continue
+            planned["_plan_only"] = True
+            seeds.append(planned)
+    return seeds
 
 
 def _is_trading_session(now: datetime) -> bool:
@@ -446,8 +474,8 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         )
     else:
         cash_ratio = None
-    plan_positions = decision_plan.get("positions") or []
-    tracked_seed = [item for item in plan_positions if _position_key(item)]
+    plan_positions = [item for item in decision_plan.get("positions") or [] if isinstance(item, dict)]
+    tracked_seed = _tracked_position_seeds(plan_positions, current_positions, risk)
     quote_codes = [_position_key(item) for item in tracked_seed] + list(BENCHMARK_CODES)
     if trading_session:
         quotes, quote_error = _fetch_realtime_quotes(quote_codes)
@@ -463,15 +491,27 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
     tracked: List[Dict[str, Any]] = []
     for planned in tracked_seed:
         code = _position_key(planned)
+        current_confirmed = _code_key(code) in current_positions and not planned.get("_plan_only")
         current = current_positions.get(_code_key(code), planned)
         quote = quotes.get(_code_key(code), {})
         benchmark_code = _benchmark_for(code)
         benchmark = quotes.get(_code_key(benchmark_code), {})
         quote_as_of = str(quote.get("as_of") or "")
         quote_fresh = bool(quote_as_of.startswith(now.strftime("%Y%m%d"))) if quote_as_of else not trading_session
-        state, suggestion = _action_for_position(current, cash_ratio, quote, benchmark, trading_session, quote_fresh, policy=policy)
-        execution_hint = _reduce_execution_hint(current, state, policy=policy)
-        action_level = _action_level(state, trading_session, quote_fresh, execution_hint)
+        if current_confirmed:
+            state, suggestion = _action_for_position(current, cash_ratio, quote, benchmark, trading_session, quote_fresh, policy=policy)
+            execution_hint = _reduce_execution_hint(current, state, policy=policy)
+            action_level = _action_level(state, trading_session, quote_fresh, execution_hint)
+        else:
+            state = "position_unconfirmed"
+            suggestion = "账户持仓覆盖不完整；该证券仅来自上一交易日计划，先核验是否仍持有及当前可用数量。"
+            execution_hint = {
+                "actionable": False,
+                "target_weight": None,
+                "suggested_qty": 0,
+                "note": "未由当前持仓证据确认，不能生成交易数量。",
+            }
+            action_level = "verify" if trading_session else "observe"
         tracked.append(
             {
                 "code": code,
@@ -482,7 +522,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
                 "available_volume": int(_safe_float(current.get("available_volume", 0))),
                 "available_volume_complete": bool(current.get("available_volume_complete")),
                 "pnl": _safe_float(current.get("pnl", planned.get("pnl"))),
-                "status": "current" if _code_key(code) in current_positions else "from_plan",
+                "status": "current" if current_confirmed else "from_plan_unconfirmed",
                 "quote": quote,
                 "benchmark_code": benchmark_code,
                 "relative_change_pct": round(_safe_float(quote.get("change_pct")) - _safe_float(benchmark.get("change_pct")), 3) if quote.get("change_available") and benchmark.get("change_available") else None,
@@ -510,7 +550,8 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         "as_of": csi300.get("as_of", ""),
     }
     return {
-        "available": bool(closing.get("available")),
+        "available": bool(closing.get("available") or risk.get("available")),
+        "plan_available": bool(closing.get("available")),
         "slot": str(slot or ""),
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "trading_session": trading_session,
@@ -520,6 +561,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         "plan_generated_at": closing.get("generated_at", ""),
         "closing_error": closing.get("error", ""),
         "risk_available": bool(risk.get("available")),
+        "position_coverage_complete": bool(risk.get("position_coverage_complete", bool(risk.get("available")))),
         "risk_as_of": risk.get("as_of", ""),
         "cash_ratio": cash_ratio,
         "cash": cash,
@@ -704,6 +746,10 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
         lines.extend(str(item) for item in opportunities[:max_opportunities])
 
     lines.extend(["", "**数据可信度**"])
+    if not monitor.get("plan_available"):
+        lines.append("- 上一交易日收盘计划不可用；当前仅按可验证持仓检查风险，不生成依赖旧计划的机会结论。")
+    if not monitor.get("position_coverage_complete"):
+        lines.append("- 当前持仓覆盖不完整；仅来自上一交易日计划的证券已标为待核验，不会生成交易数量。")
     if not monitor.get("trading_session"):
         lines.append("- 当前为非交易时段；报价仅作最近快照展示，不称为实时行情，不生成价格触发结论。")
     elif monitor.get("quote_error"):

@@ -258,7 +258,7 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
     themes = _theme_names(payload)
     cash_ratio = float(risk.get("cash_ratio") or 0)
     cash_complete = bool(risk.get("cash_complete", True))
-    for p in (risk.get("top_positions") or [])[:8]:
+    for p in (risk.get("positions") or risk.get("top_positions") or []):
         item = dict(p)
         weight = float(item.get("weight") or 0)
         pnl = float(item.get("pnl") or 0)
@@ -403,7 +403,7 @@ def build_decision_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         "cash_ratio": risk.get("cash_ratio", 0),
         "top1_ratio": risk.get("top1_ratio", 0),
         "top3_ratio": risk.get("top3_ratio", 0),
-        "positions": risk.get("top_positions") or [],
+        "positions": risk.get("positions") or risk.get("top_positions") or [],
     }
 
 

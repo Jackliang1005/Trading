@@ -74,7 +74,7 @@ def _event_summary(reports_dir: Path, risk: Dict[str, Any] | None = None) -> Dic
     theme_counts: Dict[tuple[str, ...], int] = {}
     ranked_events = rank_portfolio_events(
         event_block.get("top_events") or [],
-        (risk or {}).get("top_positions") or [],
+        (risk or {}).get("positions") or (risk or {}).get("top_positions") or [],
     )
     for item in ranked_events:
         themes = [theme_label(theme.get("theme")) for theme in (item.get("themes") or [])[:3]]
