@@ -65,3 +65,20 @@ def test_log_errors_after_latest_healthy_heartbeat_remain_active():
 
 def test_assistant_status_uses_automatic_health_probe_state():
     assert assistant_status.REPORT_FILES["health"] == str(assistant_status.HEALTH_STATE_PATH)
+
+
+def test_log_payload_checks_every_file_without_cross_file_recovery():
+    summary = service._summarize_log_payload(
+        {
+            "entries": [
+                {"content": ["ERROR connection refused"]},
+                {"content": ["signal-server heartbeat status=ok positions=4"]},
+            ]
+        }
+    )
+
+    assert summary["file_count"] == 2
+    assert summary["line_count"] == 2
+    assert summary["error_hits"] == 1
+    assert summary["recovered_error_hits"] == 0
+    assert summary["error_categories"] == {"连接链路": 1}

@@ -236,30 +236,47 @@ def _collect_trade_logs(base_url: str, token: str, days: int = 3) -> List[Dict]:
             continue
         payload = result.get("payload", {}) or {}
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        lines: List[str] = []
-        if isinstance(data, dict):
-            raw_lines = data.get("lines")
-            if isinstance(raw_lines, list):
-                lines = [str(item) for item in raw_lines if item is not None]
-            entries = data.get("entries")
-            if (not lines) and isinstance(entries, list):
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    content = entry.get("content")
-                    if isinstance(content, list) and content:
-                        lines = [str(item) for item in content if item is not None]
-                        break
-        error_summary = _summarize_log_errors(lines)
+        log_summary = _summarize_log_payload(data if isinstance(data, dict) else {})
         rows.append(
             {
                 "date": d,
                 "ok": bool(payload.get("success")),
-                "line_count": len(lines),
-                **error_summary,
+                **log_summary,
             }
         )
     return rows
+
+
+def _summarize_log_payload(data: Dict) -> Dict:
+    """Aggregate every returned log file without letting one file clear another."""
+    groups: List[List[str]] = []
+    raw_lines = data.get("lines")
+    if isinstance(raw_lines, list):
+        groups.append([str(item) for item in raw_lines if item is not None])
+    if not groups:
+        entries = data.get("entries")
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                content = entry.get("content")
+                if isinstance(content, list):
+                    groups.append([str(item) for item in content if item is not None])
+
+    totals = {"error_hits": 0, "recovered_error_hits": 0}
+    categories: Dict[str, int] = {}
+    for lines in groups:
+        summary = _summarize_log_errors(lines)
+        totals["error_hits"] += int(summary.get("error_hits", 0) or 0)
+        totals["recovered_error_hits"] += int(summary.get("recovered_error_hits", 0) or 0)
+        for name, count in (summary.get("error_categories") or {}).items():
+            categories[name] = categories.get(name, 0) + int(count or 0)
+    return {
+        "line_count": sum(len(lines) for lines in groups),
+        **totals,
+        "error_categories": categories,
+        "file_count": len(groups),
+    }
 
 
 def _summarize_log_errors(lines: List[str]) -> Dict:
