@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 
 import db
 from domain.policies.advisor_policy import load_advisor_policy
+from domain.services.position_pnl_service import resolve_position_pnl
 from domain.services.report_style_service import join_cn, money, pct, risk_label, source_label
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -47,7 +48,7 @@ def _market_value(item: Dict[str, Any]) -> float:
 
 
 def _float_profit(item: Dict[str, Any]) -> float:
-    return _f(item.get("unrealized_pnl", item.get("float_profit", item.get("m_dFloatProfit"))))
+    return float(resolve_position_pnl(item)["pnl"])
 
 
 def _volume(item: Dict[str, Any]) -> int:
@@ -198,6 +199,8 @@ def _aggregate_security_exposures(
                 "available_volume_complete": True,
                 "market_value": 0.0,
                 "pnl": 0.0,
+                "pnl_bases": [],
+                "pnl_conflict": False,
                 "sources": [],
                 "stale_sources": [],
                 "account_positions": [],
@@ -212,7 +215,11 @@ def _aggregate_security_exposures(
         else:
             exposure["available_volume_complete"] = False
         exposure["market_value"] += _market_value(item)
-        exposure["pnl"] += _float_profit(item)
+        pnl_evidence = resolve_position_pnl(item)
+        exposure["pnl"] += float(pnl_evidence["pnl"])
+        if pnl_evidence["basis"] not in exposure["pnl_bases"]:
+            exposure["pnl_bases"].append(pnl_evidence["basis"])
+        exposure["pnl_conflict"] = bool(exposure["pnl_conflict"] or pnl_evidence["cumulative_cost_conflict"])
         if source not in exposure["sources"]:
             exposure["sources"].append(source)
         if source_stale and source not in exposure["stale_sources"]:
@@ -224,6 +231,8 @@ def _aggregate_security_exposures(
                 "available_volume": available_volume if available_complete and not source_stale else None,
                 "available_volume_complete": bool(available_complete and not source_stale),
                 "stale": source_stale,
+                "pnl_basis": pnl_evidence["basis"],
+                "pnl_conflict": pnl_evidence["cumulative_cost_conflict"],
             }
         )
     return list(grouped.values())
@@ -413,6 +422,8 @@ def build_risk_report() -> Dict[str, Any]:
         flags.append("stale_account_source")
     if total_pnl < 0:
         flags.append("portfolio_unrealized_loss")
+    if any(bool(item.get("pnl_conflict")) for item in exposures):
+        flags.append("position_pnl_conflict")
     if not flags:
         flags.append("no_major_snapshot_risk_flag")
     position_summaries = [
@@ -429,6 +440,8 @@ def build_risk_report() -> Dict[str, Any]:
             "market_value": round(float(p.get("market_value") or 0), 2),
             "weight": round((float(p.get("market_value") or 0) / effective_total) if effective_total else 0.0, 4),
             "pnl": round(float(p.get("pnl") or 0), 2),
+            "pnl_bases": list(p.get("pnl_bases") or []),
+            "pnl_conflict": bool(p.get("pnl_conflict")),
         }
         for p in sorted_positions
     ]

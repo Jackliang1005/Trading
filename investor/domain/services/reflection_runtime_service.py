@@ -18,6 +18,7 @@ from data_collector import (
     fetch_qmt_trading_summary,
 )
 from domain.policies.scoring_policy import calculate_prediction_score
+from domain.services.position_pnl_service import resolve_position_pnl
 
 # 评分阈值
 NEUTRAL_THRESHOLD = 0.3
@@ -423,14 +424,9 @@ def _build_positions_table(positions: list) -> tuple[str, list]:
         # 有时 mv 由 volume * price 计算
         if not mv and vol and price:
             mv = vol * price
-        pnl = pos.get("unrealized_pnl", pos.get("float_profit", pos.get("m_dFloatProfit", pos.get("profit_loss"))))
-        if pnl is None and vol and cost:
-            pnl = mv - (cost * vol)
-        pnl = float(pnl or 0)
-        pnl_pct = pos.get("pnl_pct", pos.get("profit_loss_ratio"))
-        if pnl_pct is None and cost and vol and cost * vol != 0:
-            pnl_pct = (pnl / (cost * vol)) * 100
-        pnl_pct = float(pnl_pct or 0)
+        pnl_evidence = resolve_position_pnl(pos)
+        pnl = float(pnl_evidence["pnl"])
+        pnl_pct = float(pnl_evidence["pnl_pct"] or 0)
         # 没有数量且没有市值就不是真实持仓；行情里残留的最新价不能让它重新出现。
         if vol <= 0 and mv <= 0:
             continue
@@ -444,6 +440,8 @@ def _build_positions_table(positions: list) -> tuple[str, list]:
                 "market_value": mv,
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
+                "pnl_basis": pnl_evidence["basis"],
+                "pnl_conflict": pnl_evidence["cumulative_cost_conflict"],
             }
         )
     enriched.sort(key=lambda x: x["pnl"], reverse=True)
@@ -522,8 +520,8 @@ def build_trading_summary_report(ts: Dict) -> str:
     pos_table_lines, enriched = _build_positions_table(positions)
     if enriched:
         total_market_value = total_market_value or sum(item["market_value"] for item in enriched)
-        # Position-level QMT float_profit is authoritative.  Older snapshots may
-        # contain the historical "market_value minus zero cost" aggregation bug.
+        # Recompute from position-level cumulative P&L evidence. Older snapshots
+        # may contain either a market-value aggregation bug or daily float P&L.
         total_unrealized_pnl = sum(item["pnl"] for item in enriched)
         lines.append(f"总持仓市值: {total_market_value:,.2f}")
         lines.append(f"总未实现盈亏: {total_unrealized_pnl:+,.2f}")
