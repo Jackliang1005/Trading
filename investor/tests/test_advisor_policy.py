@@ -33,14 +33,21 @@ def test_execution_quantity_uses_the_shared_reduction_target():
     policy["single_position_reduce_target_ratio"] = 0.20
 
     hint = decision_monitor_service._reduce_execution_hint(
-        {"weight": 0.40, "volume": 1000, "source": "main", "sources": ["main"]},
+        {
+            "weight": 0.40,
+            "volume": 1000,
+            "available_volume": 1000,
+            "available_volume_complete": True,
+            "source": "main",
+            "sources": ["main"],
+        },
         "reduce_priority",
         policy=policy,
     )
 
     assert hint["target_weight"] == 0.20
     assert hint["suggested_qty"] == 500
-    assert "目标仓位不高于 20%" in hint["note"]
+    assert "20% 附近或以下" in hint["note"]
 
 
 def test_cash_shortage_wording_uses_the_shared_minimum_cash_ratio():

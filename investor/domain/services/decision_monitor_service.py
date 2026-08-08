@@ -9,6 +9,7 @@ whether an intraday recommendation is based on live evidence or only a plan.
 from __future__ import annotations
 
 import json
+import math
 import os
 import urllib.request
 import re
@@ -308,7 +309,7 @@ def _action_for_position(
 
 
 def _reduce_execution_hint(position: Dict[str, Any], state: str, policy: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """Convert a risk-reduction state into a board-lot-aware execution hint."""
+    """Convert a risk state into a broker-evidence-backed quantity reference."""
     active_policy = policy or load_advisor_policy()
     weight = _safe_float(position.get("weight"))
     volume = int(_safe_float(position.get("volume")))
@@ -329,21 +330,81 @@ def _reduce_execution_hint(position: Dict[str, Any], state: str, policy: Dict[st
             "note": "同一证券分布在多个账户，需先分账户核对可用数量，不能按合计股数生成卖出数量。",
         }
     if volume <= 0:
-        return {"actionable": False, "target_weight": target_weight, "suggested_qty": 0, "note": "缺少可用持仓数量，不能生成下单数量。"}
+        return {"actionable": False, "target_weight": target_weight, "suggested_qty": 0, "note": "缺少总持仓数量，不能生成下单数量。"}
+    if position.get("stale_sources"):
+        return {
+            "actionable": False,
+            "target_weight": target_weight,
+            "suggested_qty": 0,
+            "note": "持仓来自过期账户回退，只能核验风险方向，不能生成当前卖出数量。",
+        }
+    if not bool(position.get("available_volume_complete")):
+        return {
+            "actionable": False,
+            "target_weight": target_weight,
+            "suggested_qty": 0,
+            "note": "券商未返回完整可用股数，只能核验，不能把总持仓当作可卖数量。",
+        }
+    available_volume = int(_safe_float(position.get("available_volume")))
+    if available_volume < 0 or available_volume > volume:
+        return {
+            "actionable": False,
+            "target_weight": target_weight,
+            "suggested_qty": 0,
+            "note": "券商可用股数与总持仓不一致，只能先核验账户数据。",
+        }
+    if available_volume <= 0:
+        return {
+            "actionable": False,
+            "target_weight": target_weight,
+            "suggested_qty": 0,
+            "note": "当前可用股数为 0（可能受当日买入或冻结影响），不能生成卖出数量。",
+        }
     raw_qty = volume * (weight - target_weight) / weight
-    suggested_qty = int(raw_qty // 100) * 100
+    if raw_qty < 100:
+        return {
+            "actionable": False,
+            "target_weight": target_weight,
+            "suggested_qty": 0,
+            "available_volume": available_volume,
+            "note": f"理论减仓约 {raw_qty:.0f} 股，不足 100 股整手；为避免过度调整，暂不生成卖出数量。",
+        }
+    required_qty = min(volume, int(math.ceil(raw_qty / 100.0) * 100))
+    executable_cap = int(available_volume // 100) * 100
+    suggested_qty = min(required_qty, executable_cap)
     if suggested_qty <= 0:
         return {
             "actionable": False,
             "target_weight": target_weight,
             "suggested_qty": 0,
-            "note": f"理论减仓约 {raw_qty:.0f} 股，不足 100 股最小交易单位，暂不生成卖出数量。",
+            "required_qty": required_qty,
+            "available_volume": available_volume,
+            "note": f"理论需减仓约 {raw_qty:.0f} 股，但当前可用 {available_volume} 股不足 100 股整手，暂不生成卖出数量。",
         }
+    target_reachable = suggested_qty >= required_qty
+    market_value = _safe_float(position.get("market_value"))
+    implied_price = market_value / volume if market_value > 0 and volume > 0 else 0.0
+    estimated_notional = round(suggested_qty * implied_price, 2) if implied_price > 0 else None
+    if target_reachable:
+        note = f"建议减仓 {suggested_qty} 股，按当前仓位估算可降至 {target_weight:.0%} 附近或以下。"
+    else:
+        note = (
+            f"当前最多先减仓 {suggested_qty} 股；达到 {target_weight:.0%} 目标约需 {required_qty} 股，"
+            "剩余数量待冻结解除或账户更新后再核验。"
+        )
+    if estimated_notional is not None:
+        note += f" 快照估算成交额约 {estimated_notional:,.0f} 元。"
+    note += " 未配置券商实际费率，未计佣金、印花税和滑点。"
     return {
         "actionable": True,
         "target_weight": target_weight,
         "suggested_qty": suggested_qty,
-        "note": f"建议减仓 {suggested_qty} 股，目标仓位不高于 {target_weight:.0%}。",
+        "required_qty": required_qty,
+        "available_volume": available_volume,
+        "target_reachable": target_reachable,
+        "estimated_notional": estimated_notional,
+        "transaction_cost_estimated": False,
+        "note": note,
     }
 
 
@@ -418,6 +479,8 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
                 "source": str(current.get("source") or planned.get("source") or ""),
                 "weight": _safe_float(current.get("weight", planned.get("weight"))),
                 "volume": int(_safe_float(current.get("volume", planned.get("volume", 0)))),
+                "available_volume": int(_safe_float(current.get("available_volume", 0))),
+                "available_volume_complete": bool(current.get("available_volume_complete")),
                 "pnl": _safe_float(current.get("pnl", planned.get("pnl"))),
                 "status": "current" if _code_key(code) in current_positions else "from_plan",
                 "quote": quote,

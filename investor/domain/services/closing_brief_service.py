@@ -265,6 +265,11 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
         sources = list(item.get("sources") or ([item.get("source")] if item.get("source") else []))
         level = _closing_action_level(item, policy)
         target_weight = None
+        suggested_qty = 0
+        required_qty = 0
+        quantity_actionable = False
+        target_reachable = False
+        estimated_notional = None
         if weight >= float(policy["single_position_prepare_ratio"]):
             target_weight = float(policy["single_position_reduce_target_ratio"])
             if len(sources) > 1:
@@ -276,10 +281,37 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
                 total_asset = float(risk.get("effective_total_asset") or 0)
                 market_value = float(item.get("market_value") or 0)
                 volume = int(item.get("volume") or 0)
+                available_volume = int(item.get("available_volume") or 0)
+                available_complete = bool(item.get("available_volume_complete"))
                 implied_price = market_value / volume if volume > 0 else 0
                 excess_value = max(0.0, market_value - total_asset * target_weight)
-                suggested_qty = min(volume, int(math.ceil(excess_value / implied_price / 100.0) * 100)) if implied_price > 0 else 0
-                quantity_text = f"参考减持约 {suggested_qty} 股（按快照隐含价估算，执行前核对可用股数和实时价）；" if suggested_qty else ""
+                raw_qty = excess_value / implied_price if implied_price > 0 else 0
+                required_qty = min(volume, int(math.ceil(raw_qty / 100.0) * 100)) if raw_qty >= 100 else 0
+                if item.get("stale_sources"):
+                    quantity_text = "账户持仓来自过期回退，收盘只保留降仓方向，下一交易日先刷新账户；"
+                elif not available_complete:
+                    quantity_text = "券商未返回完整可用股数，收盘只保留降仓方向，下一交易日先核验；"
+                elif available_volume < 0 or available_volume > volume:
+                    quantity_text = "券商可用股数与总持仓不一致，下一交易日先核验账户数据；"
+                elif raw_qty < 100:
+                    quantity_text = f"理论减仓约 {raw_qty:.0f} 股不足一手，为避免过度调整不生成卖出数量；"
+                else:
+                    suggested_qty = min(required_qty, int(available_volume // 100) * 100)
+                    quantity_actionable = suggested_qty > 0
+                    target_reachable = quantity_actionable and suggested_qty >= required_qty
+                    estimated_notional = round(suggested_qty * implied_price, 2) if quantity_actionable and implied_price > 0 else None
+                    if not quantity_actionable:
+                        quantity_text = f"当前可用 {available_volume} 股不足一手或为零，下一交易日不生成卖出数量；"
+                    elif target_reachable:
+                        quantity_text = (
+                            f"参考减持约 {suggested_qty} 股（快照估算成交额约 {estimated_notional:,.0f} 元）；"
+                            "执行前核对实时价，且未计佣金、印花税和滑点；"
+                        )
+                    else:
+                        quantity_text = (
+                            f"当前最多先参考减持 {suggested_qty} 股，达到目标约需 {required_qty} 股；"
+                            "剩余数量待解冻后核验，且未计佣金、印花税和滑点；"
+                        )
                 advice = (
                     "不加仓；若下一交易日开盘 30 分钟弱于所属板块或继续放量下跌，"
                     f"{quantity_text}目标是把单票权重压回 {target_weight:.0%} 以下。"
@@ -301,6 +333,12 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
                 "action_level": level,
                 "target_weight": target_weight,
                 "requires_account_split": len(sources) > 1,
+                "quantity_actionable": quantity_actionable,
+                "suggested_qty": suggested_qty,
+                "required_qty": required_qty,
+                "target_reachable": target_reachable,
+                "estimated_notional": estimated_notional,
+                "transaction_cost_estimated": False,
                 "theme_hint": _position_theme_hint(item, themes),
                 "advice": advice,
             }

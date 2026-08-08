@@ -54,6 +54,21 @@ def _volume(item: Dict[str, Any]) -> int:
     return int(_f(item.get("volume", item.get("m_nVolume", item.get("total_volume")))))
 
 
+def _available_volume(item: Dict[str, Any]) -> tuple[int, bool]:
+    """Return broker-reported sellable shares and whether that evidence exists."""
+    for key in ("can_use_volume", "available_volume", "m_nCanUseVolume"):
+        if key not in item or item.get(key) is None:
+            continue
+        try:
+            value = float(item.get(key))
+        except (TypeError, ValueError):
+            return 0, False
+        if value < 0:
+            return 0, False
+        return int(value), True
+    return 0, False
+
+
 def _snapshot_age_days(as_of: str) -> int | None:
     try:
         d = date.fromisoformat(str(as_of)[:10])
@@ -162,8 +177,12 @@ def _position_coverage(positions: List[Dict[str, Any]], account_metrics: Dict[st
     }
 
 
-def _aggregate_security_exposures(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Aggregate the same security across accounts for concentration analysis."""
+def _aggregate_security_exposures(
+    positions: List[Dict[str, Any]],
+    stale_sources: set[str] | None = None,
+) -> List[Dict[str, Any]]:
+    """Aggregate concentration while preserving account-level execution evidence."""
+    stale = {str(source) for source in (stale_sources or set())}
     grouped: Dict[str, Dict[str, Any]] = {}
     for item in positions:
         code = _position_code(item)
@@ -175,17 +194,38 @@ def _aggregate_security_exposures(positions: List[Dict[str, Any]]) -> List[Dict[
                 "code": code,
                 "name": _position_name(item),
                 "volume": 0,
+                "available_volume": 0,
+                "available_volume_complete": True,
                 "market_value": 0.0,
                 "pnl": 0.0,
                 "sources": [],
+                "stale_sources": [],
+                "account_positions": [],
             },
         )
+        source = str(item.get("_source") or "unknown")
+        available_volume, available_complete = _available_volume(item)
+        source_stale = source in stale
         exposure["volume"] += _volume(item)
+        if available_complete and not source_stale:
+            exposure["available_volume"] += available_volume
+        else:
+            exposure["available_volume_complete"] = False
         exposure["market_value"] += _market_value(item)
         exposure["pnl"] += _float_profit(item)
-        source = str(item.get("_source") or "unknown")
         if source not in exposure["sources"]:
             exposure["sources"].append(source)
+        if source_stale and source not in exposure["stale_sources"]:
+            exposure["stale_sources"].append(source)
+        exposure["account_positions"].append(
+            {
+                "source": source,
+                "volume": _volume(item),
+                "available_volume": available_volume if available_complete and not source_stale else None,
+                "available_volume_complete": bool(available_complete and not source_stale),
+                "stale": source_stale,
+            }
+        )
     return list(grouped.values())
 
 
@@ -344,7 +384,7 @@ def build_risk_report() -> Dict[str, Any]:
     position_coverage = _position_coverage(positions, account_metrics)
     cash = float(account_metrics["cash"])
     effective_total = float(account_metrics["effective_total"])
-    exposures = _aggregate_security_exposures(positions)
+    exposures = _aggregate_security_exposures(positions, set(account_metrics["stale_sources"]))
     sorted_positions = sorted(exposures, key=lambda item: float(item.get("market_value") or 0), reverse=True)
     top1_ratio = (float(sorted_positions[0]["market_value"]) / effective_total) if sorted_positions and effective_total else 0.0
     top3_mv = sum(float(p.get("market_value") or 0) for p in sorted_positions[:3])
@@ -408,6 +448,10 @@ def build_risk_report() -> Dict[str, Any]:
                 "source": str((p.get("sources") or ["unknown"])[0]) if len(p.get("sources") or []) == 1 else "combined",
                 "sources": list(p.get("sources") or []),
                 "volume": int(p.get("volume") or 0),
+                "available_volume": int(p.get("available_volume") or 0),
+                "available_volume_complete": bool(p.get("available_volume_complete")),
+                "stale_sources": list(p.get("stale_sources") or []),
+                "account_positions": list(p.get("account_positions") or []),
                 "market_value": round(float(p.get("market_value") or 0), 2),
                 "weight": round((float(p.get("market_value") or 0) / effective_total) if effective_total else 0.0, 4),
                 "pnl": round(float(p.get("pnl") or 0), 2),

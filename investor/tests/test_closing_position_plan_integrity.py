@@ -63,6 +63,8 @@ def test_single_account_closing_plan_can_show_a_snapshot_quantity_reference():
             "source": "main",
             "sources": ["main"],
             "volume": 400,
+            "available_volume": 400,
+            "available_volume_complete": True,
             "market_value": 200000,
         }
     )
