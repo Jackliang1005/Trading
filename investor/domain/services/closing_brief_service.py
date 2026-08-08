@@ -502,7 +502,7 @@ def format_closing_brief(payload: Dict[str, Any]) -> str:
         )
         lines.extend([
             f"- 市值 **{float(risk.get('total_market_value') or 0):,.0f}**｜{cash_text}",
-            f"- 浮动盈亏 **{float(risk.get('total_unrealized_pnl') or 0):+,.0f}**｜快照 {risk.get('as_of')}（{risk.get('snapshot_age_days')} 天）",
+            f"- 累计持仓盈亏 **{float(risk.get('total_unrealized_pnl') or 0):+,.0f}**｜快照 {risk.get('as_of')}（{risk.get('snapshot_age_days')} 天）",
         ])
     else:
         lines.append("- ⚠️ 持仓快照不可用，本报告不提供仓位建议。")
@@ -552,14 +552,14 @@ def format_closing_brief(payload: Dict[str, Any]) -> str:
         lines.append(f"- {report_date} 没有通过新鲜度与相关性校验的重要事件；其他日期事件不混入本交易日复盘。")
 
     longterm_summary = longterm.get("summary") or {}
-    lines.extend(["", "**🧭 长线组合**"])
+    lines.extend(["", "**🧭 长线模拟盘（非实盘账户）**"])
     if longterm_summary.get("available"):
         lines.append(
-            f"- 净值 **{float(longterm_summary.get('nav') or 0):,.2f}**｜现金 {float(longterm_summary.get('cash') or 0):,.2f}（{float(longterm_summary.get('cash_ratio') or 0)*100:.1f}%）｜持仓 {int(longterm_summary.get('holdings_count') or 0)} 只"
+            f"- 模拟净值 **{float(longterm_summary.get('nav') or 0):,.2f}**｜模拟现金 {float(longterm_summary.get('cash') or 0):,.2f}（{float(longterm_summary.get('cash_ratio') or 0)*100:.1f}%）｜模拟持仓 {int(longterm_summary.get('holdings_count') or 0)} 只"
         )
         lines.append(f"- {longterm_plan_status(longterm_summary)}｜数据日 {longterm_summary.get('as_of', '未知')}")
     else:
-        lines.append("- 长线快照不可用。")
+        lines.append("- 长线模拟盘快照不可用。")
 
     market_quality = "🟢" if review.get("quality_ok") else "🟡"
     concept_quality = "🟢" if concept.get("available") else "🟡"
@@ -569,6 +569,7 @@ def format_closing_brief(payload: Dict[str, Any]) -> str:
         f"- {market_quality} 市场数据：{'完整' if review.get('quality_ok') else '部分缺失｜' + '、'.join({'limit_up_unavailable':'涨停数据未取得','limit_down_unavailable':'跌停数据未取得','limit_ladder_unavailable':'连板数据未取得'}.get(str(x), str(x)) for x in quality_issues)}",
         "- 🟢 事件过滤：已排除旧闻、非市场内容和近似重复；仅展示报告交易日事件。",
         f"- {concept_quality} 概念/动量：概念数据日 {_display_date(concept.get('concept_date'))}｜动量数据日 {_display_date(concept.get('momentum_date'))}｜通过筛选 {len(concept.get('candidates') or [])} 只",
+        "- 🟢 账户身份：长线模拟盘与国金、东莞实盘严格分开；模拟净值和现金不参与实盘资金判断。",
         f"- 🟢 持仓快照：数据日 {risk.get('as_of', '未取得')}｜账户 {join_cn((source_label(item) for item in sorted((risk.get('by_source') or {}).keys())), '未知')}",
     ])
     if risk.get("available") and not risk.get("cash_complete", True):

@@ -178,7 +178,7 @@ def format_morning_brief(payload: Dict[str, Any]) -> str:
             else f"- 可验证现金 {money(risk.get('cash'))}；部分账户资产字段异常，不计算完整现金占比；"
         )
         lines.extend([
-            f"- 数据日 {risk.get('as_of')}；{risk.get('positions_count')} 只持仓，市值 {money(risk.get('total_market_value'))}，浮动盈亏 {money(risk.get('total_unrealized_pnl'))}。",
+            f"- 数据日 {risk.get('as_of')}；{risk.get('positions_count')} 只持仓，市值 {money(risk.get('total_market_value'))}，累计持仓盈亏 {money(risk.get('total_unrealized_pnl'))}。",
             cash_line + f"第一大持仓 {pct(risk.get('top1_ratio', 0)*100)}，前三大持仓 {pct(risk.get('top3_ratio', 0)*100)}。",
             "- " + join_cn((risk_label(item) for item in risk.get("risk_flags") or [])) + "。",
         ])

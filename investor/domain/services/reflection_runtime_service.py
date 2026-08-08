@@ -775,12 +775,12 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
         f"数据日：{as_of or '未知'}",
         "",
         "**核心结论**",
-        f"- 已验证成交 {len(trades)} 笔；{position_scope}有 {len(positions)} 只有效持仓，组合浮动盈亏 {money(total_pnl)}。",
+        f"- 已验证成交 {len(trades)} 笔；{position_scope}有 {len(positions)} 只有效持仓，组合累计持仓盈亏 {money(total_pnl)}。",
     ]
     if len(raw_trades) > len(trades):
         lines.append(f"- 有 {len(raw_trades) - len(trades)} 条成交记录缺少正数成交量或成交价，已排除，不计入交易完成。")
     if total_pnl < 0:
-        lines.append("- 组合处于浮亏，下一交易日先控制回撤和集中度，不以热点补仓替代风控。")
+        lines.append("- 组合累计持仓盈亏为负，下一交易日先控制回撤和集中度，不以热点补仓替代风控。")
     if stale_sources:
         stale_labels = [source_label(item) for item in stale_sources]
         lines.append(f"- 账户 {', '.join(stale_labels)} 使用最近可验证历史快照；组合数值不是全账户实时状态。")

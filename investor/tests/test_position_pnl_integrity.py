@@ -131,7 +131,7 @@ def test_reflection_prefers_cross_account_risk_inventory_over_stale_packet_total
         "2026-08-08 20:30:00",
         "2026-08-08",
     )
-    assert "组合浮动盈亏 -11.72万" in text
+    assert "组合累计持仓盈亏 -11.72万" in text
     assert "账户 国金 使用最近可验证历史快照" in text
     assert "不是全账户实时状态" in text
     report = reflection_runtime_service.build_trading_summary_report(summary)
@@ -173,6 +173,8 @@ def test_risk_report_uses_cumulative_pnl_and_exposes_its_basis(monkeypatch):
     assert report["top_positions"][0]["pnl_ratio"] == -0.3004
     assert report["top_positions"][0]["pnl_bases"] == ["position_profit"]
     assert "portfolio_unrealized_loss" in report["risk_flags"]
+    assert "累计持仓盈亏 -8.95万" in report["text"]
+    assert "浮动盈亏" not in report["text"]
 
 
 def test_inconsistent_cumulative_and_cost_values_are_flagged(monkeypatch):

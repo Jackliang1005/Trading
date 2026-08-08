@@ -504,7 +504,7 @@ def format_risk_report(report: Dict[str, Any]) -> str:
         "",
         "**核心结论**",
         f"- {join_cn(flags)}。",
-        f"- {'快照记录' if report.get('fallback_snapshot') else '当前'}已知 {report.get('positions_count')} 条持仓明细，市值 {money(report.get('total_market_value'))}，浮动盈亏 {money(report.get('total_unrealized_pnl'))}。",
+        f"- {'快照记录' if report.get('fallback_snapshot') else '当前'}已知 {report.get('positions_count')} 条持仓明细，市值 {money(report.get('total_market_value'))}，累计持仓盈亏 {money(report.get('total_unrealized_pnl'))}。",
         "",
         "**仓位结构**",
         (

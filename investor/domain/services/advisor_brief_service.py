@@ -274,7 +274,7 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     if risk.get("available"):
         lines.append(
             f"- 数据日 {risk.get('as_of') or '未知'}；已知 {int(risk.get('positions_count', 0) or 0)} 条持仓明细，"
-            f"明细市值 {money(risk.get('total_market_value'))}，浮动盈亏 {money(risk.get('total_unrealized_pnl'))}。"
+            f"明细市值 {money(risk.get('total_market_value'))}，累计持仓盈亏 {money(risk.get('total_unrealized_pnl'))}。"
         )
         if risk.get("cash_complete"):
             lines.append(f"- 现金 {money(risk.get('cash'))}（{pct(float(risk.get('cash_ratio') or 0) * 100)}）。")

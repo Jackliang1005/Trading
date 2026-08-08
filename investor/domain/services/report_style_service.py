@@ -19,7 +19,7 @@ RISK_LABELS = {
     "snapshot_date_unknown": "持仓快照日期未知",
     "top1_concentration_high": "单一持仓集中度过高",
     "top3_concentration_high": "前三持仓集中度过高",
-    "portfolio_unrealized_loss": "组合处于浮亏",
+    "portfolio_unrealized_loss": "组合累计持仓盈亏为负",
     "position_pnl_conflict": "持仓盈亏字段与成本口径冲突",
     "position_coverage_incomplete": "持仓明细覆盖不完整",
     "account_source_incomplete": "部分账户接口缺失",

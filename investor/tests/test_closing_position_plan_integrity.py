@@ -164,3 +164,34 @@ def test_closing_catalysts_fall_back_to_same_day_local_events():
     assert "伊朗霍尔木兹海峡限制方案推升石油供应担忧" in text
     assert text.count("伊朗霍尔木兹海峡限制方案推升石油供应担忧") == 1
     assert "2026-08-07 没有通过新鲜度" not in text
+
+
+def test_closing_brief_labels_longterm_portfolio_as_simulation():
+    payload = {
+        "date": "2026-08-07",
+        "generated_at": "2026-08-07 16:05:00",
+        "events": {},
+        "global_impact": {},
+        "risk": {"available": False, "by_source": {}},
+        "longterm": {
+            "summary": {
+                "available": True,
+                "nav": 176818.51,
+                "cash": 89401.84,
+                "cash_ratio": 0.506,
+                "holdings_count": 2,
+                "actions_count": 0,
+                "as_of": "2026-08-07",
+            }
+        },
+        "audit": {},
+        "market_review": {"sentiment": "震荡", "indices": [], "quality_issues": []},
+        "decision_plan": {"position_actions": [], "opportunities": [], "opening_triggers": []},
+    }
+
+    text = service.format_closing_brief(payload)
+
+    assert "长线模拟盘（非实盘账户）" in text
+    assert "模拟净值" in text
+    assert "模拟现金" in text
+    assert "不参与实盘资金判断" in text

@@ -58,7 +58,7 @@ def _load_market_prediction_template() -> str:
         "## 实盘账户概况\n"
         "说明：以下为本人实盘账户数据（双服务器汇总），预测时应考虑当前仓位情况，避免在满仓时仍建议加仓。\n"
         "${account_str}\n\n"
-        "## 当前持仓（含浮动盈亏）\n${positions_str}\n\n"
+        "## 当前持仓（含累计持仓盈亏）\n${positions_str}\n\n"
         "## 今日成交明细\n${trades_str}\n\n"
         "## 待成交委托\n${pending_str}\n\n"
         "${rag_context}\n\n${few_shot}\n\n"
@@ -219,7 +219,7 @@ def _format_positions(snapshot_data: Dict) -> str:
             pnl_str = "?"
         lines.append(
             f"- {name}({code}): 持仓{vol}股, 成本{cost}, 现价{price}, "
-            f"市值{mv}, 浮动盈亏{pnl_str}, 盈亏率{profit_pct}\n"
+            f"市值{mv}, 累计持仓盈亏{pnl_str}, 累计盈亏率{profit_pct}\n"
         )
     return _join_lines(lines)
 
