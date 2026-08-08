@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from domain.policies.advisor_policy import ADVISOR_PROFILES, confirm_advisor_profile, load_advisor_policy
 from domain.services.assistant_menu_service import format_assistant_menu_text
 from domain.services.assistant_status_service import build_assistant_status
 from domain.services.watchlist_report_service import build_watchlist_report
@@ -274,6 +275,8 @@ def _normalize_account(text: str) -> str:
 def _normalize_intent(text: str) -> str:
     query = str(text or "")
     ql = query.lower()
+    if any(key in query for key in ("风险偏好", "风险档案", "投顾档案")):
+        return "advisor_profile"
     if "\u65e5\u5185\u9884\u6d4b" in query or "intraday outlook" in ql:
         return "intraday_outlook"
     if is_position_monitor_exemptions_query(query):
@@ -830,6 +833,59 @@ def _query_capability_audit() -> str:
         lines.extend(f"- {_capability_item_label(item.get('name'))}" for item in warnings[:8])
     lines.extend(["", "**新鲜度**", f"- {freshness_note}"])
     lines.extend(["", "**边界**", "- 这是系统能力检查，不代表行情数据一定可用，也不会自动下单。"])
+    return "\n".join(lines)
+
+
+def _query_advisor_profile(query: str) -> str:
+    selected = next((name for name in ADVISOR_PROFILES if name in str(query or "")), "")
+    confirmed = bool(selected and re.search(r"(?:^|\s)确认\s*$", str(query or "").strip()))
+    if selected and confirmed:
+        try:
+            policy = confirm_advisor_profile(selected, confirmed_via="feishu_explicit_command")
+        except Exception as exc:
+            return f"🎚️ 风险偏好\n\n- 档案写入或回读失败（{type(exc).__name__}）；原风险政策保持不变。"
+        prefix = f"已确认并回读：{selected}"
+    elif selected:
+        policy = {"profile_name": selected, "profile_status": "preview", **ADVISOR_PROFILES[selected]}
+        prefix = f"待确认预览：{selected}"
+    else:
+        policy = load_advisor_policy()
+        current_name = policy.get("profile_name") or "系统默认"
+        status = "用户已确认" if policy.get("profile_status") == "user_confirmed" else "尚未确认"
+        prefix = f"当前档案：{current_name}（{status}）"
+
+    lines = [
+        "🎚️ OpenClaw 风险偏好",
+        "",
+        f"**{prefix}**",
+        f"- 单票预警 / 准备 / 降风险目标：{float(policy.get('single_position_alert_ratio', 0))*100:.0f}% / "
+        f"{float(policy.get('single_position_prepare_ratio', 0))*100:.0f}% / "
+        f"{float(policy.get('single_position_reduce_target_ratio', 0))*100:.0f}%",
+        f"- 浮亏复核 / 降风险目标：{float(policy.get('loss_position_review_ratio', 0))*100:.0f}% / "
+        f"{float(policy.get('loss_position_reduce_target_ratio', 0))*100:.0f}%",
+        f"- 前三持仓预警：{float(policy.get('top3_position_alert_ratio', 0))*100:.0f}%｜最低现金参考："
+        f"{float(policy.get('minimum_cash_ratio', 0))*100:.0f}%",
+    ]
+    if selected and not confirmed:
+        lines.extend(
+            [
+                f"- 档案说明：{ADVISOR_PROFILES[selected]['description']}。",
+                "",
+                f"如确认，请发送：`/风险偏好 {selected} 确认`",
+                "未出现末尾“确认”时只预览，不写入。",
+            ]
+        )
+    elif not selected:
+        lines.extend(
+            [
+                "",
+                "**可选档案**",
+                *[f"- {name}：{values['description']}" for name, values in ADVISOR_PROFILES.items()],
+                "",
+                "先发送 `/风险偏好 稳健`、`/风险偏好 均衡` 或 `/风险偏好 进取` 查看，不会直接写入。",
+            ]
+        )
+    lines.extend(["", "**边界**", "- 风险偏好只改变建议阈值，不会自动下单，也不会绕过实时数据与人工确认门槛。"])
     return "\n".join(lines)
 
 
@@ -1413,6 +1469,8 @@ def handle_feishu_query(query_text: str) -> str:
         from domain.services.advisor_brief_service import build_advisor_brief
 
         return build_advisor_brief().get("text", "投顾总览生成失败；本次不输出账户或交易结论。")
+    if intent == "advisor_profile":
+        return _query_advisor_profile(query)
     if intent == "delivery_audit":
         return format_delivery_audit_text()
     if intent == "live_delivery_acceptance":

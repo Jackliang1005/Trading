@@ -12,6 +12,7 @@ def build_assistant_menu() -> Dict:
             "title": "常用报告与查询",
             "items": [
                 {"ask": "/投顾", "cli": "python3 main.py advisor-brief", "purpose": "一页查看账户可信度、组合风险、重点事件、行动层级和验证闭环"},
+                {"ask": "/风险偏好", "cli": "python3 main.py feishu-query '/风险偏好'", "purpose": "查看稳健/均衡/进取档案；只有末尾带“确认”才写入"},
                 {"ask": "/早报", "cli": "python3 main.py morning-brief", "purpose": "08:30 汇总隔夜新闻、美股收盘、日韩开盘、A股传导和组合风险"},
                 {"ask": "/日内预测 0930", "cli": "python3 main.py intraday-outlook 0930", "purpose": "开盘预测与验证条件"},
                 {"ask": "/日内预测 1030", "cli": "python3 main.py intraday-outlook 1030", "purpose": "根据实际走势修正开盘预测"},

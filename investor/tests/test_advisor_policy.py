@@ -1,6 +1,6 @@
 import json
 
-from domain.policies.advisor_policy import load_advisor_policy
+from domain.policies.advisor_policy import ADVISOR_PROFILES, confirm_advisor_profile, load_advisor_policy
 from domain.services import decision_monitor_service
 
 
@@ -58,3 +58,15 @@ def test_cash_shortage_wording_uses_the_shared_minimum_cash_ratio():
     )
 
     assert "现金不足" in action
+
+
+def test_explicit_profile_confirmation_writes_and_reads_back(tmp_path):
+    path = tmp_path / "advisor_policy_user.json"
+
+    policy = confirm_advisor_profile("稳健", path=path, confirmed_via="test_explicit_command")
+
+    assert policy["profile_status"] == "user_confirmed"
+    assert policy["profile_name"] == "稳健"
+    assert policy["minimum_cash_ratio"] == ADVISOR_PROFILES["稳健"]["minimum_cash_ratio"]
+    assert policy["confirmed_via"] == "test_explicit_command"
+    assert path.exists()

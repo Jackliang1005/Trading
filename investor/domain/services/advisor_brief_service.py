@@ -188,11 +188,13 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
         str(policy.get("profile_status") or "system_default"),
         "自定义",
     )
+    profile_name = str(policy.get("profile_name") or "").strip()
+    policy_identity = f"{profile_name}，{policy_status}" if profile_name else policy_status
     lines.append(
         f"- 风险政策：单票 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)} 预警 / "
         f"{pct(float(policy.get('single_position_reduce_target_ratio', 0.25)) * 100)} 降风险目标，"
         f"前三持仓 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)} 预警，"
-        f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}（{policy_status}）。"
+        f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}（{policy_identity}）。"
     )
 
     lines.extend(["", "**账户与组合风险**"])
