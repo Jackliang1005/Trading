@@ -142,6 +142,26 @@ def test_stale_decision_snapshot_cannot_create_prepare_action(tmp_path, monkeypa
     assert "已过当前时效" in brief["text"]
 
 
+def test_advisor_brief_distinguishes_degradation_from_system_blocker(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "build_risk_report", _risk)
+    monkeypatch.setattr(service, "build_evolution_readiness", lambda as_of=None: _evolution())
+    _write(
+        tmp_path / "investor_assistant_capability_audit_latest.json",
+        {
+            "items": [
+                {"name": "holdings_account_monitor", "status": "warn"},
+                {"name": "service_health_diagnostics", "status": "ok"},
+            ]
+        },
+    )
+
+    brief = service.build_advisor_brief(now=datetime(2026, 8, 10, 11, 0), reports_dir=tmp_path)
+
+    assert "没有系统阻断" in brief["text"]
+    assert "1 项降级需关注：双账户持仓与资金读取" in brief["text"]
+    assert "2 项阻断" not in brief["text"]
+
+
 def test_feishu_and_menu_expose_the_advisor_home_view(monkeypatch):
     monkeypatch.setattr(service, "build_advisor_brief", lambda: {"text": "统一投顾总览"})
 

@@ -174,8 +174,14 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
         f"- 当前最高行动层级：**{ACTION_LABELS.get(overall, '观察')}**。只有证据完整的持仓才会进入“准备”，本报告不会自动下单。",
     ]
     blocked = audit.get("blocked") or []
+    warnings = audit.get("warnings") or []
     if blocked:
         lines.append(f"- 系统能力仍有 {len(blocked)} 项阻断：{join_cn(blocked)}；相关数据按降级口径处理。")
+    elif warnings:
+        lines.append(
+            f"- 最近能力审计没有系统阻断；仍有 {len(warnings)} 项降级需关注：{join_cn(warnings)}。"
+            "降级数据不会冒充实时完整账户。"
+        )
     else:
         lines.append("- 最近能力审计没有阻断项；行情和账户结论仍以各自数据时间为准。")
     policy_status = {"system_default": "系统默认", "user_confirmed": "用户已确认"}.get(

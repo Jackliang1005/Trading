@@ -315,9 +315,58 @@ def _health_transition(
     }
 
 
-def _format_message(health: Dict[str, Any], recovered: bool = False) -> str:
+def _refresh_recovered_portfolio() -> Dict[str, Any]:
+    sys.path.insert(0, str(INVESTOR_DIR))
+    from domain.services.portfolio_refresh_service import refresh_verified_portfolio_snapshot
+
+    return refresh_verified_portfolio_snapshot(require_complete_sources=True)
+
+
+def _reconcile_recovery_transition(
+    transition: Dict[str, Any],
+    previous_state: Dict[str, Any],
+    *,
+    recovery_confirmations: int,
+    dry_run: bool,
+    refresh_fn=None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Do not close an incident until a fresh complete portfolio snapshot is saved."""
+    if not transition.get("recovered") or dry_run:
+        return transition, {"attempted": False, "verified": False, "reason": "not_required"}
+    refresh = refresh_fn or _refresh_recovered_portfolio
+    try:
+        result = dict(refresh() or {})
+    except Exception as exc:
+        result = {"verified": False, "saved": False, "reason": f"refresh_failed:{type(exc).__name__}"}
+    reconciliation = {"attempted": True, **result}
+    if result.get("verified") and result.get("saved"):
+        return transition, reconciliation
+
+    held = dict(transition)
+    held.update(
+        {
+            "should_send": False,
+            "recovered": False,
+            "incident_open": True,
+            "incident_keys": list(previous_state.get("incident_keys") or []),
+            "consecutive_ok": max(0, int(recovery_confirmations) - 1),
+        }
+    )
+    return held, reconciliation
+
+
+def _format_message(
+    health: Dict[str, Any],
+    recovered: bool = False,
+    reconciliation: Dict[str, Any] | None = None,
+) -> str:
     if recovered:
-        return "✅ OpenClaw 投资助手已恢复\n此前异常的服务与数据链路已通过健康检查。"
+        verified_sources = len((reconciliation or {}).get("verified_sources") or [])
+        return (
+            "✅ OpenClaw 投资助手已恢复\n"
+            "此前异常的服务与数据链路已通过连续健康检查。\n"
+            f"双账户实时快照已重新采集并校验（来源 {verified_sources} 个）；后续报告不再使用该故障期历史回退。"
+        )
     lines = [
         "🚨 OpenClaw 投资助手异常",
         f"检查时间：{health.get('generated_at', '')}",
@@ -412,12 +461,21 @@ def main() -> int:
         recovery_confirmations=args.recovery_confirmations,
         force=args.force,
     )
+    transition, reconciliation = _reconcile_recovery_transition(
+        transition,
+        state,
+        recovery_confirmations=args.recovery_confirmations,
+        dry_run=args.dry_run,
+    )
     recovered = bool(transition["recovered"])
     should_send = bool(transition["should_send"])
 
     push_result = {"pushed": False, "reason": "not_needed"}
     if should_send and not args.dry_run:
-        push_result = _send_feishu(_format_message(health, recovered=recovered), args.target)
+        push_result = _send_feishu(
+            _format_message(health, recovered=recovered, reconciliation=reconciliation),
+            args.target,
+        )
 
     state.update(
         {
@@ -439,7 +497,14 @@ def main() -> int:
     if not args.dry_run:
         _save_state(state)
 
-    result = {"ok": health["ok"], "should_send": should_send, "recovered": recovered, "push_result": push_result, "health": health}
+    result = {
+        "ok": health["ok"],
+        "should_send": should_send,
+        "recovered": recovered,
+        "push_result": push_result,
+        "recovery_reconciliation": reconciliation,
+        "health": health,
+    }
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if health["ok"] else 2
 

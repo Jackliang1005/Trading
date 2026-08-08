@@ -134,6 +134,41 @@ def _item(name: str, status: str, evidence: List[str], action: str = "") -> Dict
     return {"name": name, "status": status, "evidence": evidence, "action": action}
 
 
+def _holdings_capability_status(
+    *,
+    dongguan_reachable: bool,
+    guojin_probe_rc: int,
+    risk_payload: Dict[str, Any],
+) -> tuple[str, bool]:
+    """Distinguish a safe partial-account degradation from total loss of holdings."""
+    stale_sources = risk_payload.get("stale_account_sources") or {}
+    fallback_active = bool(stale_sources)
+    portfolio_has_data = bool(risk_payload.get("available")) and (
+        int(risk_payload.get("positions_count", 0) or 0) > 0
+        or float(risk_payload.get("effective_total_asset", 0) or 0) > 0
+    )
+    guojin_reachable = guojin_probe_rc == 0
+    if dongguan_reachable and guojin_reachable and portfolio_has_data and not fallback_active:
+        return "ok", fallback_active
+    if dongguan_reachable or (portfolio_has_data and fallback_active):
+        return "warn", fallback_active
+    return "blocked", fallback_active
+
+
+def _diagnostics_capability_status(
+    *,
+    timer_state: str,
+    probe_rc: int,
+    payload_available: bool,
+) -> str:
+    """A working detector is healthy even when it correctly reports an external outage."""
+    if timer_state == "active" and payload_available and probe_rc in {0, 2}:
+        return "ok"
+    if timer_state == "active":
+        return "warn"
+    return "blocked"
+
+
 def _push_inventory_item() -> Dict[str, Any]:
     result = _run(["python3", "scripts/report_push_inventory.py", "--json"], timeout=120, cwd=WORKSPACE)
     try:
@@ -212,14 +247,30 @@ def build_audit() -> Dict[str, Any]:
     ))
 
     dongguan = _run(["python3", "-c", "import json,urllib.request; h={'X-API-Token':'998811','Authorization':'Bearer 998811'}; r=urllib.request.urlopen(urllib.request.Request('http://150.158.31.115:8085/api/stock/positions',headers=h),timeout=8); d=json.loads(r.read().decode()); print(d.get('success'), len(d.get('data') or []))"], timeout=12)
-    degraded_positions = _run(["python3", "main.py", "feishu-query", "/\u6301\u4ed3"], timeout=30, cwd=INVESTOR_DIR)
+    degraded_positions = _run(["python3", "main.py", "risk-report", "--json"], timeout=30, cwd=INVESTOR_DIR)
+    degraded_payload = _json_payload(degraded_positions.get("stdout") or "")
     guojin_probe = _run(["python3", "scripts/qmt2http_remote_recovery.py", "--server", "guojin", "--timeout", "4"], timeout=35, cwd=WORKSPACE)
     guojin_bad = guojin_probe["rc"] == 2
+    holdings_status, fallback_active = _holdings_capability_status(
+        dongguan_reachable=bool(dongguan["ok"]),
+        guojin_probe_rc=int(guojin_probe["rc"]),
+        risk_payload=degraded_payload,
+    )
     items.append(_item(
         "holdings_account_monitor",
-        "blocked" if guojin_bad else ("ok" if dongguan["ok"] else "warn"),
-        [f"dongguan positions reachable={dongguan['ok']}", f"degraded_positions rc={degraded_positions['rc']} has_fallback={'fallback_snapshot' in (degraded_positions['stdout'] or degraded_positions['stderr'])}", f"guojin recovery probe rc={guojin_probe['rc']} ms={guojin_probe['ms']}"],
-        "Guojin qmt2http/miniQMT requires Windows-side recovery; degraded positions fallback uses latest portfolio snapshot while Dongguan realtime remains healthy.",
+        holdings_status,
+        [
+            f"dongguan positions reachable={dongguan['ok']}",
+            f"portfolio risk rc={degraded_positions['rc']} positions={degraded_payload.get('positions_count', 'unknown')}",
+            f"guojin historical fallback active={fallback_active}",
+            f"guojin recovery probe rc={guojin_probe['rc']} ms={guojin_probe['ms']}",
+        ],
+        (
+            "Guojin qmt2http/miniQMT requires Windows-side recovery; the advisor remains available in "
+            "read-only degraded mode with Dongguan realtime and explicitly dated Guojin history."
+            if guojin_bad
+            else "Verify both account sources and keep fallback data explicitly dated."
+        ),
     ))
 
     closing_timer = _systemctl("investor-closing-brief.timer")
@@ -299,11 +350,18 @@ def build_audit() -> Dict[str, Any]:
     if recovered_on_retry:
         health_evidence.append("transient probe failure recovered on read-only retry")
     health_evidence.extend(f"issue={_safe_text(issue)}" for issue in health_issues[:8])
+    diagnostics_status = _diagnostics_capability_status(
+        timer_state=health_timer,
+        probe_rc=int(health_dry["rc"]),
+        payload_available=bool(health_payload),
+    )
+    if diagnostics_status == "ok" and health_dry["rc"] == 2:
+        health_evidence.append("diagnostics operational; external outage is represented by holdings_account_monitor")
     items.append(_item(
         "service_health_diagnostics",
-        "blocked" if health_dry["rc"] == 2 else ("ok" if health_timer == "active" and health_dry["ok"] else "warn"),
+        diagnostics_status,
         health_evidence,
-        "Current blocked state is expected while Guojin qmt2http/miniQMT trade endpoint is unhealthy.",
+        "Keep the health timer active; account endpoint degradation is tracked once under holdings monitoring.",
     ))
 
     assistant_status = _cli_contains(["python3", "main.py", "assistant-status"], "投资助理运行状态", timeout=20)
