@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from domain.services.report_style_service import event_summary_cn, join_cn, money, pct, risk_label, theme_label
 from domain.services.risk_report_service import build_risk_report
 from domain.services.evolution_service import build_evolution_readiness
+from domain.services.portfolio_event_service import rank_portfolio_events
 from domain.services.weekly_report_service import _summarize_intraday_predictions
 
 
@@ -65,23 +66,38 @@ def _audit_summary(reports_dir: Path) -> Dict[str, Any]:
     }
 
 
-def _event_summary(reports_dir: Path) -> Dict[str, Any]:
+def _event_summary(reports_dir: Path, risk: Dict[str, Any] | None = None) -> Dict[str, Any]:
     closing = _load_json(reports_dir / "investor_closing_brief_latest.json")
     event_block = closing.get("events") or {}
     rows = []
-    seen_titles: set[str] = set()
-    for item in event_block.get("top_events") or []:
+    seen_keys: set[str] = set()
+    theme_counts: Dict[tuple[str, ...], int] = {}
+    ranked_events = rank_portfolio_events(
+        event_block.get("top_events") or [],
+        (risk or {}).get("top_positions") or [],
+    )
+    for item in ranked_events:
         themes = [theme_label(theme.get("theme")) for theme in (item.get("themes") or [])[:3]]
         display_title = event_summary_cn(item.get("title"), themes)
-        if display_title in seen_titles:
+        url = str(item.get("url") or "").strip()
+        identity = url if url.startswith(("http://", "https://")) else display_title
+        signature = tuple(sorted(themes))
+        if identity in seen_keys or (signature and theme_counts.get(signature, 0) >= 2):
             continue
-        seen_titles.add(display_title)
+        seen_keys.add(identity)
+        if signature:
+            theme_counts[signature] = theme_counts.get(signature, 0) + 1
         rows.append(
             {
                 "title": display_title,
                 "themes": themes,
                 "published_at": item.get("published_at", ""),
-                "url": item.get("url", ""),
+                "url": url,
+                "portfolio_positions": list(item.get("portfolio_positions") or []),
+                "portfolio_exposure_weight": float(item.get("portfolio_exposure_weight") or 0),
+                "portfolio_relevance": item.get("portfolio_relevance") or "market_wide",
+                "portfolio_priority_score": float(item.get("portfolio_priority_score") or 0),
+                "impact_tone": item.get("impact_tone") or "unclear",
             }
         )
         if len(rows) >= 3:
@@ -89,6 +105,7 @@ def _event_summary(reports_dir: Path) -> Dict[str, Any]:
     return {
         "as_of": closing.get("date") or str(closing.get("generated_at") or "")[:10],
         "events": rows,
+        "portfolio_relevant_count": sum(1 for item in rows if item.get("portfolio_positions")),
     }
 
 
@@ -123,8 +140,25 @@ def _build_actions(risk: Dict[str, Any], decision: Dict[str, Any], events: Dict[
         actions.append({"level": "verify", "text": "重新采集双账户持仓并核对同代码跨账户明细；覆盖完整前不按当前明细计算精确总仓位。"})
     if risk.get("stale_account_sources"):
         actions.append({"level": "verify", "text": "历史账户持仓只用于保持组合连续性；恢复实时接口并逐账户回读后，才能升级到准备层级。"})
-    if events.get("events"):
-        actions.append({"level": "observe", "text": f"跟踪“{events['events'][0]['title']}”的盘前延续性，只在板块与量价同时确认后升级。"})
+    event_rows = events.get("events") or []
+    relevant_event = next((item for item in event_rows if item.get("portfolio_positions")), None)
+    if relevant_event:
+        positions = relevant_event.get("portfolio_positions") or []
+        names = join_cn((str(item.get("name") or item.get("code") or "") for item in positions[:4]), "关联持仓")
+        stale_note = "其中包含历史回退账户，只核验、不据此下单；" if any(item.get("stale") for item in positions) else ""
+        tone = "下行风险" if relevant_event.get("impact_tone") == "downside_risk" else "催化" if relevant_event.get("impact_tone") == "catalyst" else "主题"
+        actions.append(
+            {
+                "level": "observe",
+                "text": (
+                    f"上述首要组合相关事件属于{tone}事件，主题关联 {names}，"
+                    f"占已知组合 {pct(float(relevant_event.get('portfolio_exposure_weight') or 0) * 100)}；"
+                    f"{stale_note}下一交易时段先核验关联板块与个股量价，不按新闻标题直接交易。"
+                ),
+            }
+        )
+    elif event_rows:
+        actions.append({"level": "observe", "text": "跟踪上述首要市场事件的盘前延续性，只在板块与量价同时确认后升级。"})
     if not actions:
         actions.append({"level": "observe", "text": "当前没有达到核验或准备门槛的动作，继续等待新证据。"})
     return actions[:6]
@@ -134,7 +168,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
     current = now or datetime.now()
     risk = build_risk_report()
     audit = _audit_summary(reports_dir)
-    events = _event_summary(reports_dir)
+    events = _event_summary(reports_dir, risk=risk)
     decision = _decision_summary(reports_dir, current)
     intraday = _summarize_intraday_predictions(current.date() - timedelta(days=6), current.date(), reports_dir=reports_dir)
     evolution = build_evolution_readiness(as_of=current.date())
@@ -225,6 +259,18 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     if events.get("events"):
         for item in events.get("events") or []:
             lines.append(f"- **{item.get('title')}**｜{join_cn(item.get('themes') or [], '主题待核验')}")
+            if item.get("portfolio_positions"):
+                position_parts = [
+                    f"{position.get('name') or position.get('code')} {pct(float(position.get('weight') or 0) * 100)}"
+                    for position in (item.get("portfolio_positions") or [])[:4]
+                ]
+                stale_note = "；含历史回退账户" if any(
+                    position.get("stale") for position in item.get("portfolio_positions") or []
+                ) else ""
+                lines.append(
+                    f"  组合主题关联：{join_cn(position_parts)}，"
+                    f"合计 {pct(float(item.get('portfolio_exposure_weight') or 0) * 100)}{stale_note}。"
+                )
         lines.append(f"- 事件来源于最近收盘简报，数据日 {events.get('as_of') or '未知'}；开盘后仍需验证板块和量价。")
     else:
         lines.append("- 最近收盘简报没有通过质量门槛的事件，不为凑数生成主题。")
