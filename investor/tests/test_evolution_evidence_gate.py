@@ -1,3 +1,6 @@
+from datetime import datetime
+
+import db
 from domain.services import evolution_service as service
 
 
@@ -40,6 +43,80 @@ def test_bounded_normalize_preserves_sum_and_bounds():
     )
     assert sum(result.values()) == 1.0
     assert all(0.10 <= value <= 0.60 for value in result.values())
+
+
+def test_unprofiled_legacy_samples_do_not_unlock_evolution():
+    perf = [
+        {"strategy_used": "technical", "total": 30, "profiled_total": 0},
+        {"strategy_used": "sentiment", "total": 20, "profiled_total": 0},
+    ]
+
+    evidence = service._performance_evidence(perf, _config())
+
+    assert evidence["ready"] is False
+    assert evidence["total"] == 0
+
+
+def test_two_profiled_strategy_chains_make_evolution_gate_reachable():
+    perf = [
+        {
+            "strategy_used": "technical",
+            "profiled_total": 12,
+            "profiled_correct": 7,
+            "profiled_win_rate": 58.3,
+            "evidence_profiles": "technical_price_regime_v1",
+        },
+        {
+            "strategy_used": "sentiment",
+            "profiled_total": 12,
+            "profiled_correct": 6,
+            "profiled_win_rate": 50.0,
+            "evidence_profiles": "sentiment_flow_news_v1",
+        },
+    ]
+
+    evidence = service._performance_evidence(perf, _config())
+
+    assert evidence["ready"] is True
+    assert evidence["total"] == 24
+    assert evidence["eligible_strategies"] == ["technical", "sentiment"]
+    assert evidence["evidence_profiles"]["technical"] == "technical_price_regime_v1"
+
+
+def test_persisted_profiled_samples_reach_gate_without_legacy_rows(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "investor.db"))
+    db.init_db()
+    for strategy, profile in (
+        ("technical", "technical_price_regime_v1"),
+        ("sentiment", "sentiment_flow_news_v1"),
+    ):
+        for index in range(12):
+            prediction_id = db.add_prediction(
+                target=f"target-{index % 3}",
+                direction="neutral",
+                confidence=0.5,
+                strategy_used=strategy,
+                model_used="test",
+                actual_price=100,
+                trend_3d="ranging",
+                evidence_profile=profile,
+                prediction_run_id=f"run-{index // 3}",
+            )
+            db.update_prediction_result(
+                prediction_id,
+                actual_price=100,
+                actual_change=0,
+                is_correct=index % 2 == 0,
+                score=60,
+            )
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    performance = db.get_strategy_performance(today, today)
+    evidence = service._performance_evidence(performance, _config())
+
+    assert evidence["ready"] is True
+    assert evidence["total"] == 24
+    assert set(evidence["eligible_strategies"]) == {"technical", "sentiment"}
 
 
 def test_evolve_labels_zero_sample_run_as_audit_not_evolution(monkeypatch):

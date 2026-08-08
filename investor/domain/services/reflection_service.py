@@ -37,7 +37,8 @@ def weekly_attribution(date: Optional[str] = None) -> Dict:
     for sp in strategy_perf:
         print(
             f"  - {sp['strategy_used']}: 胜率 {sp['win_rate']}%, "
-            f"共 {sp['total']} 次预测, 正确 {sp['correct']} 次"
+            f"共 {sp['total']} 次预测, 正确 {sp['correct']} 次, "
+            f"证据链 {sp.get('evidence_profiles') or '历史未标注'}"
         )
 
     predictions = repo.get_checked_predictions_in_range(start_date, end_date)

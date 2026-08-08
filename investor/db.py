@@ -33,6 +33,8 @@ def _migrate_prediction_log_columns(conn: sqlite3.Connection):
         ("buy_point", "REAL"),
         ("sell_point", "REAL"),
         ("stop_loss", "REAL"),
+        ("evidence_profile", "TEXT"),
+        ("prediction_run_id", "TEXT"),
     ]
     existing = {row[1] for row in conn.execute("PRAGMA table_info(prediction_log)")}
     for col_name, col_type in new_cols:
@@ -328,6 +330,8 @@ def add_prediction(target: str, direction: str, confidence: float,
                    buy_point: float = None,
                    sell_point: float = None,
                    stop_loss: float = None,
+                   evidence_profile: str = "",
+                   prediction_run_id: str = "",
                    ) -> int:
     conn = get_conn()
     cur = conn.execute(
@@ -335,18 +339,34 @@ def add_prediction(target: str, direction: str, confidence: float,
            (target, target_name, direction, confidence, reasoning, strategy_used,
             model_used, timeframe, predicted_change, actual_price_at_predict,
             trend_3d, predicted_return_3d, kline_day1, kline_day2, kline_day3,
-            buy_point, sell_point, stop_loss)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            buy_point, sell_point, stop_loss, evidence_profile, prediction_run_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (target, target_name, direction, confidence, reasoning, strategy_used,
          model_used, timeframe, predicted_change, actual_price,
          trend_3d, predicted_return_3d,
          kline_day1, kline_day2, kline_day3,
-         buy_point, sell_point, stop_loss),
+         buy_point, sell_point, stop_loss, evidence_profile, prediction_run_id),
     )
     conn.commit()
     pid = cur.lastrowid
     conn.close()
     return pid
+
+
+def get_prediction_keys_for_date(created_date: str) -> set[tuple[str, str, str]]:
+    """Return persisted (target, strategy, timeframe) keys for idempotent runs."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT target, strategy_used, timeframe
+           FROM prediction_log
+           WHERE date(created_at)=date(?)""",
+        (created_date,),
+    ).fetchall()
+    conn.close()
+    return {
+        (str(row["target"] or ""), str(row["strategy_used"] or ""), str(row["timeframe"] or "3d"))
+        for row in rows
+    }
 
 
 def update_prediction_result(pred_id: int, actual_price: float,
@@ -919,6 +939,7 @@ def get_strategy_performance(start: str, end: str) -> List[Dict]:
            ),
            merged AS (
                SELECT p.strategy_used AS strategy_used,
+                      COALESCE(p.evidence_profile, '') AS evidence_profile,
                       COALESCE(le.is_correct, p.is_correct) AS is_correct,
                       COALESCE(le.score, p.score) AS score
                FROM prediction_log p
@@ -931,7 +952,12 @@ def get_strategy_performance(start: str, end: str) -> List[Dict]:
                   COUNT(*) as total,
                   SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END) as correct,
                   ROUND(AVG(CASE WHEN is_correct IS NOT NULL THEN is_correct ELSE NULL END) * 100, 1) as win_rate,
-                  ROUND(AVG(score), 1) as avg_score
+                  ROUND(AVG(score), 1) as avg_score,
+                  SUM(CASE WHEN evidence_profile != '' THEN 1 ELSE 0 END) AS profiled_total,
+                  SUM(CASE WHEN evidence_profile != '' AND is_correct=1 THEN 1 ELSE 0 END) AS profiled_correct,
+                  ROUND(AVG(CASE WHEN evidence_profile != '' THEN is_correct ELSE NULL END) * 100, 1) AS profiled_win_rate,
+                  ROUND(AVG(CASE WHEN evidence_profile != '' THEN score ELSE NULL END), 1) AS profiled_avg_score,
+                  GROUP_CONCAT(DISTINCT NULLIF(evidence_profile, '')) AS evidence_profiles
            FROM merged
            GROUP BY strategy_used""",
         (start, end),

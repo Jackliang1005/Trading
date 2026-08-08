@@ -52,6 +52,25 @@ def test_historical_position_code_strips_exchange_suffix(monkeypatch):
     assert rows[0]["close"] == 10.5
 
 
+def test_tencent_index_quote_fallback_parses_canonical_codes(monkeypatch):
+    payload = (
+        'v_s_sh000001="1~上证指数~000001~3940.04~39.69~1.02~100~200~~0~ZS~";\n'
+        'v_s_sz399001="51~深证成指~399001~14311.01~200.89~1.42~300~400~~0~ZS~";\n'
+    ).encode("gbk")
+
+    class Response:
+        def read(self):
+            return payload
+
+    monkeypatch.setattr(data_collector.urllib.request, "urlopen", lambda request, timeout: Response())
+
+    rows = data_collector.fetch_tencent_index_quotes(["sh000001", "sz399001"])
+
+    assert [row["code"] for row in rows] == ["sh000001", "sz399001"]
+    assert rows[0]["price"] == 3940.04
+    assert rows[0]["source"] == "tencent-index-quote"
+
+
 def test_backtest_waits_for_three_actual_trading_bars(monkeypatch):
     predictions = [
         {

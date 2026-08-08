@@ -76,11 +76,12 @@ def format_weekly_report(report: Dict) -> str:
 
     if report.get("strategy_performance"):
         lines.append("## 策略表现")
-        lines.append("| 策略 | 总数 | 正确 | 胜率 | 平均分 |")
-        lines.append("|------|------|------|------|--------|")
+        lines.append("| 策略 | 证据链 | 总数 | 正确 | 胜率 | 平均分 |")
+        lines.append("|------|--------|------|------|------|--------|")
         for sp in report["strategy_performance"]:
             lines.append(
-                f"| {sp.get('strategy_used', '-')} | {sp.get('total', 0)} | "
+                f"| {sp.get('strategy_used', '-')} | {sp.get('evidence_profiles') or '历史未标注'} | "
+                f"{sp.get('total', 0)} | "
                 f"{sp.get('correct', 0)} | {sp.get('win_rate', 0)}% | {sp.get('avg_score', 0)} |"
             )
         lines.append("")

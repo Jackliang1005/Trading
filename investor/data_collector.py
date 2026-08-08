@@ -203,6 +203,62 @@ def fetch_qmt_realtime(codes: List[str] = None) -> List[Dict]:
     return quotes
 
 
+def fetch_tencent_index_quotes(codes: List[str] = None) -> List[Dict]:
+    """Fetch compact index quotes from Tencent as an independent public fallback."""
+    if codes is None:
+        codes = list(QMT_INDEX_CODES.keys())
+    requested = [str(code).strip().lower() for code in codes if str(code).strip()]
+    if not requested:
+        return []
+    query_codes = ",".join(f"s_{code}" for code in requested)
+    url = f"https://qt.gtimg.cn/q={urllib.parse.quote(query_codes, safe=',_')}"
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://stockapp.finance.qq.com/"},
+        )
+        raw = urllib.request.urlopen(request, timeout=8).read().decode("gbk", errors="replace")
+    except Exception as exc:
+        print(f"  ⚠️ 腾讯指数行情失败: {exc}")
+        return []
+
+    quotes = []
+    for line in raw.splitlines():
+        if "=\"" not in line:
+            continue
+        variable, payload = line.split("=\"", 1)
+        code = variable.rsplit("s_", 1)[-1].strip().lower()
+        fields = payload.rstrip('";').split("~")
+        if code not in requested or len(fields) < 8:
+            continue
+        try:
+            price = float(fields[3] or 0)
+            change = float(fields[4] or 0)
+            change_percent = float(fields[5] or 0)
+            volume = float(fields[6] or 0)
+            amount = float(fields[7] or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        quotes.append(
+            {
+                "code": code,
+                "name": fields[1] or code,
+                "price": price,
+                "open": 0,
+                "high": 0,
+                "low": 0,
+                "pre_close": round(price - change, 4) if price and change else 0,
+                "volume": volume,
+                "amount": amount,
+                "change_percent": change_percent,
+                "source": "tencent-index-quote",
+            }
+        )
+    return quotes
+
+
 def fetch_qmt_account() -> Dict:
     """获取 QMT 实盘账户资产（从两个服务器获取）"""
     try:
@@ -260,23 +316,40 @@ SKILLS_DIR = os.path.join(os.path.dirname(__file__), "..", "skills")
 
 
 def fetch_market_quotes(codes: str = "sh000001,sz399001,sz399006,sh000688") -> List[Dict]:
-    """获取主要指数行情，优先 openclaw-data-china-stock，回退 eastmoney-quotes。"""
+    """获取主要指数行情，按独立数据源逐级补齐缺失标的。"""
     code_list = [c.strip() for c in codes.split(",") if c.strip()]
-    plugin_quotes = fetch_openclaw_realtime(code_list)
-    if plugin_quotes:
-        return plugin_quotes
+    quotes_by_code: Dict[str, Dict] = {}
+    for quote in fetch_openclaw_realtime(code_list):
+        code = str(quote.get("code", "")).strip().lower()
+        if code in code_list and float(quote.get("price", 0) or 0) > 0:
+            quotes_by_code[code] = quote
+
+    missing = [code for code in code_list if code not in quotes_by_code]
+    if missing:
+        for quote in fetch_tencent_index_quotes(missing):
+            code = str(quote.get("code", "")).strip().lower()
+            if code in missing:
+                quotes_by_code[code] = quote
+
+    missing = [code for code in code_list if code not in quotes_by_code]
+    if not missing:
+        return [quotes_by_code[code] for code in code_list]
 
     script = os.path.join(SKILLS_DIR, "eastmoney-quotes", "eastmoney_quotes.py")
     if not os.path.exists(script):
         print(f"⚠️ eastmoney-quotes skill 未找到: {script}")
-        return []
+        return [quotes_by_code[code] for code in code_list if code in quotes_by_code]
     try:
         sys.path.insert(0, os.path.join(SKILLS_DIR, "eastmoney-quotes"))
         from eastmoney_quotes import get_quotes
-        return get_quotes(code_list)
+        for quote in get_quotes(missing):
+            code = str(quote.get("code", "")).strip().lower()
+            if code in missing and not quote.get("error") and float(quote.get("price", 0) or 0) > 0:
+                quotes_by_code[code] = quote
+        return [quotes_by_code[code] for code in code_list if code in quotes_by_code]
     except Exception as e:
         print(f"❌ 获取行情失败: {e}")
-        return []
+        return [quotes_by_code[code] for code in code_list if code in quotes_by_code]
 
 
 def fetch_market_flow(code: str = "sh000001") -> Dict:

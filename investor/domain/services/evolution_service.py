@@ -106,11 +106,18 @@ def _bounded_normalize(weights: Dict[str, float], min_weight: float, max_weight:
 
 
 def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
-    total = sum(int(item.get("total") or 0) for item in perf)
+    def profiled(item: Dict, field: str, fallback: str):
+        value = item.get(field)
+        return item.get(fallback) if value is None else value
+
+    total = sum(int(profiled(item, "profiled_total", "total") or 0) for item in perf)
     min_total = int(config.get("min_evolution_samples", 20) or 20)
     min_per_strategy = int(config.get("min_strategy_samples", 5) or 5)
     min_strategies = int(config.get("min_evolution_strategies", 2) or 2)
-    eligible = [item for item in perf if int(item.get("total") or 0) >= min_per_strategy]
+    eligible = [
+        item for item in perf
+        if int(profiled(item, "profiled_total", "total") or 0) >= min_per_strategy
+    ]
     reasons = []
     if total < min_total:
         reasons.append(f"已验证样本 {total}/{min_total}")
@@ -123,6 +130,10 @@ def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
         "minimum_per_strategy": min_per_strategy,
         "minimum_strategies": min_strategies,
         "eligible_strategies": [str(item.get("strategy_used") or "") for item in eligible],
+        "evidence_profiles": {
+            str(item.get("strategy_used") or ""): str(item.get("evidence_profiles") or "legacy-unprofiled")
+            for item in eligible
+        },
         "reasons": reasons,
     }
 
@@ -160,9 +171,13 @@ def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
 
     old_weights = config["weights"].copy()
     eligible_perf = [p for p in perf if str(p.get("strategy_used") or "") in evidence["eligible_strategies"]]
-    eligible_total = sum(int(p.get("total") or 0) for p in eligible_perf)
+    def metric(item: Dict, profiled_field: str, fallback_field: str):
+        value = item.get(profiled_field)
+        return item.get(fallback_field) if value is None else value
+
+    eligible_total = sum(int(metric(p, "profiled_total", "total") or 0) for p in eligible_perf)
     pooled_win_rate = (
-        sum(int(p.get("correct") or 0) for p in eligible_perf) / eligible_total * 100
+        sum(int(metric(p, "profiled_correct", "correct") or 0) for p in eligible_perf) / eligible_total * 100
         if eligible_total
         else 50.0
     )
@@ -174,7 +189,8 @@ def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
 
     for p in eligible_perf:
         name = p.get("strategy_used", "")
-        win_rate = p.get("win_rate", 50) or 50
+        win_rate = metric(p, "profiled_win_rate", "win_rate")
+        win_rate = 50 if win_rate is None else float(win_rate)
         if name in config["weights"]:
             if win_rate > pooled_win_rate + 5:
                 adjustments[name] = step

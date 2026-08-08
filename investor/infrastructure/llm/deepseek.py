@@ -13,12 +13,17 @@ SYSTEM_ROLE_TEXT = (
 )
 
 
-def call_deepseek_chat(prompt: str, api_key: str, model: str = "deepseek-chat") -> str:
+def call_deepseek_chat(
+    prompt: str,
+    api_key: str,
+    model: str = "deepseek-chat",
+    system_role: str = "",
+) -> str:
     url = "https://api.deepseek.com/chat/completions"
     body = {
         "model": model or "deepseek-chat",
         "messages": [
-            {"role": "system", "content": SYSTEM_ROLE_TEXT},
+            {"role": "system", "content": system_role or SYSTEM_ROLE_TEXT},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
@@ -36,4 +41,3 @@ def call_deepseek_chat(prompt: str, api_key: str, model: str = "deepseek-chat") 
     with urllib.request.urlopen(req, timeout=60) as resp:
         result = json.loads(resp.read())
     return result["choices"][0]["message"]["content"]
-

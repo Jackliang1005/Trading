@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, List, Sequence
 
 import db
@@ -19,6 +20,7 @@ PREDICTION_TARGETS = [
 
 # 最大持仓预测数（避免 prompt 过长）
 MAX_POSITION_PREDICTION_TARGETS = 15
+PREDICTION_SOURCE_PRICE_TOLERANCE = 0.05
 
 
 def get_position_prediction_targets() -> list:
@@ -77,6 +79,91 @@ def get_all_prediction_targets(include_positions: bool = True) -> list:
     return targets
 
 
+def _canonical_prediction_code(value: str) -> str:
+    code = str(value or "").strip()
+    if code.lower().startswith(("sh", "sz")):
+        return code.lower()
+    if "." in code:
+        stem, suffix = code.split(".", 1)
+        return f"{stem}.{suffix.upper()}"
+    return code
+
+
+def get_trusted_prediction_prices(snapshot_data: Dict) -> Dict[str, float]:
+    """Extract source prices used to reject copied examples and hallucinated anchors."""
+    prices: Dict[str, float] = {}
+    for quote in snapshot_data.get("quotes", []) or []:
+        if not isinstance(quote, dict) or quote.get("error"):
+            continue
+        code = _canonical_prediction_code(quote.get("code", ""))
+        try:
+            price = float(quote.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if code and price > 0:
+            prices[code] = price
+    for position in snapshot_data.get("qmt_positions", snapshot_data.get("positions", [])) or []:
+        if not isinstance(position, dict):
+            continue
+        code = _canonical_prediction_code(position.get("stock_code", position.get("code", "")))
+        try:
+            price = float(position.get("current_price", position.get("last_price", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if code and price > 0:
+            prices[code] = price
+    return prices
+
+
+def sanitize_strategy_predictions(
+    predictions: Sequence[Dict],
+    targets: Sequence[Dict],
+    snapshot_data: Dict,
+    strategy_name: str,
+    evidence_profile: str,
+    model_used: str,
+    prediction_run_id: str,
+) -> List[Dict]:
+    """Whitelist targets and bind every sample to one explicit evidence chain."""
+    allowed = {
+        _canonical_prediction_code(item.get("code", "")): item
+        for item in targets
+        if item.get("code")
+    }
+    trusted_prices = get_trusted_prediction_prices(snapshot_data)
+    sanitized: List[Dict] = []
+    seen = set()
+    for raw in predictions:
+        if not isinstance(raw, dict):
+            continue
+        code = _canonical_prediction_code(raw.get("code", ""))
+        if code not in allowed or code in seen:
+            continue
+        source_price = trusted_prices.get(code, 0)
+        try:
+            predicted_price = float(raw.get("current_price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if source_price <= 0 or predicted_price <= 0:
+            continue
+        deviation = abs(predicted_price - source_price) / source_price
+        if deviation > PREDICTION_SOURCE_PRICE_TOLERANCE:
+            continue
+        target = allowed[code]
+        item = dict(raw)
+        item["code"] = str(target.get("code") or code)
+        item["name"] = str(target.get("name") or item["code"])
+        item["prediction_type"] = str(target.get("prediction_type") or "index")
+        item["current_price"] = source_price
+        item["strategy_used"] = strategy_name
+        item["evidence_profile"] = evidence_profile
+        item["model_used"] = model_used
+        item["prediction_run_id"] = prediction_run_id
+        sanitized.append(item)
+        seen.add(code)
+    return sanitized
+
+
 def _merge_packet_data(payload: Dict, packet: Dict | None) -> Dict:
     if not packet:
         return payload
@@ -86,6 +173,41 @@ def _merge_packet_data(payload: Dict, packet: Dict | None) -> Dict:
     merged = dict(payload)
     merged.update(data)
     return merged
+
+
+def _hydrate_prediction_quotes(payload: Dict) -> Dict:
+    """Fill missing/error index quotes before any prediction is allowed to persist."""
+    hydrated = dict(payload)
+    requested_codes = [str(item["code"]) for item in PREDICTION_TARGETS]
+    valid_by_code: Dict[str, Dict] = {}
+    for quote in hydrated.get("quotes", []) or []:
+        if not isinstance(quote, dict) or quote.get("error"):
+            continue
+        code = _canonical_prediction_code(quote.get("code", ""))
+        try:
+            price = float(quote.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if code in requested_codes and price > 0:
+            valid_by_code[code] = quote
+    missing = [code for code in requested_codes if code not in valid_by_code]
+    if missing:
+        for quote in fetch_market_quotes(",".join(missing)):
+            if not isinstance(quote, dict) or quote.get("error"):
+                continue
+            code = _canonical_prediction_code(quote.get("code", ""))
+            try:
+                price = float(quote.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if code in missing and price > 0:
+                valid_by_code[code] = quote
+    hydrated["quotes"] = [valid_by_code[code] for code in requested_codes if code in valid_by_code]
+    hydrated["_quote_sources"] = sorted(
+        {str(quote.get("source") or "unknown") for quote in hydrated["quotes"]}
+    )
+    hydrated["_quote_coverage"] = f"{len(valid_by_code)}/{len(requested_codes)}"
+    return hydrated
 
 
 def load_prediction_snapshot_data() -> Dict:
@@ -107,7 +229,7 @@ def load_prediction_snapshot_data() -> Dict:
     if packet_hits > 0:
         payload["_source"] = "research_packets"
         payload["_packet_hits"] = packet_hits
-        return payload
+        return _hydrate_prediction_quotes(payload)
 
     latest = db.get_latest_snapshot("daily_close")
     if latest:
@@ -116,7 +238,7 @@ def load_prediction_snapshot_data() -> Dict:
             snapshot_data = dict(snapshot_data)
             snapshot_data["_source"] = "market_snapshots"
             snapshot_data["_captured_at"] = latest.get("captured_at", "")
-            return snapshot_data
+            return _hydrate_prediction_quotes(snapshot_data)
     return {}
 
 
@@ -269,12 +391,22 @@ def _get_strategy_distribution() -> dict:
     return mapping
 
 
-def save_predictions(predictions: List[Dict], model: str) -> List[int]:
+def save_predictions(predictions: List[Dict], model: str, run_date: str | None = None) -> List[int]:
     """Persist predictions and return inserted ids."""
     import json as _json
 
     pred_ids: List[int] = []
+    created_date = run_date or datetime.now().strftime("%Y-%m-%d")
+    existing_keys = db.get_prediction_keys_for_date(created_date)
     for item in predictions:
+        key = (
+            str(item.get("code") or ""),
+            str(item.get("strategy_used") or "technical"),
+            str(item.get("timeframe") or "3d"),
+        )
+        if key in existing_keys:
+            item["_persist_status"] = "duplicate"
+            continue
         current_price = float(item.get("current_price", 0) or 0)
         if current_price <= 0:
             quotes = fetch_market_quotes(item["code"])
@@ -293,7 +425,7 @@ def save_predictions(predictions: List[Dict], model: str) -> List[int]:
             confidence=item["confidence"],
             reasoning=item.get("reasoning", ""),
             strategy_used=item.get("strategy_used", "technical"),
-            model_used=model,
+            model_used=item.get("model_used", model),
             predicted_change=item.get("predicted_change"),
             actual_price=current_price,
             trend_3d=item.get("trend_3d"),
@@ -304,6 +436,11 @@ def save_predictions(predictions: List[Dict], model: str) -> List[int]:
             buy_point=item.get("buy_point"),
             sell_point=item.get("sell_point"),
             stop_loss=item.get("stop_loss"),
+            evidence_profile=item.get("evidence_profile", ""),
+            prediction_run_id=item.get("prediction_run_id", ""),
         )
         pred_ids.append(pid)
+        existing_keys.add(key)
+        item["_persist_status"] = "saved"
+        item["_prediction_id"] = pid
     return pred_ids

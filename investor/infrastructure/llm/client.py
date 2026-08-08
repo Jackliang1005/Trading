@@ -49,15 +49,18 @@ def resolve_available_provider() -> Tuple[str, str]:
     return "", ""
 
 
-def call_prediction_llm(prompt: str, model: str = "deepseek/deepseek-chat") -> str:
+def call_prediction_llm(
+    prompt: str,
+    model: str = "deepseek/deepseek-chat",
+    system_role: str = "",
+) -> str:
     provider, key = resolve_available_provider()
     if provider == "deepseek":
         # DeepSeek 官方 endpoint 只接受 deepseek-chat / deepseek-reasoner.
         model_name = "deepseek-chat"
         if model in {"deepseek-chat", "deepseek-reasoner"}:
             model_name = model
-        return call_deepseek_chat(prompt, key, model=model_name)
+        return call_deepseek_chat(prompt, key, model=model_name, system_role=system_role)
     if provider == "openrouter":
-        return call_openrouter_chat(prompt, key, model=model)
+        return call_openrouter_chat(prompt, key, model=model, system_role=system_role)
     raise RuntimeError("no available llm api key")
-

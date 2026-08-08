@@ -319,14 +319,23 @@ def _load_sector_rotation_context() -> Dict:
 
 def build_prediction_context(snapshot_data: Dict) -> Dict:
     sector_context = _load_sector_rotation_context()
-    return {
-        "source_summary": (
+    if snapshot_data.get("_source") == "research_packets":
+        source_summary = (
+            f"source=research_packets, packet_hits={snapshot_data.get('_packet_hits', 0)}"
+        )
+    else:
+        source_summary = (
             f"source={snapshot_data.get('_source', 'unknown')}, "
-            f"packet_hits={snapshot_data.get('_packet_hits', 0)}"
-            if snapshot_data.get("_source") == "research_packets"
-            else f"source={snapshot_data.get('_source', 'unknown')}, "
             f"captured_at={snapshot_data.get('_captured_at', '')}"
-        ),
+        )
+    if snapshot_data.get("_quote_coverage"):
+        quote_sources = ",".join(snapshot_data.get("_quote_sources", []) or ["unknown"])
+        source_summary += (
+            f", quote_coverage={snapshot_data.get('_quote_coverage')}, "
+            f"quote_sources={quote_sources}"
+        )
+    return {
+        "source_summary": source_summary,
         "quotes_str": _format_quotes(snapshot_data),
         "flow_str": json.dumps(snapshot_data.get("flow", {}), ensure_ascii=False)[:500]
         if snapshot_data.get("flow")
@@ -370,9 +379,42 @@ def build_market_context_text(snapshot_data: Dict) -> str:
     return "\n".join(sections).strip()
 
 
-def build_prediction_prompt(snapshot_data: Dict, rag_context: str, few_shot: str, system_prompt: str) -> str:
+def build_prediction_prompt(
+    snapshot_data: Dict,
+    rag_context: str,
+    few_shot: str,
+    system_prompt: str,
+    targets: List[Dict] | None = None,
+    strategy_name: str = "",
+    strategy_focus: str = "",
+) -> str:
     """Construct LLM prediction prompt."""
     context = build_prediction_context(snapshot_data)
+    hidden = "[本策略证据隔离：不可见]"
+    if strategy_name == "technical":
+        for key in (
+            "flow_str",
+            "sectors_str",
+            "news_str",
+            "global_str",
+            "commodity_str",
+            "macro_str",
+            "hot_sectors_str",
+            "us_sectors_str",
+            "us_stocks_str",
+            "rotation_str",
+        ):
+            context[key] = hidden
+    elif strategy_name == "sentiment":
+        for key in (
+            "regime_str",
+            "openclaw_str",
+            "account_str",
+            "positions_str",
+            "trades_str",
+            "pending_str",
+        ):
+            context[key] = hidden
     quotes_str = context["quotes_str"]
     flow_str = context["flow_str"]
     sectors_str = context["sectors_str"]
@@ -393,7 +435,7 @@ def build_prediction_prompt(snapshot_data: Dict, rag_context: str, few_shot: str
     source_summary = context["source_summary"]
 
     template = Template(_load_market_prediction_template())
-    return template.safe_substitute(
+    base_prompt = template.safe_substitute(
         source_summary=source_summary,
         quotes_str=quotes_str or "无数据",
         flow_str=flow_str or "无数据",
@@ -416,3 +458,30 @@ def build_prediction_prompt(snapshot_data: Dict, rag_context: str, few_shot: str
         few_shot=few_shot or "",
         system_prompt=system_prompt or "",
     )
+    target_items = targets or []
+    task_lines = []
+    if target_items:
+        allowed = ", ".join(
+            f"{item.get('code', '')}({item.get('name', item.get('code', ''))})"
+            for item in target_items
+        )
+        task_lines.extend(
+            [
+                "## 本轮预测边界（高优先级）",
+                f"- 只允许输出这些标的：{allowed}",
+                "- 每个允许标的最多输出一条；禁止新增、改写或猜测代码。",
+                "- 必须使用输入数据中的真实当前价，禁止复制 JSON 示例里的价格。",
+            ]
+        )
+    if strategy_name:
+        task_lines.append(f"- 本轮唯一策略为 `{strategy_name}`，所有 strategy_used 必须等于该值。")
+    if strategy_focus:
+        task_lines.append(f"- 策略证据边界：{strategy_focus}")
+
+    prompt_parts = []
+    if system_prompt and system_prompt.strip():
+        prompt_parts.extend(["## 已验证进化规则", system_prompt.strip()])
+    prompt_parts.append(base_prompt)
+    if task_lines:
+        prompt_parts.append("\n".join(task_lines))
+    return "\n\n".join(prompt_parts)
