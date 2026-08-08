@@ -32,6 +32,7 @@ from domain.services.longterm_portfolio_service import (
 from workflows.scheduled_briefings import run_scheduled_briefing
 from domain.services.event_service import build_global_event_brief, format_global_event_brief
 from domain.services.weekly_report_service import build_weekly_report
+from domain.services.evolution_service import EVOLUTION_EVIDENCE_PROFILES, build_evolution_readiness
 from domain.services.risk_report_service import build_risk_report
 from domain.services.morning_brief_service import build_morning_brief
 from domain.services.closing_brief_service import build_closing_brief
@@ -687,42 +688,104 @@ def _query_unified_health(accounts: List[str], token: str) -> str:
     return "\n\n".join(section for section in sections if section)
 
 
-def _query_predictions() -> str:
-    """查询最近预测结果与胜率。"""
+def _query_predictions(as_of: date | None = None) -> str:
+    """查询预测验真证据，并隔离旧版、异常与未成熟样本。"""
     import db as db_mod
 
-    from datetime import datetime, timedelta
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    end_day = as_of or date.today()
+    end_date = end_day.isoformat()
+    start_date = (end_day - timedelta(days=6)).isoformat()
     checked = db_mod.get_checked_predictions_in_range(start_date, end_date)
-    unchecked = db_mod.get_unchecked_predictions(before_date=end_date)
+    activity = db_mod.get_prediction_validation_activity(end_date)
+    evolution = build_evolution_readiness(as_of=end_day)
 
-    lines = ["📊 预测验证概览", f"统计区间：{start_date} 至 {end_date}", "", "**结论**"]
-    if checked:
-        total = len(checked)
-        correct = sum(1 for p in checked if p.get("is_correct"))
-        win_rate = correct / total * 100 if total else 0
-        if total < 5:
-            lines.append(f"- 已完成 {total} 条预测验证，其中 {correct} 条方向正确；样本不足 5 条，暂不把胜率作为有效评价。")
-        else:
-            lines.append(f"- 已完成 {total} 条预测验证，其中 {correct} 条方向正确，历史胜率 {win_rate:.0f}%。")
+    def is_profiled(row: Dict) -> bool:
+        strategy = str(row.get("strategy_used") or "").strip()
+        profile = str(row.get("evidence_profile") or "").strip()
+        run_id = str(row.get("prediction_run_id") or "").strip()
+        return bool(run_id and profile and profile == EVOLUTION_EVIDENCE_PROFILES.get(strategy))
 
-        # 按标的分组
-        lines.extend(["", "**按标的拆分**"])
-        by_target = {}
-        for pred in checked:
-            name = pred.get("target_name", pred.get("target", "?"))
-            by_target.setdefault(name, []).append(pred)
-        for name, preds in sorted(by_target.items()):
-            items = len(preds)
-            won = sum(1 for p in preds if p.get("is_correct"))
-            lines.append(f"- {name}：{won}/{items} 条方向正确。" if items else f"- {name}：暂无可验证数据。")
+    profiled = [row for row in checked if is_profiled(row)]
+    legacy = [row for row in checked if not is_profiled(row)]
+    lines = ["📊 策略预测验真", f"近 7 个自然日生成样本：{start_date} 至 {end_date}", "", "**当前结论**"]
+    if evolution.get("ready"):
+        lines.append(
+            f"- 当前策略证据已达到比较门槛：画像化成熟样本 "
+            f"{int(evolution.get('total', 0) or 0)}/{int(evolution.get('minimum_total', 20) or 20)}，"
+            f"合格策略 {len(evolution.get('eligible_strategies') or [])}/{int(evolution.get('minimum_strategies', 2) or 2)}。"
+        )
     else:
-        lines.append("- 近 7 天没有完成回测的预测，因此无法计算可靠胜率。")
+        lines.append(
+            f"- 当前策略仍在采样：画像化成熟样本 "
+            f"{int(evolution.get('total', 0) or 0)}/{int(evolution.get('minimum_total', 20) or 20)}；"
+            "门槛未达成，不输出策略胜率，也不据此调整权重。"
+        )
 
-    if unchecked:
-        lines.extend(["", "**等待验证**", f"- 还有 {len(unchecked)} 条预测尚未到验证时间或缺少对应行情。"])
-    lines.extend(["", "**边界**", "- 未完成验证的预测不计入胜率；历史正确率也不代表下一次预测一定正确。"])
+    lines.extend(["", "**当前证据链**"])
+    strategy_labels = {"technical": "技术", "sentiment": "情绪", "fundamental": "基本面", "geopolitical": "地缘"}
+    strategies = evolution.get("strategies") or []
+    if strategies:
+        for item in strategies:
+            strategy = str(item.get("strategy") or "未知")
+            pending = int(item.get("pending", 0) or 0)
+            pending_text = f"，待成熟 {pending}" if pending else ""
+            lines.append(
+                f"- {strategy_labels.get(strategy, strategy)}：成熟验真 "
+                f"{int(item.get('verified', 0) or 0)}/{int(item.get('minimum', 0) or 0)}{pending_text}。"
+            )
+    else:
+        lines.append("- 尚未形成可归属到当前证据画像的成熟样本。")
+    lines.append(f"- 成熟规则：{evolution.get('maturity_rule') or '样本走满验证窗口并通过价格锚点校验后才计入'}。")
+
+    lines.extend(["", "**近 7 日样本审计**"])
+    if profiled:
+        correct = sum(1 for row in profiled if row.get("is_correct"))
+        if evolution.get("ready"):
+            rate = correct / len(profiled) * 100
+            lines.append(f"- 当前画像化样本 {len(profiled)} 条，方向正确 {correct} 条，正确率 {rate:.1f}%。")
+        else:
+            lines.append(
+                f"- 当前画像化样本 {len(profiled)} 条，方向正确 {correct} 条；"
+                "整体证据门槛未达成，暂不换算正确率。"
+            )
+    else:
+        lines.append("- 当前画像化证据链没有新增成熟验真样本。")
+    if legacy:
+        correct = sum(1 for row in legacy if row.get("is_correct"))
+        lines.append(
+            f"- 旧版或未画像化样本 {len(legacy)} 条，方向正确 {correct} 条；"
+            "仅作迁移审计，不代表升级后策略质量。"
+        )
+    elif not checked:
+        lines.append("- 本区间没有完成验真的历史样本。")
+
+    processed = int(activity.get("activity_processed", 0) or 0)
+    evaluated = int(activity.get("activity_evaluated", 0) or 0)
+    legacy_evaluated = int(activity.get("activity_legacy_evaluated", 0) or 0)
+    profiled_evaluated = int(activity.get("activity_profiled_evaluated", 0) or 0)
+    unscorable = int(activity.get("activity_unscorable", 0) or 0)
+    pending = int(activity.get("pending", 0) or 0)
+    lines.extend(["", "**今日验真作业**"])
+    if processed:
+        lines.append(
+            f"- 共处理 {processed} 条：可评分 {evaluated} 条"
+            f"（当前画像化 {profiled_evaluated}、旧版或未画像化 {legacy_evaluated}），"
+            f"隔离异常 {unscorable} 条。"
+        )
+    else:
+        lines.append("- 今日尚无已落库的验真作业。")
+    if unscorable:
+        lines.append(f"- {unscorable} 条因价格锚点或行情证据异常不可评分，不计入任何正确率。")
+    if pending:
+        lines.append(f"- 另有 {pending} 条尚未走满验证窗口或缺少对应行情，继续等待。")
+
+    lines.extend(
+        [
+            "",
+            "**口径边界**",
+            "- 旧版、未画像化、异常和未成熟样本都不能用于评价当前策略；历史结果也不代表下一次预测一定正确。",
+        ]
+    )
     return "\n".join(lines)
 
 
