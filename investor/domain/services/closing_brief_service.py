@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import db
+from domain.policies.advisor_policy import load_advisor_policy
 from domain.services.risk_report_service import build_risk_report
 from domain.services.global_impact_service import build_global_impact_brief
 from domain.services.longterm_portfolio_service import build_longterm_snapshot_text, load_longterm_snapshot, longterm_plan_status, summarize_longterm_snapshot
@@ -180,7 +181,8 @@ def _theme_names(payload: Dict[str, Any]) -> List[str]:
     return names
 
 
-def _next_session_opportunity_lines(payload: Dict[str, Any], limit: int = 6) -> List[str]:
+def _next_session_opportunity_lines(payload: Dict[str, Any], limit: int = 6, policy: Dict[str, Any] | None = None) -> List[str]:
+    active_policy = policy or load_advisor_policy()
     impact = payload.get("global_impact") or {}
     risk = payload.get("risk") or {}
     cash_ratio = float(risk.get("cash_ratio") or 0)
@@ -209,7 +211,7 @@ def _next_session_opportunity_lines(payload: Dict[str, Any], limit: int = 6) -> 
         stance = "只观察，不追高"
         if risk_off:
             stance = "仅观察；市场或组合风险未解除前不新增仓位"
-        elif cash_complete and cash_ratio < 0.03:
+        elif cash_complete and cash_ratio < float(active_policy["minimum_cash_ratio"]):
             stance = "现金不足，必须先换仓/减仓才可参与"
         else:
             stance = "列入动量候选；仅在概念板块与个股同步放量、且未明显高开时再评估"
@@ -241,51 +243,95 @@ def _position_theme_hint(position: Dict[str, Any], themes: List[str]) -> str:
     return "按持仓权重、盈亏和板块强弱处理。"
 
 
-def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any]) -> List[str]:
+def _closing_action_level(position: Dict[str, Any], policy: Dict[str, Any]) -> str:
+    weight = float(position.get("weight") or 0)
+    pnl = float(position.get("pnl") or 0)
+    if weight >= float(policy["single_position_prepare_ratio"]):
+        return "verify"
+    if weight >= float(policy["loss_position_review_ratio"]) and pnl < 0:
+        return "verify"
+    return "observe"
+
+
+def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    decisions: List[Dict[str, Any]] = []
+    themes = _theme_names(payload)
+    cash_ratio = float(risk.get("cash_ratio") or 0)
+    cash_complete = bool(risk.get("cash_complete", True))
+    for p in (risk.get("top_positions") or [])[:8]:
+        item = dict(p)
+        weight = float(item.get("weight") or 0)
+        pnl = float(item.get("pnl") or 0)
+        sources = list(item.get("sources") or ([item.get("source")] if item.get("source") else []))
+        level = _closing_action_level(item, policy)
+        target_weight = None
+        if weight >= float(policy["single_position_prepare_ratio"]):
+            target_weight = float(policy["single_position_reduce_target_ratio"])
+            if len(sources) > 1:
+                advice = (
+                    "不加仓；同一证券分布在多个账户，先逐账户核对可用股数。下一交易日若弱于所属板块或继续放量下跌，"
+                    f"再准备把合计权重降至 {target_weight:.0%} 以下，收盘计划不按合计股数生成卖出数量。"
+                )
+            else:
+                total_asset = float(risk.get("effective_total_asset") or 0)
+                market_value = float(item.get("market_value") or 0)
+                volume = int(item.get("volume") or 0)
+                implied_price = market_value / volume if volume > 0 else 0
+                excess_value = max(0.0, market_value - total_asset * target_weight)
+                suggested_qty = min(volume, int(math.ceil(excess_value / implied_price / 100.0) * 100)) if implied_price > 0 else 0
+                quantity_text = f"参考减持约 {suggested_qty} 股（按快照隐含价估算，执行前核对可用股数和实时价）；" if suggested_qty else ""
+                advice = (
+                    "不加仓；若下一交易日开盘 30 分钟弱于所属板块或继续放量下跌，"
+                    f"{quantity_text}目标是把单票权重压回 {target_weight:.0%} 以下。"
+                )
+        elif weight >= float(policy["loss_position_review_ratio"]) and pnl < 0:
+            target_weight = float(policy["loss_position_reduce_target_ratio"])
+            advice = "不补亏损仓；只在放量站回板块强势队列后保留，反弹无量则减仓修复组合弹性。"
+        elif str(item.get("source") or "") == "trade":
+            advice = "按交易仓处理；高开不追，低开无承接先降风险，强于板块才继续观察。"
+        elif pnl < 0:
+            advice = "先等止跌确认，不用摊低成本替代风控。"
+        else:
+            advice = "维持观察，除非出现明确板块催化和量能确认。"
+        if cash_complete and cash_ratio < float(policy["minimum_cash_ratio"]):
+            advice += " 当前现金低于政策下限，任何新机会都必须来自减仓腾挪。"
+        decisions.append(
+            {
+                **item,
+                "action_level": level,
+                "target_weight": target_weight,
+                "requires_account_split": len(sources) > 1,
+                "theme_hint": _position_theme_hint(item, themes),
+                "advice": advice,
+            }
+        )
+    return decisions
+
+
+def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any], policy: Dict[str, Any] | None = None) -> List[str]:
     if not risk.get("available"):
         return ["- 持仓快照不可用，先补齐 /risk 数据，再给出个股处理。"]
     positions = risk.get("top_positions") or []
     if not positions:
         return ["- 当前没有可处理持仓。"]
-    cash_ratio = float(risk.get("cash_ratio") or 0)
-    cash_complete = bool(risk.get("cash_complete", True))
-    themes = _theme_names(payload)
+    active_policy = policy or load_advisor_policy()
     lines: List[str] = []
-    for p in positions[:8]:
+    for p in _position_decisions(risk, payload, active_policy):
         code = _cn(p.get("code"))
         name = _cn(p.get("name"), code)
         weight = float(p.get("weight") or 0)
         pnl = float(p.get("pnl") or 0)
-        source = _cn(p.get("source"), "unknown")
-        hint = _position_theme_hint(p, themes)
-        if weight >= 0.28:
-            total_asset = float(risk.get("effective_total_asset") or 0)
-            market_value = float(p.get("market_value") or 0)
-            volume = int(p.get("volume") or 0)
-            implied_price = market_value / volume if volume > 0 else 0
-            excess_value = max(0.0, market_value - total_asset * 0.25)
-            suggested_qty = min(volume, int(math.ceil(excess_value / implied_price / 100.0) * 100)) if implied_price > 0 else 0
-            quantity_text = f"参考减持约 {suggested_qty} 股（按快照隐含价估算，执行前核对可用股数和实时价）；" if suggested_qty else ""
-            action = f"不加仓；若下一交易日开盘 30 分钟弱于所属板块或继续放量下跌，{quantity_text}目标是把单票权重压回 25% 以下。"
-        elif weight >= 0.18 and pnl < 0:
-            action = "不补亏损仓；只在放量站回板块强势队列后保留，反弹无量则减仓修复组合弹性。"
-        elif source == "trade":
-            action = "按交易仓处理；高开不追，低开无承接先降风险，强于板块才继续观察。"
-        elif pnl < 0:
-            action = "先等止跌确认，不用摊低成本替代风控。"
-        else:
-            action = "维持观察，除非出现明确板块催化和量能确认。"
-        if cash_complete and cash_ratio < 0.03:
-            action += " 当前现金几乎为 0，任何新机会都必须来自减仓腾挪。"
-        source_name = {"main": "国金", "trade": "东莞"}.get(source, source)
+        source_names = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
+        level_name = {"observe": "观察", "verify": "核验"}.get(str(p.get("action_level") or "observe"), "观察")
         lines.extend([
-            f"- **{name}（{code}）**｜仓位 {weight*100:.1f}%｜盈亏 {pnl:+,.0f}｜{source_name}",
-            f"  建议：{action}",
+            f"- **{name}（{code}）**｜行动 {level_name}｜仓位 {weight*100:.1f}%｜盈亏 {pnl:+,.0f}｜{source_names}",
+            f"  建议：{p.get('advice')}",
         ])
     return lines
 
 
-def _next_session_trigger_lines(risk: Dict[str, Any]) -> List[str]:
+def _next_session_trigger_lines(risk: Dict[str, Any], policy: Dict[str, Any] | None = None) -> List[str]:
+    active_policy = policy or load_advisor_policy()
     cash_ratio = float(risk.get("cash_ratio") or 0)
     cash_complete = bool(risk.get("cash_complete", True))
     top1 = float(risk.get("top1_ratio") or 0)
@@ -295,9 +341,9 @@ def _next_session_trigger_lines(risk: Dict[str, Any]) -> List[str]:
         "- **09:35**｜持仓弱于板块且没有放量承接时，先处理风险仓，不开新仓。",
         "- **10:30**｜只保留强于板块且量能修复的持仓；弱反弹视为减仓窗口。",
     ]
-    if cash_complete and cash_ratio < 0.03:
+    if cash_complete and cash_ratio < float(active_policy["minimum_cash_ratio"]):
         lines.append("- **现金约束**｜默认不新增标的，除非先卖出低优先级仓位腾出现金。")
-    if top1 >= 0.30 or top3 >= 0.70:
+    if top1 >= float(active_policy["single_position_alert_ratio"]) or top3 >= float(active_policy["top3_position_alert_ratio"]):
         lines.append(f"- **组合约束**｜单票 {top1*100:.1f}%、前三大 {top3*100:.1f}%；首要目标是降集中度。")
     return lines
 
@@ -305,13 +351,16 @@ def _next_session_trigger_lines(risk: Dict[str, Any]) -> List[str]:
 def build_decision_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Build a structured next-session action plan from the closing brief payload."""
     risk = payload.get("risk") or {}
+    policy = load_advisor_policy()
     return {
         "source": "closing_brief",
         "date": payload.get("date", ""),
         "generated_at": payload.get("generated_at", ""),
-        "opportunities": _next_session_opportunity_lines(payload, limit=6),
-        "position_actions": _position_action_lines(risk, payload),
-        "opening_triggers": _next_session_trigger_lines(risk),
+        "opportunities": _next_session_opportunity_lines(payload, limit=6, policy=policy),
+        "position_actions": _position_action_lines(risk, payload, policy=policy),
+        "position_decisions": _position_decisions(risk, payload, policy),
+        "opening_triggers": _next_session_trigger_lines(risk, policy=policy),
+        "advisor_policy": policy,
         "risk_flags": risk.get("risk_flags") or [],
         "cash_ratio": risk.get("cash_ratio", 0),
         "top1_ratio": risk.get("top1_ratio", 0),

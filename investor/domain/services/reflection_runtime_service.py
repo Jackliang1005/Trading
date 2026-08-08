@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
@@ -537,19 +538,45 @@ def _decision_monitor_attribution(trading_summary: Dict) -> str:
         return f"## 盘中建议闭环\n- 最新建议快照为 {generated_at or 'unknown'}，非当日，不用于本次执行归因。"
 
     reduce_states = {"reduce_priority", "reduce_candidate", "reduce_candidate_no_intraday_change", "hold_or_reduce", "hold_or_reduce_no_intraday_change"}
-    recommended = [
-        str(item.get("code") or "")
+    risk_items = [
+        item
         for item in (monitor.get("tracked_positions") or [])
         if str(item.get("decision_state") or "") in reduce_states and item.get("code")
     ]
-    trade_codes = {
-        str(item.get("stock_code") or item.get("code") or "")
-        for item in (_valid_trades(trading_summary) or [])
-        if isinstance(item, dict)
-    }
-    matched = [code for code in recommended if code in trade_codes]
-    pending = [code for code in recommended if code not in trade_codes]
-    slot = str(monitor.get("slot") or "").replace(":", "")
+    prepared = [
+        item
+        for item in risk_items
+        if item.get("action_level") == "prepare"
+        and (item.get("execution_hint") or {}).get("actionable")
+        and int((item.get("execution_hint") or {}).get("suggested_qty") or 0) > 0
+    ]
+    verify_only = [item for item in risk_items if item not in prepared]
+
+    trade_evidence: Dict[str, Dict[str, float]] = {}
+    for trade in _valid_trades(trading_summary) or []:
+        if not isinstance(trade, dict):
+            continue
+        code = str(trade.get("stock_code") or trade.get("code") or "")
+        if not code:
+            continue
+        volume = float(trade.get("trade_volume", trade.get("deal_volume", 0)) or 0)
+        side = "buy" if trade.get("order_type", 0) in (23, "buy", "BUY") else "sell"
+        evidence = trade_evidence.setdefault(code, {"buy": 0.0, "sell": 0.0})
+        evidence[side] += volume
+
+    results = []
+    for item in prepared:
+        code = str(item.get("code") or "")
+        suggested = int((item.get("execution_hint") or {}).get("suggested_qty") or 0)
+        evidence = trade_evidence.get(code, {})
+        sold = int(evidence.get("sell", 0) or 0)
+        bought = int(evidence.get("buy", 0) or 0)
+        status = "已完成" if sold >= suggested else "部分完成" if sold > 0 else "无卖出证据"
+        results.append({"code": code, "suggested": suggested, "sold": sold, "bought": bought, "status": status})
+
+    slot_raw = str(monitor.get("slot") or "")
+    slot_match = re.search(r"(0930|0935|1030|1430)", slot_raw.replace(":", ""))
+    slot = slot_match.group(1) if slot_match else ""
     slot_label = {
         "0930": "09:30 开盘预测",
         "0935": "09:35 风险检查",
@@ -557,10 +584,29 @@ def _decision_monitor_attribution(trading_summary: Dict) -> str:
         "1430": "14:30 仓位决策",
     }.get(slot, "盘中检查")
     lines = ["## 盘中建议闭环", f"- 建议时间：{generated_at}；时点：{slot_label}"]
-    lines.append(f"- 风险处理建议：{', '.join(recommended) if recommended else '无'}")
-    lines.append(f"- 当日成交代码：{', '.join(sorted(code for code in trade_codes if code)) if trade_codes else '无'}")
-    lines.append(f"- 已有成交证据：{', '.join(matched) if matched else '无'}")
-    lines.append(f"- 尚无成交证据：{', '.join(pending) if pending else '无'}")
+    if prepared:
+        lines.append("- 准备级减仓候选：" + "、".join(f"{item.get('code')} {int((item.get('execution_hint') or {}).get('suggested_qty') or 0)} 股" for item in prepared) + "。")
+        for item in results:
+            lines.append(
+                f"- {item['code']}：建议卖出 {item['suggested']} 股，已验证卖出 {item['sold']} 股，状态 {item['status']}。"
+            )
+            if item["bought"] > 0:
+                lines.append(f"- {item['code']} 同日另有买入 {item['bought']} 股；方向与降风险建议冲突，不能算作建议完成。")
+    else:
+        lines.append("- 当日没有达到“准备”层级且带可执行数量的减仓候选，不评价执行完成率。")
+    if verify_only:
+        lines.append(
+            "- 核验级风险项："
+            + "、".join(str(item.get("code")) for item in verify_only)
+            + "；这些项目只要求补齐行情或分账户数量，不把未成交视为执行失败。"
+        )
+    trade_parts = []
+    for code, evidence in sorted(trade_evidence.items()):
+        if evidence.get("buy"):
+            trade_parts.append(f"{code} 买入 {int(evidence['buy'])} 股")
+        if evidence.get("sell"):
+            trade_parts.append(f"{code} 卖出 {int(evidence['sell'])} 股")
+    lines.append("- 当日有效成交证据：" + ("；".join(trade_parts) if trade_parts else "无") + "。")
     return "\n".join(lines)
 
 

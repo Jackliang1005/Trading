@@ -31,6 +31,7 @@ SOURCE_LABELS = {
     "trade": "东莞",
     "guojin": "国金",
     "dongguan": "东莞",
+    "combined": "跨账户合计",
     "unknown": "来源待确认",
 }
 
