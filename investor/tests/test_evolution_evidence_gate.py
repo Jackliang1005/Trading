@@ -45,6 +45,64 @@ def test_bounded_normalize_preserves_sum_and_bounds():
     assert all(0.10 <= value <= 0.60 for value in result.values())
 
 
+def test_profiled_rebalance_preserves_unmeasured_strategy_weights():
+    weights = {"technical": 0.30, "sentiment": 0.20, "fundamental": 0.25, "geopolitical": 0.25}
+
+    result = service._rebalance_eligible_weights(
+        weights,
+        {"technical": 0.05, "sentiment": 0},
+        ["technical", "sentiment"],
+        0.10,
+        0.60,
+    )
+
+    assert result["fundamental"] == 0.25
+    assert result["geopolitical"] == 0.25
+    assert result["technical"] + result["sentiment"] == 0.50
+    assert result["technical"] > weights["technical"]
+    assert result["sentiment"] < weights["sentiment"]
+
+
+def test_adjustment_changes_only_evidence_qualified_subset(monkeypatch):
+    config = _config()
+    original = config["weights"].copy()
+    saved = []
+    updated = []
+    monkeypatch.setattr(service, "load_strategy_config", lambda: config)
+    monkeypatch.setattr(
+        service.db,
+        "get_strategy_performance",
+        lambda start, end: [
+            {
+                "strategy_used": "technical",
+                "profiled_total": 12,
+                "profiled_correct": 10,
+                "profiled_win_rate": 83.3,
+                "evidence_profiles": "technical_price_regime_v1",
+            },
+            {
+                "strategy_used": "sentiment",
+                "profiled_total": 12,
+                "profiled_correct": 4,
+                "profiled_win_rate": 33.3,
+                "evidence_profiles": "sentiment_flow_news_v1",
+            },
+        ],
+    )
+    monkeypatch.setattr(service, "save_strategy_config", lambda value: saved.append(value.copy()))
+    monkeypatch.setattr(service.db, "update_strategy_weight", lambda name, weight: updated.append((name, weight)))
+
+    result = service.adjust_strategy_weights()
+
+    assert result["_weights_changed"] is True
+    assert result["weights"]["fundamental"] == original["fundamental"]
+    assert result["weights"]["geopolitical"] == original["geopolitical"]
+    assert result["weights"]["technical"] > original["technical"]
+    assert result["weights"]["sentiment"] < original["sentiment"]
+    assert sum(result["weights"].values()) == 1.0
+    assert saved
+
+
 def test_unprofiled_legacy_samples_do_not_unlock_evolution():
     perf = [
         {"strategy_used": "technical", "total": 30, "profiled_total": 0},

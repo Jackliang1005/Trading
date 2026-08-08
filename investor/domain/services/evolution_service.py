@@ -105,6 +105,61 @@ def _bounded_normalize(weights: Dict[str, float], min_weight: float, max_weight:
     return rounded
 
 
+def _rebalance_eligible_weights(
+    weights: Dict[str, float],
+    adjustments: Dict[str, float],
+    eligible_names: List[str],
+    min_weight: float,
+    max_weight: float,
+) -> Dict[str, float]:
+    """Reallocate only inside the evidence-qualified subset, preserving its mass."""
+    result = {name: float(value) for name, value in weights.items()}
+    names = [name for name in eligible_names if name in result]
+    if len(names) < 2:
+        return {name: round(value, 3) for name, value in result.items()}
+
+    target_mass = sum(result[name] for name in names)
+    proposed = {
+        name: max(min_weight, min(max_weight, result[name] + float(adjustments.get(name, 0) or 0)))
+        for name in names
+    }
+    for _ in range(20):
+        delta = target_mass - sum(proposed.values())
+        if abs(delta) < 1e-9:
+            break
+        candidates = [
+            name for name in names
+            if (delta > 0 and proposed[name] < max_weight - 1e-9)
+            or (delta < 0 and proposed[name] > min_weight + 1e-9)
+        ]
+        if not candidates:
+            break
+        share = delta / len(candidates)
+        for name in candidates:
+            proposed[name] = max(min_weight, min(max_weight, proposed[name] + share))
+
+    rounded_subset = {name: round(value, 3) for name, value in proposed.items()}
+    residual = round(round(target_mass, 3) - sum(rounded_subset.values()), 3)
+    if residual:
+        candidates = sorted(
+            names,
+            key=lambda name: (
+                max_weight - rounded_subset[name]
+                if residual > 0
+                else rounded_subset[name] - min_weight
+            ),
+            reverse=True,
+        )
+        for name in candidates:
+            candidate = round(rounded_subset[name] + residual, 3)
+            if min_weight <= candidate <= max_weight:
+                rounded_subset[name] = candidate
+                break
+    for name in names:
+        result[name] = rounded_subset[name]
+    return {name: round(value, 3) for name, value in result.items()}
+
+
 def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
     def profiled(item: Dict, field: str, fallback: str):
         value = item.get(field)
@@ -199,11 +254,13 @@ def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
             else:
                 adjustments[name] = 0
 
-    for name, adj in adjustments.items():
-        new_weight = config["weights"].get(name, 0.33) + adj
-        config["weights"][name] = max(min_w, min(max_w, new_weight))
-
-    config["weights"] = _bounded_normalize(config["weights"], min_w, max_w)
+    config["weights"] = _rebalance_eligible_weights(
+        config["weights"],
+        adjustments,
+        evidence["eligible_strategies"],
+        min_w,
+        max_w,
+    )
 
     # 权重无实质变化时跳过写入，避免 weight_history 膨胀
     if old_weights == config["weights"]:
