@@ -98,6 +98,20 @@ def test_advisor_brief_unifies_risk_events_actions_and_validation(tmp_path, monk
             ]
         },
     )
+    _write(
+        tmp_path / "trading_summary_20260810.json",
+        {
+            "as_of_date": "2026-08-10",
+            "prediction_validation": {
+                "activity_evaluated": 9,
+                "activity_correct": 2,
+                "activity_profiled_evaluated": 0,
+                "activity_legacy_evaluated": 9,
+                "activity_unscorable": 15,
+                "pending": 4,
+            },
+        },
+    )
 
     brief = service.build_advisor_brief(
         now=datetime(2026, 8, 10, 11, 0),
@@ -118,6 +132,12 @@ def test_advisor_brief_unifies_risk_events_actions_and_validation(tmp_path, monk
     assert "画像化验真样本 6/20" in brief["text"]
     assert "技术3/5，待验真3" in brief["text"]
     assert "未达门槛前权重保持不变" in brief["text"]
+    assert "**策略预测验真**" in brief["text"]
+    assert "9 条旧版或未画像化预测" in brief["text"]
+    assert "已隔离 15 条价格锚点或行情证据异常样本" in brief["text"]
+    assert "**风险建议与盘中校正**" in brief["text"]
+    assert "盘中市场状态校正" in brief["text"]
+    assert "不是指数策略预测胜率" in brief["text"]
 
 
 def test_stale_decision_snapshot_cannot_create_prepare_action(tmp_path, monkeypatch):

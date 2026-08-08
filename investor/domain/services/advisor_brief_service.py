@@ -18,6 +18,7 @@ from domain.services.weekly_report_service import _summarize_intraday_prediction
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"
+REFLECTION_REPORTS_DIR = WORKSPACE / "investor" / "reflection_reports"
 
 BLOCKED_LABELS = {
     "holdings_account_monitor": "双账户持仓与资金读取",
@@ -36,6 +37,24 @@ def _load_json(path: Path) -> Dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _prediction_validation_summary(reports_dir: Path) -> Dict[str, Any]:
+    """Load the latest persisted prediction validation without mixing it with intraday checks."""
+    directories = [reports_dir]
+    try:
+        if reports_dir.resolve() == REPORTS_DIR.resolve():
+            directories.append(REFLECTION_REPORTS_DIR)
+    except OSError:
+        pass
+    candidates = [path for directory in directories for path in directory.glob("trading_summary_*.json")]
+    if not candidates:
+        return {}
+    payload = _load_json(max(candidates, key=lambda path: path.name))
+    summary = payload.get("prediction_validation") or {}
+    if not isinstance(summary, dict):
+        return {}
+    return {**summary, "as_of": payload.get("as_of_date", "")}
 
 
 def _parse_dt(value: object) -> datetime | None:
@@ -182,6 +201,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
     intraday = _summarize_intraday_predictions(current.date() - timedelta(days=6), current.date(), reports_dir=reports_dir)
     decision_outcomes = recent_outcome_summary(current.date(), days=7, reports_dir=reports_dir)
     evolution = build_evolution_readiness(as_of=current.date())
+    prediction_validation = _prediction_validation_summary(reports_dir)
     actions = _build_actions(risk, decision, events)
     overall_level = "prepare" if any(item["level"] == "prepare" for item in actions) else (
         "verify" if any(item["level"] == "verify" for item in actions) else "observe"
@@ -196,6 +216,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
         "intraday": intraday,
         "decision_outcomes": decision_outcomes,
         "evolution": evolution,
+        "prediction_validation": prediction_validation,
         "actions": actions,
     }
     brief["text"] = format_advisor_brief(brief)
@@ -211,6 +232,7 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     intraday = brief.get("intraday") or {}
     decision_outcomes = brief.get("decision_outcomes") or {}
     evolution = brief.get("evolution") or {}
+    prediction_validation = brief.get("prediction_validation") or {}
     overall = str(brief.get("overall_action_level") or "observe")
     lines = [
         "🧭 OpenClaw 投顾总览",
@@ -296,31 +318,7 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     for item in brief.get("actions") or []:
         lines.append(f"- [{ACTION_LABELS.get(item.get('level'), '观察')}] {item.get('text')}")
 
-    lines.extend(["", "**验证闭环**"])
-    if int(intraday.get("total", 0) or 0):
-        lines.append(
-            f"- 最近 7 日完成 {intraday.get('total')} 次日内方向验证：精确正确率 {intraday.get('exact_rate')}%，"
-            f"含接近结果可用率 {intraday.get('usable_rate')}%。"
-        )
-        lines.append("- 这些历史样本只评价日内方向；未完成策略归因的样本不进入权重更新。")
-    else:
-        lines.append("- 最近 7 日暂无可用的日内方向验证，不输出命中率。")
-    if int(decision_outcomes.get("profiled_evaluated_count", 0) or 0):
-        lines.append(
-            f"- 最近 7 日完成 {int(decision_outcomes.get('profiled_evaluated_count', 0) or 0)} 条当前分层逐仓降风险建议的收盘价格验证："
-            f"下行得到确认 {int(decision_outcomes.get('profiled_confirmed_count', 0) or 0)} 条，"
-            f"未确认 {int(decision_outcomes.get('profiled_not_confirmed_count', 0) or 0)} 条，"
-            f"证据混合 {int(decision_outcomes.get('profiled_mixed_count', 0) or 0)} 条。"
-        )
-        lines.append("- 逐仓价格验证只评价建议后至收盘的方向，不代表实际成交、收益或长期策略有效性。")
-    if int(decision_outcomes.get("legacy_evaluated_count", 0) or 0):
-        lines.append(
-            f"- 另有 {int(decision_outcomes.get('legacy_evaluated_count', 0) or 0)} 条旧版未分层建议完成价格回放；"
-            f"其中下行确认 {int(decision_outcomes.get('confirmed_count', 0) or 0)} 条、"
-            f"未确认 {int(decision_outcomes.get('not_confirmed_count', 0) or 0)} 条、"
-            f"证据混合 {int(decision_outcomes.get('mixed_count', 0) or 0)} 条；"
-            "仅作迁移审计，不计入当前分层建议质量。"
-        )
+    lines.extend(["", "**策略预测验真**"])
     if evolution.get("ready"):
         lines.append(
             f"- 策略进化证据已达门槛：画像化验真样本 {evolution.get('total')}/{evolution.get('minimum_total')}，"
@@ -342,6 +340,53 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
             f"{detail}。未达门槛前权重保持不变。"
         )
         lines.append(f"- 成熟规则：{evolution.get('maturity_rule') or '样本成熟并验真后才计入'}。")
+    profiled = int(prediction_validation.get("activity_profiled_evaluated", 0) or 0)
+    legacy = int(prediction_validation.get("activity_legacy_evaluated", 0) or 0)
+    if profiled:
+        lines.append(
+            f"- 最新生成日的当前证据链样本：可评分 {profiled} 条，"
+            f"正确 {int(prediction_validation.get('activity_profiled_correct', 0) or 0)} 条，"
+            f"胜率 {float(prediction_validation.get('activity_profiled_win_rate') or 0):.1f}%；"
+            "只有该口径可用于评价升级后策略。"
+        )
+    if legacy:
+        lines.append(
+            f"- 同日另有 {legacy} 条旧版或未画像化预测完成验证，"
+            f"整体正确 {int(prediction_validation.get('activity_correct', 0) or 0)} 条 / "
+            f"{int(prediction_validation.get('activity_evaluated', 0) or 0)} 条；仅作迁移审计。"
+        )
+    unscorable = int(prediction_validation.get("activity_unscorable", 0) or 0)
+    pending = int(prediction_validation.get("pending", 0) or 0)
+    if unscorable:
+        lines.append(f"- 已隔离 {unscorable} 条价格锚点或行情证据异常样本，不计入任何胜率。")
+    if pending:
+        lines.append(f"- 尚有 {pending} 条等待走满验证窗口；未成熟前不计入策略比较。")
+
+    lines.extend(["", "**风险建议与盘中校正**"])
+    if int(intraday.get("total", 0) or 0):
+        lines.append(
+            f"- 最近 7 日完成 {intraday.get('total')} 次盘中市场状态校正：精确一致率 {intraday.get('exact_rate')}%，"
+            f"含接近结果可用率 {intraday.get('usable_rate')}%。"
+        )
+        lines.append("- 这是 09:30→10:30→14:30 的市场状态复核，不是指数策略预测胜率，也不进入策略权重更新。")
+    else:
+        lines.append("- 最近 7 日暂无可用的盘中市场状态校正，不输出一致率。")
+    if int(decision_outcomes.get("profiled_evaluated_count", 0) or 0):
+        lines.append(
+            f"- 最近 7 日完成 {int(decision_outcomes.get('profiled_evaluated_count', 0) or 0)} 条当前分层逐仓降风险建议的收盘价格验证："
+            f"下行得到确认 {int(decision_outcomes.get('profiled_confirmed_count', 0) or 0)} 条，"
+            f"未确认 {int(decision_outcomes.get('profiled_not_confirmed_count', 0) or 0)} 条，"
+            f"证据混合 {int(decision_outcomes.get('profiled_mixed_count', 0) or 0)} 条。"
+        )
+        lines.append("- 逐仓价格验证只评价建议后至收盘的方向，不代表实际成交、收益或长期策略有效性。")
+    if int(decision_outcomes.get("legacy_evaluated_count", 0) or 0):
+        lines.append(
+            f"- 另有 {int(decision_outcomes.get('legacy_evaluated_count', 0) or 0)} 条旧版未分层建议完成价格回放；"
+            f"其中下行确认 {int(decision_outcomes.get('confirmed_count', 0) or 0)} 条、"
+            f"未确认 {int(decision_outcomes.get('not_confirmed_count', 0) or 0)} 条、"
+            f"证据混合 {int(decision_outcomes.get('mixed_count', 0) or 0)} 条；"
+            "仅作迁移审计，不计入当前分层建议质量。"
+        )
     if decision.get("fresh"):
         lines.append(f"- 盘中决策快照：{decision.get('generated_at')}，可用于当前行动分层。")
     elif decision.get("available"):
