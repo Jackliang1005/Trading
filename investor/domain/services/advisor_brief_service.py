@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from domain.services.report_style_service import event_summary_cn, join_cn, money, pct, risk_label, theme_label
 from domain.services.risk_report_service import build_risk_report
 from domain.services.evolution_service import build_evolution_readiness
+from domain.services.decision_outcome_service import recent_outcome_summary
 from domain.services.portfolio_event_service import rank_portfolio_events
 from domain.services.weekly_report_service import _summarize_intraday_predictions
 
@@ -171,6 +172,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
     events = _event_summary(reports_dir, risk=risk)
     decision = _decision_summary(reports_dir, current)
     intraday = _summarize_intraday_predictions(current.date() - timedelta(days=6), current.date(), reports_dir=reports_dir)
+    decision_outcomes = recent_outcome_summary(current.date(), days=7, reports_dir=reports_dir)
     evolution = build_evolution_readiness(as_of=current.date())
     actions = _build_actions(risk, decision, events)
     overall_level = "prepare" if any(item["level"] == "prepare" for item in actions) else (
@@ -184,6 +186,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
         "events": events,
         "decision": decision,
         "intraday": intraday,
+        "decision_outcomes": decision_outcomes,
         "evolution": evolution,
         "actions": actions,
     }
@@ -198,6 +201,7 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     events = brief.get("events") or {}
     decision = brief.get("decision") or {}
     intraday = brief.get("intraday") or {}
+    decision_outcomes = brief.get("decision_outcomes") or {}
     evolution = brief.get("evolution") or {}
     overall = str(brief.get("overall_action_level") or "observe")
     lines = [
@@ -288,6 +292,22 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
         lines.append("- 这些历史样本只评价日内方向；未完成策略归因的样本不进入权重更新。")
     else:
         lines.append("- 最近 7 日暂无可用的日内方向验证，不输出命中率。")
+    if int(decision_outcomes.get("profiled_evaluated_count", 0) or 0):
+        lines.append(
+            f"- 最近 7 日完成 {int(decision_outcomes.get('profiled_evaluated_count', 0) or 0)} 条当前分层逐仓降风险建议的收盘价格验证："
+            f"下行得到确认 {int(decision_outcomes.get('profiled_confirmed_count', 0) or 0)} 条，"
+            f"未确认 {int(decision_outcomes.get('profiled_not_confirmed_count', 0) or 0)} 条，"
+            f"证据混合 {int(decision_outcomes.get('profiled_mixed_count', 0) or 0)} 条。"
+        )
+        lines.append("- 逐仓价格验证只评价建议后至收盘的方向，不代表实际成交、收益或长期策略有效性。")
+    if int(decision_outcomes.get("legacy_evaluated_count", 0) or 0):
+        lines.append(
+            f"- 另有 {int(decision_outcomes.get('legacy_evaluated_count', 0) or 0)} 条旧版未分层建议完成价格回放；"
+            f"其中下行确认 {int(decision_outcomes.get('confirmed_count', 0) or 0)} 条、"
+            f"未确认 {int(decision_outcomes.get('not_confirmed_count', 0) or 0)} 条、"
+            f"证据混合 {int(decision_outcomes.get('mixed_count', 0) or 0)} 条；"
+            "仅作迁移审计，不计入当前分层建议质量。"
+        )
     if evolution.get("ready"):
         lines.append(
             f"- 策略进化证据已达门槛：画像化验真样本 {evolution.get('total')}/{evolution.get('minimum_total')}，"

@@ -18,6 +18,11 @@ from data_collector import (
     fetch_qmt_trading_summary,
 )
 from domain.policies.scoring_policy import calculate_prediction_score
+from domain.services.decision_outcome_service import (
+    build_decision_outcomes,
+    load_decision_snapshots,
+    save_decision_outcomes,
+)
 from position_pnl import resolve_position_pnl
 
 # 评分阈值
@@ -561,17 +566,14 @@ def build_trading_summary_report(ts: Dict) -> str:
     return "\n".join(lines)
 
 
-def _decision_monitor_attribution(trading_summary: Dict) -> str:
+def _decision_monitor_attribution(trading_summary: Dict, outcome_summary: Dict | None = None) -> str:
     """Compare scheduled risk recommendations with same-day executed trades."""
-    if not DECISION_MONITOR_PATH.exists():
-        return "## 盘中建议闭环\n- 当日没有保存的盘中建议快照。"
-    try:
-        monitor = json.loads(DECISION_MONITOR_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return "## 盘中建议闭环\n- 建议快照格式异常，本次不用于执行归因。"
-
-    generated_at = str(monitor.get("generated_at") or "")
     today = datetime.now().strftime("%Y-%m-%d")
+    monitors = load_decision_snapshots(today, reports_dir=DECISION_MONITOR_PATH.parent)
+    if not monitors:
+        return "## 盘中建议闭环\n- 当日没有保存的盘中建议快照。"
+    monitor = monitors[-1]
+    generated_at = str(monitor.get("generated_at") or "")
     if not generated_at.startswith(today):
         return f"## 盘中建议闭环\n- 最新建议快照为 {generated_at or 'unknown'}，非当日，不用于本次执行归因。"
 
@@ -622,6 +624,8 @@ def _decision_monitor_attribution(trading_summary: Dict) -> str:
         "1430": "14:30 仓位决策",
     }.get(slot, "盘中检查")
     lines = ["## 盘中建议闭环", f"- 建议时间：{generated_at}；时点：{slot_label}"]
+    if len(monitors) > 1:
+        lines.append(f"- 当日共保存 {len(monitors)} 个建议时点；成交归因采用上述最后时点，价格验证覆盖全部时点。")
     if prepared:
         lines.append("- 准备级减仓候选：" + "、".join(f"{item.get('code')} {int((item.get('execution_hint') or {}).get('suggested_qty') or 0)} 股" for item in prepared) + "。")
         for item in results:
@@ -645,6 +649,36 @@ def _decision_monitor_attribution(trading_summary: Dict) -> str:
         if evidence.get("sell"):
             trade_parts.append(f"{code} 卖出 {int(evidence['sell'])} 股")
     lines.append("- 当日有效成交证据：" + ("；".join(trade_parts) if trade_parts else "无") + "。")
+    outcome = outcome_summary or {}
+    if int(outcome.get("directional_count", 0) or 0):
+        lines.append(
+            f"- 收盘价格验证：明确降风险建议 {int(outcome.get('directional_count', 0) or 0)} 条，"
+            f"可验证 {int(outcome.get('evaluated_count', 0) or 0)} 条；下行得到确认 "
+            f"{int(outcome.get('confirmed_count', 0) or 0)} 条，未确认 "
+            f"{int(outcome.get('not_confirmed_count', 0) or 0)} 条，证据混合 "
+            f"{int(outcome.get('mixed_count', 0) or 0)} 条。"
+        )
+        if int(outcome.get("legacy_evaluated_count", 0) or 0):
+            lines.append(
+                f"- 其中 {int(outcome.get('legacy_evaluated_count', 0) or 0)} 条来自旧版未分层快照，"
+                "仅作迁移审计，不计入当前分层建议质量。"
+            )
+        verdict_labels = {
+            "downside_confirmed": "下行得到确认",
+            "downside_not_confirmed": "下行未确认",
+            "mixed": "证据混合",
+            "unavailable": "价格证据不可用",
+        }
+        for item in (outcome.get("outcomes") or [])[:8]:
+            stock_return = item.get("stock_return_pct")
+            relative_return = item.get("relative_return_pct")
+            move = "收盘变化不可验证" if stock_return is None else f"建议后至收盘 {float(stock_return):+.2f}%"
+            relative = "" if relative_return is None else f"，相对基准 {float(relative_return):+.2f}pct"
+            lines.append(
+                f"- {str(item.get('generated_at') or '')[11:16]} {item.get('code')}：{move}{relative}，"
+                f"{verdict_labels.get(str(item.get('verdict') or ''), '待核验')}。"
+            )
+        lines.append("- 价格验证只评价建议后的收盘方向，不代表实际成交、收益或长期策略有效性。")
     return "\n".join(lines)
 
 
@@ -821,7 +855,10 @@ def daily_reflection() -> Dict:
         print(f"  📅 数据日期: {reflection_context.get('as_of_date')}")
 
     trading_report = build_trading_summary_report(trading_summary)
-    decision_attribution = _decision_monitor_attribution(trading_summary)
+    outcome_as_of = datetime.now().strftime("%Y-%m-%d")
+    decision_outcome = build_decision_outcomes(outcome_as_of)
+    save_decision_outcomes(decision_outcome)
+    decision_attribution = _decision_monitor_attribution(trading_summary, outcome_summary=decision_outcome)
     positions = _resolve_positions(trading_summary)
     pos_count = trading_summary.get("positions_count", len(positions))
     print(
@@ -838,6 +875,7 @@ def daily_reflection() -> Dict:
         "trading_summary": trading_summary,
         "trading_report": trading_report,
         "decision_attribution": decision_attribution,
+        "decision_outcome": decision_outcome,
         "backtest_result": bt_result,
         "prediction_breakdown": prediction_breakdown,
     }
