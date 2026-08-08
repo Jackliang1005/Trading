@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -18,6 +19,58 @@ from domain.services.concept_momentum_service import THEME_CONCEPT_KEYWORDS
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"
+TRADING_DIR = str(WORKSPACE / "trading")
+if TRADING_DIR not in sys.path:
+    sys.path.insert(0, TRADING_DIR)
+try:
+    from trading_core_new.longterm.trading_calendar import is_cn_trading_day, next_trading_day
+except Exception:
+    is_cn_trading_day = None
+    next_trading_day = None
+
+
+def _morning_session_context(generated_at: object) -> Dict[str, Any]:
+    """Resolve which trading date a manually or automatically generated brief targets."""
+    try:
+        generated = datetime.strptime(str(generated_at or "")[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        generated = datetime.now()
+    today = generated.strftime("%Y-%m-%d")
+    calendar_source = "weekday_fallback"
+    is_open = generated.weekday() < 5
+    if is_cn_trading_day is not None:
+        try:
+            is_open, calendar_source = is_cn_trading_day(today)
+        except Exception:
+            pass
+
+    market_closed = generated.hour * 60 + generated.minute >= 15 * 60
+    if is_open and not market_closed:
+        return {
+            "target_date": today,
+            "status": "当日交易计划",
+            "is_current_trading_day": True,
+            "calendar_source": calendar_source,
+        }
+
+    search_from = generated.date() + timedelta(days=1 if is_open else 0)
+    if next_trading_day is not None:
+        try:
+            target_date = next_trading_day(search_from.isoformat())
+        except Exception:
+            target_date = ""
+    else:
+        cursor = search_from
+        while cursor.weekday() >= 5:
+            cursor += timedelta(days=1)
+        target_date = cursor.isoformat()
+    status = "当前交易日已收盘，以下时点属于下一交易日" if is_open else "当前为非交易日，以下时点属于下一交易日"
+    return {
+        "target_date": target_date or search_from.isoformat(),
+        "status": status,
+        "is_current_trading_day": False,
+        "calendar_source": calendar_source,
+    }
 
 
 def _global_focus_lines(brief: Dict[str, Any], limit: int = 3) -> List[str]:
@@ -132,9 +185,11 @@ def format_morning_brief(payload: Dict[str, Any]) -> str:
     risk = payload.get("risk") or {}
     longterm = payload.get("longterm") or {}
     overseas = payload.get("overseas") or {}
+    session = _morning_session_context(payload.get("generated_at"))
     lines = [
         "🌅 OpenClaw A股盘前简报",
         f"生成时间：{payload.get('generated_at')}",
+        f"计划交易日：{session.get('target_date')}（{session.get('status')}）",
         "",
         "**核心结论**",
         *_morning_conclusion_lines(payload),
@@ -186,7 +241,7 @@ def format_morning_brief(payload: Dict[str, Any]) -> str:
         lines.append("- 持仓快照不可用；不生成仓位判断，开盘前须人工核验账户。")
     lines.extend([
         "",
-        "**开盘执行顺序**",
+        f"**{session.get('target_date')} 开盘执行顺序**",
         "- 09:25：检查外盘、离岸人民币及主题前排竞价，确认催化是否延续。",
         "- 09:35：持仓弱于板块且无放量承接时，先降风险，不先开新仓。",
         "- 10:30：只保留强于板块、量能确认的方向；弱反弹视为风险处理窗口。",
@@ -194,6 +249,7 @@ def format_morning_brief(payload: Dict[str, Any]) -> str:
         "**数据边界**",
     ])
     lines.append("- 海外指数均标注各自数据时间；行情为空、过期或尚未开盘时不做方向推断。")
+    lines.append(f"- 交易日历来源：{session.get('calendar_source')}；所有 09:25/09:35/10:30 动作均属于计划交易日 {session.get('target_date')}。")
     lines.append("- 国金实时链路未恢复稳定前按降级处理；禁止用历史数据冒充实时状态。")
     return "\n".join(lines)
 
