@@ -562,6 +562,55 @@ def _query_logs(account: str, token: str, days: int) -> str:
     return "\n".join(parts)
 
 
+def _query_account_health_evidence(account: str, token: str) -> str:
+    """Summarize live gateway, account-read, and strategy-log evidence."""
+    alias = ACCOUNT_ALIASES.get(account, account)
+    base_url = _resolve_base_url(account)
+    lines = [_query_health(account, token), "", f"**{alias}账户与策略日志证据**"]
+
+    positions_result = _http_get(base_url, "/api/stock/positions", token)
+    if not positions_result.get("ok"):
+        lines.append(f"- 持仓读取：失败（{_connection_error_cn(positions_result.get('error'))}），本次不使用缓存冒充实时账户状态。")
+    else:
+        payload = positions_result.get("payload", {}) or {}
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not bool(payload.get("success")):
+            lines.append(f"- 持仓读取：接口失败（{payload.get('message') or '未返回原因'}）。")
+        elif isinstance(rows, list):
+            lines.append(f"- 持仓读取：成功，实时接口返回 {len(rows)} 条持仓记录。")
+        else:
+            lines.append("- 持仓读取：返回格式异常，不能确认实时持仓数量。")
+
+    log_rows = _collect_trade_logs(base_url, token, days=1)
+    log_item = log_rows[0] if log_rows else {}
+    if not log_item.get("ok"):
+        lines.append(f"- 当日策略日志：读取失败（{_connection_error_cn(log_item.get('error'))}）。")
+    else:
+        line_count = int(log_item.get("line_count", 0) or 0)
+        error_hits = int(log_item.get("error_hits", 0) or 0)
+        if line_count < 1:
+            lines.append("- 当日策略日志：接口可用但未读到日志行，需要结合是否为交易日与策略进程继续核验。")
+        elif error_hits:
+            lines.append(f"- 当日策略日志：读取 {line_count} 行，命中 {error_hits} 条异常关键词，需要检查。")
+        else:
+            lines.append(f"- 当日策略日志：读取 {line_count} 行，未命中异常关键词。")
+    return "\n".join(lines)
+
+
+def _query_unified_health(accounts: List[str], token: str) -> str:
+    """Return local assistant health even when authenticated gateway probes cannot run."""
+    sections = [_query_assistant_status(), "**账户网关实时诊断**"]
+    if not token:
+        sections.append(
+            "- 未找到 QMT2HTTP_API_TOKEN：核心服务、定时器和报告状态仍已完成检查；"
+            "账户读取与策略日志本次无法核验。"
+        )
+    else:
+        sections.extend(_query_account_health_evidence(account, token) for account in accounts)
+    sections.append("- 健康检查只读取运行证据，不会触发下单或改变仓位。")
+    return "\n\n".join(section for section in sections if section)
+
+
 def _query_predictions() -> str:
     """查询最近预测结果与胜率。"""
     import db as db_mod
@@ -1529,10 +1578,11 @@ def handle_feishu_query(query_text: str) -> str:
     # 实盘数据查询（需要 token）
     account = _normalize_account(query)
     token = _resolve_token()
+    accounts = ["guojin", "dongguan"] if account == "all" else [account]
+    if intent == "health":
+        return _query_unified_health(accounts, token)
     if not token:
         return "未找到 QMT2HTTP_API_TOKEN，无法查询实盘接口\n\n💡 试试分析类查询: 最近预测 / 风险敞口 / 策略表现"
-    accounts = ["guojin", "dongguan"] if account == "all" else [account]
-
     lines: List[str] = []
     if intent == "summary":
         for current in accounts:
@@ -1541,8 +1591,6 @@ def handle_feishu_query(query_text: str) -> str:
             lines.append(_query_endpoint(current, "orders", token))
             lines.append(_query_endpoint(current, "trades", token))
         return "\n\n".join(lines)
-    if intent == "health":
-        return "\n".join(_query_health(current, token) for current in accounts)
     if intent in {"positions", "orders", "trades"}:
         return "\n\n".join(_query_endpoint(current, intent, token) for current in accounts)
     if intent == "logs":
