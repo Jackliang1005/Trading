@@ -235,7 +235,7 @@ def test_reflection_uses_generation_day_validation_activity_not_only_latest_run(
         "2026-08-08",
     )
 
-    assert "\u751f\u6210\u65e5\u7d2f\u8ba1\u9a8c\u8bc1 3 \u6761" in text
+    assert "\u9a8c\u8bc1\u8fd0\u884c\u65e5\u7d2f\u8ba1\u9a8c\u8bc1 3 \u6761" in text
     assert "\u6b63\u786e 2 \u6761" in text
     assert "66.7%" in text
     assert "\u4e0a\u8ff0 3 \u6761\u5747\u4e3a\u65e7\u7248\u6216\u672a\u753b\u50cf\u5316\u6837\u672c" in text

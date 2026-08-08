@@ -445,11 +445,42 @@ def _valid_trades(ts: Dict) -> list:
     for item in _resolve_trades(ts):
         if not isinstance(item, dict):
             continue
-        volume = float(item.get("trade_volume", item.get("deal_volume", 0)) or 0)
-        price = float(item.get("trade_price", item.get("deal_price", 0)) or 0)
+        volume = _trade_volume(item)
+        price = _trade_price(item)
         if volume > 0 and price > 0:
             rows.append(item)
     return rows
+
+
+def _trade_volume(item: Dict) -> float:
+    return float(
+        item.get(
+            "traded_volume",
+            item.get("trade_volume", item.get("deal_volume", item.get("m_nTradedVolume", 0))),
+        )
+        or 0
+    )
+
+
+def _trade_price(item: Dict) -> float:
+    return float(
+        item.get(
+            "traded_price",
+            item.get("trade_price", item.get("deal_price", item.get("m_dTradedPrice", 0))),
+        )
+        or 0
+    )
+
+
+def _trade_amount(item: Dict) -> float:
+    amount = float(
+        item.get(
+            "traded_amount",
+            item.get("trade_amount", item.get("deal_amount", item.get("m_dTradedAmount", 0))),
+        )
+        or 0
+    )
+    return amount if amount > 0 else _trade_volume(item) * _trade_price(item)
 
 
 def _build_positions_table(positions: list) -> tuple[str, list]:
@@ -549,8 +580,8 @@ def build_trading_summary_report(ts: Dict) -> str:
     trades = _valid_trades(ts)
     buys = [item for item in trades if item.get("order_type", 0) in (23, "buy", "BUY")]
     sells = [item for item in trades if item not in buys]
-    buy_amount = sum(float(item.get("trade_amount", item.get("deal_amount", 0)) or 0) or float(item.get("trade_volume", item.get("deal_volume", 0)) or 0) * float(item.get("trade_price", item.get("deal_price", 0)) or 0) for item in buys)
-    sell_amount = sum(float(item.get("trade_amount", item.get("deal_amount", 0)) or 0) or float(item.get("trade_volume", item.get("deal_volume", 0)) or 0) * float(item.get("trade_price", item.get("deal_price", 0)) or 0) for item in sells)
+    buy_amount = sum(_trade_amount(item) for item in buys)
+    sell_amount = sum(_trade_amount(item) for item in sells)
     lines.append("### 今日交易活动")
     lines.append(f"- 已验证成交: {len(trades)} 笔")
     lines.append(f"- 买入 {len(buys)} 笔 / {buy_amount:,.2f} 元")
@@ -568,9 +599,9 @@ def build_trading_summary_report(ts: Dict) -> str:
             code = item.get("stock_code", item.get("code", ""))
             otype = item.get("order_type", 0)
             direction_label = "买" if otype in (23, "buy", "BUY") else "卖"
-            vol = item.get("trade_volume", item.get("deal_volume", 0)) or 0
-            price = item.get("trade_price", item.get("deal_price", 0)) or 0
-            amt = item.get("trade_amount", item.get("deal_amount", 0)) or 0
+            vol = _trade_volume(item)
+            price = _trade_price(item)
+            amt = _trade_amount(item)
             lines.append(f"| {code} | {direction_label} | {vol} | {price} | {float(amt):,.2f} |")
         lines.append("")
 
@@ -656,7 +687,7 @@ def _decision_monitor_attribution(trading_summary: Dict, outcome_summary: Dict |
         code = str(trade.get("stock_code") or trade.get("code") or "")
         if not code:
             continue
-        volume = float(trade.get("trade_volume", trade.get("deal_volume", 0)) or 0)
+        volume = _trade_volume(trade)
         side = "buy" if trade.get("order_type", 0) in (23, "buy", "BUY") else "sell"
         evidence = trade_evidence.setdefault(code, {"buy": 0.0, "sell": 0.0})
         evidence[side] += volume
@@ -751,14 +782,14 @@ def _reflection_freshness(as_of: str, generated_at: str) -> tuple[bool, str]:
         return False, "数据日期格式异常，持仓与成交不能视为当前状态。"
     age_days = (report_day - data_day).days
     if age_days == 0:
-        return True, "数据日与报告生成日一致。"
+        return True, "账户快照数据日与报告生成日一致。"
     if age_days > 0:
         return False, f"数据滞后 {age_days} 天；持仓与成交仅代表 {data_date} 快照，不可视为当前状态。"
     return False, f"数据日期晚于报告生成日 {abs(age_days)} 天，日期口径冲突，本次仅作排障参考。"
 
 
 def format_reflection_push_text(trading_summary: Dict, decision_attribution: str, backtest_result: Dict, generated_at: str, as_of: str) -> str:
-    from domain.services.report_style_service import money, source_label
+    from domain.services.report_style_service import money, position_pnl_pct, source_label
 
     trades = _valid_trades(trading_summary)
     raw_trades = _resolve_trades(trading_summary)
@@ -769,13 +800,23 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
     position_coverage_complete = bool(trading_summary.get("position_coverage_complete"))
     account_coverage_complete = bool(trading_summary.get("account_source_coverage_complete"))
     fully_current = is_fresh and position_coverage_complete and account_coverage_complete and not stale_sources
-    position_scope = "当前可验证" if fully_current else "数据快照中已知"
+    position_scope = "账户快照中当前可验证" if fully_current else "账户快照中已知"
+    portfolio_as_of = str(trading_summary.get("portfolio_as_of") or as_of or "未知")
+    trading_review_date = str(trading_summary.get("trading_review_date") or as_of or "未知")
+    validation_run_date = str(
+        trading_summary.get("validation_run_date")
+        or (backtest_result.get("activity_date") if isinstance(backtest_result, dict) else "")
+        or str(generated_at or "")[:10]
+        or "未知"
+    )
     lines = [
         "📝 每日交易复盘",
-        f"数据日：{as_of or '未知'}",
+        f"账户快照日：{portfolio_as_of}",
+        f"复盘交易日：{trading_review_date}",
+        f"验证运行日：{validation_run_date}",
         "",
         "**核心结论**",
-        f"- 已验证成交 {len(trades)} 笔；{position_scope}有 {len(positions)} 只有效持仓，组合累计持仓盈亏 {money(total_pnl)}。",
+        f"- 复盘交易日已验证成交 {len(trades)} 笔；{position_scope}有 {len(positions)} 只有效持仓，组合累计持仓盈亏 {money(total_pnl)}。",
     ]
     if len(raw_trades) > len(trades):
         lines.append(f"- 有 {len(raw_trades) - len(trades)} 条成交记录缺少正数成交量或成交价，已排除，不计入交易完成。")
@@ -795,15 +836,15 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
     for item in trades[:8]:
         side = "买入" if item.get("order_type", 0) in (23, "buy", "BUY") else "卖出"
         code = item.get("stock_code", item.get("code", ""))
-        volume = float(item.get("trade_volume", item.get("deal_volume", 0)) or 0)
-        price = float(item.get("trade_price", item.get("deal_price", 0)) or 0)
+        volume = _trade_volume(item)
+        price = _trade_price(item)
         lines.append(f"- {side} **{code}**｜{volume:g} 股｜{price:.3f} 元")
 
     lines.extend(["", "**持仓风险**"])
     if not positions:
         lines.append("- 当前没有有效持仓明细。")
     for item in sorted(positions, key=lambda row: abs(float(row.get("pnl") or 0)), reverse=True)[:6]:
-        lines.append(f"- **{item.get('name')}（{item.get('code')}）**｜市值 {money(item.get('market_value'))}｜盈亏 {money(item.get('pnl'))}｜{float(item.get('pnl_pct') or 0):+.1f}%")
+        lines.append(f"- **{item.get('name')}（{item.get('code')}）**｜市值 {money(item.get('market_value'))}｜盈亏 {money(item.get('pnl'))}｜{position_pnl_pct(float(item.get('pnl_pct') or 0) / 100)}")
 
     attribution_lines = [line for line in str(decision_attribution or "").splitlines() if line.strip() and not line.startswith("##")]
     lines.extend(["", "**建议闭环**", *(attribution_lines or ["- 当日没有可用的盘中建议快照。"])])
@@ -818,7 +859,7 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
     pending = int(backtest_result.get("pending", backtest_result.get("deferred", 0)) or 0)
     lines.extend(["", "**预测复盘**"])
     if checked:
-        lines.append(f"- 生成日累计验证 {checked} 条，正确 {correct} 条，胜率 {float(win_rate or 0):.1f}%。")
+        lines.append(f"- 验证运行日累计验证 {checked} 条，正确 {correct} 条，胜率 {float(win_rate or 0):.1f}%。")
     else:
         lines.append("- 今日没有完成验证的预测样本，不输出胜率结论。")
     if profiled_evaluated:

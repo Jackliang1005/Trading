@@ -741,19 +741,64 @@ def _query_reflection() -> str:
     if not candidates:
         return "暂无可用的交易复盘快照；本次不根据旧报告推断交易结果。"
     try:
-        summary = json.loads(candidates[0].read_text(encoding="utf-8"))
+        current_summary = json.loads(candidates[0].read_text(encoding="utf-8"))
     except Exception:
         return "最新交易复盘快照无法读取；本次不输出成交或盈亏结论。"
+    trading_date = _latest_reflection_trading_date(datetime.now().strftime("%Y-%m-%d"))
+    trading_path = reports_dir / f"trading_summary_{trading_date.replace('-', '')}.json"
+    trading_summary = current_summary
+    if trading_path.exists():
+        try:
+            trading_summary = json.loads(trading_path.read_text(encoding="utf-8"))
+        except Exception:
+            trading_summary = current_summary
+    summary = _compose_reflection_summary(current_summary, trading_summary, trading_date)
     as_of = str(summary.get("as_of_date") or candidates[0].stem.removeprefix("trading_summary_") or "")
     if len(as_of) == 8 and as_of.isdigit():
         as_of = f"{as_of[:4]}-{as_of[4:6]}-{as_of[6:]}"
     return format_reflection_push_text(
         summary,
-        _decision_monitor_attribution(summary),
+        _decision_monitor_attribution(trading_summary, target_date=trading_date),
         summary.get("prediction_validation") or {},
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         as_of,
     )
+
+
+def _latest_reflection_trading_date(reference_date: str) -> str:
+    try:
+        import sys
+
+        trading_dir = str(Path(__file__).resolve().parents[3] / "trading")
+        if trading_dir not in sys.path:
+            sys.path.insert(0, trading_dir)
+        from trading_core_new.longterm.trading_calendar import last_trading_day
+
+        return last_trading_day(reference_date)
+    except Exception:
+        cursor = datetime.strptime(reference_date[:10], "%Y-%m-%d")
+        while cursor.weekday() >= 5:
+            cursor -= timedelta(days=1)
+        return cursor.strftime("%Y-%m-%d")
+
+
+def _compose_reflection_summary(current_summary: Dict, trading_summary: Dict, trading_date: str) -> Dict:
+    """Keep the freshest portfolio while attaching trades from the latest trading day."""
+    merged = dict(current_summary or {})
+    trading_rows = []
+    for key in ("today_trades", "qmt_trades", "trades"):
+        value = (trading_summary or {}).get(key)
+        if isinstance(value, list):
+            trading_rows = list(value)
+            if value:
+                break
+    merged["today_trades"] = trading_rows
+    merged["today_trade_count"] = len(trading_rows)
+    merged["portfolio_as_of"] = str(merged.get("as_of_date") or "")[:10]
+    merged["trading_review_date"] = str(trading_date or "")[:10]
+    validation = merged.get("prediction_validation") or {}
+    merged["validation_run_date"] = str(validation.get("activity_date") or merged.get("as_of_date") or "")[:10]
+    return merged
 
 
 def _query_strategy() -> str:

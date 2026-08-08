@@ -35,7 +35,7 @@ def test_reflection_matches_sell_direction_quantity_and_action_level(tmp_path, m
         "today_trades": [
             {"stock_code": "600001.SH", "order_type": "sell", "trade_volume": 50, "trade_price": 10},
             {"stock_code": "600001.SH", "order_type": "buy", "trade_volume": 20, "trade_price": 9.8},
-            {"stock_code": "603986.SH", "order_type": "sell", "trade_volume": 100, "trade_price": 400},
+            {"stock_code": "603986.SH", "order_type": "sell", "traded_volume": 100, "traded_price": 400},
         ]
     }
 

@@ -57,6 +57,17 @@ def test_position_pnl_percentage_preserves_cost_noise_precision():
     assert position_pnl_pct(-0.30) == "-30.0%"
 
 
+def test_reflection_accepts_actual_qmt_traded_field_names():
+    trade = {
+        "stock_code": "513050.SH",
+        "traded_volume": 32700,
+        "traded_price": 1.161,
+        "order_type": 23,
+    }
+
+    assert reflection_runtime_service._valid_trades({"today_trades": [trade]}) == [trade]
+
+
 def test_normalized_portfolio_position_preserves_cumulative_pnl_and_cost_ratio():
     evidence = resolve_position_pnl(
         {
