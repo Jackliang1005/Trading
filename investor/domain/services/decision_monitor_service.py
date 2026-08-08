@@ -461,6 +461,26 @@ def _action_level(
     return "observe"
 
 
+def _position_display_priority(item: Dict[str, Any]) -> Tuple[int, float, float]:
+    """Order by action urgency, then estimated impact on portfolio capital."""
+    level = str(item.get("action_level") or "observe")
+    loss_review = item.get("loss_review") or {}
+    if level == "prepare":
+        rank = 0
+    elif level == "verify":
+        rank = 1
+    elif loss_review.get("required"):
+        rank = 2
+    else:
+        rank = 3
+    pnl_ratio = loss_review.get("pnl_ratio")
+    pnl_value = _safe_float(pnl_ratio)
+    drawdown = abs(pnl_value) if pnl_ratio is not None and pnl_value < 0 else 0.0
+    absolute_loss = abs(min(0.0, _safe_float(item.get("pnl"))))
+    impact = absolute_loss if absolute_loss > 0 else _safe_float(item.get("weight")) * drawdown
+    return rank, -impact, -drawdown
+
+
 def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
     now = datetime.now()
     closing = _load_latest_closing_payload()
@@ -736,7 +756,8 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
     lines.extend(["", "**持仓检查**"])
     if not positions:
         lines.append("- 没有可核验的持仓计划。")
-    for item in positions[:max_positions]:
+    display_positions = sorted(positions, key=_position_display_priority)
+    for item in display_positions[:max_positions]:
         quote = item.get("quote") or {}
         if quote.get("available"):
             quote_text = ("现价" if monitor.get("trading_session") else "最近快照") + f" {quote.get('price', 0):.3f}"
@@ -789,5 +810,6 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
         else:
             lines.append("- 非交易时段未请求实时现金，现金比例采用最近组合快照。")
     lines.append("- 行动层级：观察＝等待证据；核验＝补齐行情或数量；准备＝可形成数量参考，仍需人工确认。")
+    lines.append("- 持仓先按行动层级、再按累计亏损对组合的影响排序，不仅按跌幅大小排序。")
     lines.append("- 本报告只提供监控建议，不会自动下单。")
     return "\n".join(lines)

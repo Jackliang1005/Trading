@@ -171,3 +171,39 @@ def test_market_closed_report_prioritizes_loss_review_and_shows_cost_risk():
     assert "累计盈亏 -0.01%（成本噪声）｜下次复核 常规" in text
     assert "盘外不生成价格触发或卖出数量" in text
     assert "数量参考：" not in text
+
+
+def test_position_display_priority_puts_loss_review_before_regular_observation():
+    regular = {
+        "action_level": "observe",
+        "weight": 0.20,
+        "loss_review": {"required": False, "pnl_ratio": -0.0001},
+    }
+    severe = {
+        "action_level": "observe",
+        "weight": 0.02,
+        "loss_review": {"required": True, "pnl_ratio": -0.40},
+    }
+
+    ordered = sorted([regular, severe], key=service._position_display_priority)
+
+    assert ordered == [severe, regular]
+
+
+def test_position_display_priority_uses_portfolio_loss_impact_within_review_tier():
+    concentrated_loss = {
+        "action_level": "observe",
+        "weight": 0.62,
+        "pnl": -117000,
+        "loss_review": {"required": True, "pnl_ratio": -0.32},
+    }
+    small_severe_loss = {
+        "action_level": "observe",
+        "weight": 0.02,
+        "pnl": -5300,
+        "loss_review": {"required": True, "pnl_ratio": -0.41},
+    }
+
+    ordered = sorted([small_severe_loss, concentrated_loss], key=service._position_display_priority)
+
+    assert ordered == [concentrated_loss, small_severe_loss]
