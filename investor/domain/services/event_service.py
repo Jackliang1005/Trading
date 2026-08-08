@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -27,6 +28,13 @@ DEFAULT_EVENT_SOURCES = [
     "https://wap.eastmoney.com/",
 ]
 OPENCLAW_FEISHU_SEND_TIMEOUT = int(os.environ.get("OPENCLAW_FEISHU_SEND_TIMEOUT", "180"))
+
+
+def _openclaw_binary() -> str:
+    configured = str(os.environ.get("OPENCLAW_BIN") or "/usr/local/bin/openclaw").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    return shutil.which("openclaw") or configured or "openclaw"
 
 DEFAULT_GLOBAL_EVENT_SOURCES = [
     "https://finance.yahoo.com/news/rssindex",
@@ -703,7 +711,7 @@ def push_event_to_feishu(event: Dict[str, Any], target: str = "") -> Dict[str, A
             "transport": "rich_card",
         }
     cmd = [
-        "openclaw", "message", "send",
+        _openclaw_binary(), "message", "send",
         "--channel", "feishu",
         "--target", clean_target,
         "-m", message,

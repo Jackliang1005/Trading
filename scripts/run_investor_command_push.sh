@@ -9,7 +9,11 @@ if [[ "$#" -lt 1 ]]; then
   exit 64
 fi
 
-export PATH="/root/.nvm/versions/node/v22.22.0/bin:/root/.local/share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/root/bin:$PATH"
+export PATH="/usr/local/bin:/root/.local/share/pnpm:/root/.nvm/versions/node/v22.22.0/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/root/bin:$PATH"
+OPENCLAW_BIN="${OPENCLAW_BIN:-/usr/local/bin/openclaw}"
+if [[ ! -x "$OPENCLAW_BIN" ]]; then
+  OPENCLAW_BIN="$(command -v openclaw || true)"
+fi
 TARGET="${INVESTOR_FEISHU_TARGET:-user:ou_f7d5ef82efd4396dea7a604691c56f75}"
 if [[ -n "$TARGET" && "$TARGET" != user:* && "$TARGET" != chat:* ]]; then
   TARGET="user:$TARGET"
@@ -196,7 +200,7 @@ PY
       FALLBACK_MESSAGE="$BODY"
     fi
     set +e
-    timeout "$OPENCLAW_FEISHU_SEND_TIMEOUT" openclaw message send --channel feishu --target "$TARGET" -m "$FALLBACK_MESSAGE" >/tmp/openclaw_investor_push_send.out 2>&1
+    timeout "$OPENCLAW_FEISHU_SEND_TIMEOUT" "$OPENCLAW_BIN" message send --channel feishu --target "$TARGET" -m "$FALLBACK_MESSAGE" >/tmp/openclaw_investor_push_send.out 2>&1
     RAW_SEND_RC=$?
     set -e
     printf '%s' "$FALLBACK_MESSAGE" | \

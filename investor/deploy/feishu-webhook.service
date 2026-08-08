@@ -8,7 +8,8 @@ User=root
 WorkingDirectory=/root/.openclaw/workspace/investor
 Environment=HOME=/root
 Environment=NODE_VERSION=22.22.0
-Environment=PATH=/root/.local/share/pnpm:/root/.nvm/versions/node/v22.22.0/bin:/root/.local/bin:/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PATH=/usr/local/bin:/root/.local/share/pnpm:/root/.nvm/versions/node/v22.22.0/bin:/root/.local/bin:/root/bin:/usr/local/sbin:/usr/sbin:/usr/bin
+Environment=OPENCLAW_BIN=/usr/local/bin/openclaw
 Environment=INVESTOR_ROOT=/root/.openclaw/workspace/investor
 EnvironmentFile=-/root/.openclaw/workspace/investor/.env
 Environment=INVESTOR_T_LIVE_ENABLED=0

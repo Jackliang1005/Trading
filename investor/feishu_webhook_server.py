@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +40,13 @@ LOG_PATH = INVESTOR_DIR / "logs" / "feishu_webhook.log"
 DEFAULT_FEISHU_TARGET = "ou_f7d5ef82efd4396dea7a604691c56f75"
 OPENCLAW_FEISHU_SEND_TIMEOUT = int(os.environ.get("OPENCLAW_FEISHU_SEND_TIMEOUT", "180"))
 os.environ.setdefault("INVESTOR_FEISHU_TARGET", DEFAULT_FEISHU_TARGET)
+
+
+def _openclaw_binary() -> str:
+    configured = str(os.environ.get("OPENCLAW_BIN") or "/usr/local/bin/openclaw").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    return shutil.which("openclaw") or configured or "openclaw"
 
 FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
 FEISHU_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
@@ -439,7 +447,7 @@ def _send_feishu(target: str, message: str) -> bool:
         log_line(f"_send_feishu quality gate blocked fallback: {issues}")
         return False
     cmd = [
-        "openclaw", "message", "send",
+        _openclaw_binary(), "message", "send",
         "--channel", "feishu",
         "--target", clean,
         "-m", message,
