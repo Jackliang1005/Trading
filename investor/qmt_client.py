@@ -184,63 +184,84 @@ class QMTManager:
         self.dual_mode = self.trade is not None
         self._account_id = _env("QMT_ACCOUNT_ID")
         self._account_type = _env("QMT_ACCOUNT_TYPE", "STOCK")
+        self.last_errors: Dict[str, str] = {}
 
     # -- account helpers ------------------------------------------------------
 
     def _account_params(self) -> Dict[str, str]:
         return {"account_id": self._account_id, "account_type": self._account_type}
 
+    def _sources(self):
+        sources = [("main", self.main)]
+        if self.trade:
+            sources.append(("trade", self.trade))
+        return sources
+
+    def _record_error(self, source: str, operation: str, exc: Exception) -> None:
+        self.last_errors[f"{source}.{operation}"] = f"{type(exc).__name__}: {exc}"
+
     # -- unified access -------------------------------------------------------
 
     def get_all_positions(self) -> List[Dict[str, Any]]:
-        """Merge positions from both servers, deduplicated by stock_code."""
-        seen: set = set()
+        """Merge positions without collapsing the same security across accounts."""
+        seen: set[tuple[str, str]] = set()
         merged: List[Dict[str, Any]] = []
-        for pos in self.main.get_positions(**self._account_params()):
-            code = pos.get("stock_code", "")
-            if code and code not in seen:
-                seen.add(code)
-                pos["_source"] = "main"
+        for source, client in self._sources():
+            try:
+                rows = client.get_positions(**self._account_params())
+            except Exception as exc:
+                self._record_error(source, "positions", exc)
+                continue
+            for raw in rows:
+                pos = dict(raw)
+                code = str(pos.get("stock_code") or pos.get("code") or "").strip().upper()
+                identity = (source, code)
+                if not code or identity in seen:
+                    continue
+                seen.add(identity)
+                pos["_source"] = source
+                pos["_position_identity"] = f"{source}:{code}"
                 merged.append(pos)
-        if self.trade:
-            for pos in self.trade.get_positions(**self._account_params()):
-                code = pos.get("stock_code", "")
-                if code and code not in seen:
-                    seen.add(code)
-                    pos["_source"] = "trade"
-                    merged.append(pos)
         return merged
 
     def get_all_accounts(self) -> Dict[str, Dict[str, Any]]:
         """Return account info from both servers keyed by source label."""
         result: Dict[str, Dict[str, Any]] = {}
-        result["main"] = self.main.get_account_asset(**self._account_params())
-        if self.trade:
-            result["trade"] = self.trade.get_account_asset(**self._account_params())
+        for source, client in self._sources():
+            try:
+                result[source] = client.get_account_asset(**self._account_params())
+            except Exception as exc:
+                self._record_error(source, "asset", exc)
         return result
 
     def get_all_orders(self) -> List[Dict[str, Any]]:
         """Return today's orders from both servers."""
-        orders = self.main.get_orders(**self._account_params())
-        for o in orders:
-            o["_source"] = "main"
-        if self.trade:
-            trade_orders = self.trade.get_orders(**self._account_params())
-            for o in trade_orders:
-                o["_source"] = "trade"
-            orders.extend(trade_orders)
+        orders = []
+        for source, client in self._sources():
+            try:
+                rows = client.get_orders(**self._account_params())
+            except Exception as exc:
+                self._record_error(source, "orders", exc)
+                continue
+            for raw in rows:
+                item = dict(raw)
+                item["_source"] = source
+                orders.append(item)
         return orders
 
     def get_all_trades(self) -> List[Dict[str, Any]]:
         """Return today's trades from both servers."""
-        trades = self.main.get_trades(**self._account_params())
-        for t in trades:
-            t["_source"] = "main"
-        if self.trade:
-            trade_trades = self.trade.get_trades(**self._account_params())
-            for t in trade_trades:
-                t["_source"] = "trade"
-            trades.extend(trade_trades)
+        trades = []
+        for source, client in self._sources():
+            try:
+                rows = client.get_trades(**self._account_params())
+            except Exception as exc:
+                self._record_error(source, "trades", exc)
+                continue
+            for raw in rows:
+                item = dict(raw)
+                item["_source"] = source
+                trades.append(item)
         return trades
 
     def get_market_data(self, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -258,6 +279,7 @@ class QMTManager:
 
     def get_trading_summary(self) -> Dict[str, Any]:
         """Compute a combined P&L / trade summary across both servers."""
+        self.last_errors = {}
         accounts = self.get_all_accounts()
         positions = self.get_all_positions()
         trades = self.get_all_trades()
@@ -302,6 +324,8 @@ class QMTManager:
                 sell_amount += amt
 
         return {
+            "expected_sources": [source for source, _ in self._sources()],
+            "source_errors": dict(self.last_errors),
             "accounts": accounts,
             "positions": positions,
             "positions_count": len(positions),

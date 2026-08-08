@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 from collections import defaultdict
@@ -77,35 +78,114 @@ def _account_metrics(data: Dict[str, Any], total_position_value: float) -> Dict[
 
     known_cash = 0.0
     known_total_assets = 0.0
+    account_market_values: Dict[str, float] = {}
     valid_cash_sources: List[str] = []
     invalid_sources: List[str] = []
+    expected_sources = [str(source) for source in summary.get("expected_sources") or source_accounts.keys()]
+    missing_sources = [source for source in expected_sources if source not in source_accounts]
+    stale_sources = {str(source): str(as_of) for source, as_of in (summary.get("stale_sources") or {}).items()}
+    invalid_sources.extend(missing_sources)
+    invalid_sources.extend(stale_sources)
     for source, account in source_accounts.items():
         if not isinstance(account, dict) or not account:
             invalid_sources.append(str(source))
             continue
         raw_cash = account.get("cash", account.get("m_dCash"))
         raw_total = account.get("total_asset", account.get("m_dTotalAsset"))
+        raw_market_value = account.get("market_value", account.get("m_dMarketValue"))
         cash_ok = _plausible_account_value(raw_cash)
         total_ok = _plausible_account_value(raw_total)
+        market_value_ok = _plausible_account_value(raw_market_value)
         if cash_ok:
             known_cash += float(raw_cash)
             valid_cash_sources.append(str(source))
         if total_ok:
             known_total_assets += float(raw_total)
+        if market_value_ok:
+            account_market_values[str(source)] = float(raw_market_value)
         if not cash_ok or not total_ok:
             invalid_sources.append(str(source))
 
     # Position rows are independently verified by source.  When one account's
     # asset endpoint contains a sentinel (for example 99,999,999,999), compute
     # concentration from position value plus only known-good cash.
-    effective_total = max(total_position_value + known_cash, known_total_assets, total_position_value)
+    known_account_market_value = sum(account_market_values.values())
+    effective_total = max(
+        total_position_value + known_cash,
+        known_account_market_value + known_cash,
+        known_total_assets,
+        total_position_value,
+    )
     return {
         "cash": known_cash,
         "cash_complete": not invalid_sources,
         "valid_cash_sources": valid_cash_sources,
         "invalid_sources": sorted(set(invalid_sources)),
+        "expected_sources": expected_sources,
+        "missing_sources": missing_sources,
+        "stale_sources": stale_sources,
+        "source_coverage_complete": not missing_sources and not stale_sources,
+        "account_market_values": account_market_values,
+        "known_account_market_value": known_account_market_value,
         "effective_total": effective_total,
     }
+
+
+def _position_coverage(positions: List[Dict[str, Any]], account_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect account rows lost or duplicated while building a combined snapshot."""
+    observed: Dict[str, float] = defaultdict(float)
+    for item in positions:
+        observed[str(item.get("_source") or "unknown")] += _market_value(item)
+    expected = account_metrics.get("account_market_values") or {}
+    mismatches = []
+    for source, expected_value in expected.items():
+        observed_value = observed.get(str(source), 0.0)
+        tolerance = max(1.0, abs(float(expected_value)) * 0.005)
+        if abs(observed_value - float(expected_value)) > tolerance:
+            mismatches.append(
+                {
+                    "source": str(source),
+                    "account_market_value": round(float(expected_value), 2),
+                    "position_market_value": round(observed_value, 2),
+                    "gap": round(float(expected_value) - observed_value, 2),
+                }
+            )
+    expected_total = sum(float(value) for value in expected.values())
+    observed_total = sum(observed.get(str(source), 0.0) for source in expected)
+    return {
+        "complete": not mismatches,
+        "expected_market_value": round(expected_total, 2),
+        "observed_market_value": round(observed_total, 2),
+        "gap": round(expected_total - observed_total, 2),
+        "mismatches": mismatches,
+    }
+
+
+def _aggregate_security_exposures(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate the same security across accounts for concentration analysis."""
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for item in positions:
+        code = _position_code(item)
+        if not code:
+            continue
+        exposure = grouped.setdefault(
+            code,
+            {
+                "code": code,
+                "name": _position_name(item),
+                "volume": 0,
+                "market_value": 0.0,
+                "pnl": 0.0,
+                "sources": [],
+            },
+        )
+        exposure["volume"] += _volume(item)
+        exposure["market_value"] += _market_value(item)
+        exposure["pnl"] += _float_profit(item)
+        source = str(item.get("_source") or "unknown")
+        if source not in exposure["sources"]:
+            exposure["sources"].append(source)
+    return list(grouped.values())
 
 
 def _snapshot_is_usable(snapshot: Dict[str, Any] | None) -> bool:
@@ -156,12 +236,83 @@ def _recent_combined_snapshots(limit: int = 50) -> List[Dict[str, Any]]:
     return snapshots
 
 
+def _missing_snapshot_sources(snapshot: Dict[str, Any]) -> List[str]:
+    data = snapshot.get("data", {}) or {}
+    summary = data.get("qmt_trading_summary", {}) or {}
+    expected = [str(source) for source in summary.get("expected_sources") or []]
+    if not expected:
+        return []
+    accounts = summary.get("accounts", {}) or {}
+    error_sources = {str(key).split(".", 1)[0] for key in (summary.get("source_errors") or {})}
+    return [source for source in expected if source not in accounts or source in error_sources]
+
+
+def _snapshot_source_payload(snapshot: Dict[str, Any], source: str) -> tuple[Dict[str, Any] | None, List[Dict[str, Any]]]:
+    data = snapshot.get("data", {}) or {}
+    summary = data.get("qmt_trading_summary", {}) or {}
+    account = (summary.get("accounts", {}) or {}).get(source)
+    positions = [
+        copy.deepcopy(item)
+        for item in data.get("qmt_positions", data.get("positions", [])) or []
+        if isinstance(item, dict) and str(item.get("_source") or "") == source
+    ]
+    return copy.deepcopy(account) if isinstance(account, dict) else None, positions
+
+
+def _enrich_partial_snapshot(
+    latest: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    max_source_age_days: int = 3,
+) -> Dict[str, Any]:
+    """Fill an unavailable account from its recent per-source snapshot, explicitly stale."""
+    missing = _missing_snapshot_sources(latest)
+    if not missing:
+        return latest
+    enriched = copy.deepcopy(latest)
+    data = enriched.setdefault("data", {})
+    summary = data.setdefault("qmt_trading_summary", {})
+    accounts = summary.setdefault("accounts", {})
+    positions = list(data.get("qmt_positions", data.get("positions", [])) or [])
+    stale_sources: Dict[str, str] = {}
+    try:
+        latest_date = date.fromisoformat(str(latest.get("as_of_date") or "")[:10])
+    except Exception:
+        latest_date = date.today()
+    for source in missing:
+        for candidate in candidates:
+            if candidate.get("id") == latest.get("id"):
+                continue
+            try:
+                candidate_date = date.fromisoformat(str(candidate.get("as_of_date") or "")[:10])
+            except Exception:
+                continue
+            age = (latest_date - candidate_date).days
+            if age < 0 or age > max_source_age_days:
+                continue
+            account, source_positions = _snapshot_source_payload(candidate, source)
+            if account is None:
+                continue
+            accounts[source] = account
+            positions = [item for item in positions if str(item.get("_source") or "") != source]
+            positions.extend(source_positions)
+            stale_sources[source] = candidate_date.isoformat()
+            break
+    if stale_sources:
+        data["qmt_positions"] = positions
+        summary["stale_sources"] = stale_sources
+        enriched.setdefault("metadata", {})["stale_sources"] = stale_sources
+    return enriched
+
+
 def _select_risk_snapshot(max_fallback_age_days: int = 3) -> tuple[Dict[str, Any] | None, bool]:
     latest = db.get_latest_portfolio_snapshot(account_scope="combined")
+    recent = _recent_combined_snapshots()
+    if latest:
+        latest = _enrich_partial_snapshot(latest, recent, max_source_age_days=max_fallback_age_days)
     if _snapshot_is_usable(latest):
         return latest, False
     latest_id = latest.get("id") if latest else None
-    for candidate in _recent_combined_snapshots():
+    for candidate in recent:
         if latest_id is not None and candidate.get("id") == latest_id:
             continue
         age = _snapshot_age_days(str(candidate.get("as_of_date") or ""))
@@ -188,11 +339,13 @@ def build_risk_report() -> Dict[str, Any]:
     total_mv = sum(_market_value(p) for p in positions)
     total_pnl = sum(_float_profit(p) for p in positions)
     account_metrics = _account_metrics(data, total_mv)
+    position_coverage = _position_coverage(positions, account_metrics)
     cash = float(account_metrics["cash"])
     effective_total = float(account_metrics["effective_total"])
-    sorted_positions = sorted(positions, key=_market_value, reverse=True)
-    top1_ratio = (_market_value(sorted_positions[0]) / effective_total) if sorted_positions and effective_total else 0.0
-    top3_mv = sum(_market_value(p) for p in sorted_positions[:3])
+    exposures = _aggregate_security_exposures(positions)
+    sorted_positions = sorted(exposures, key=lambda item: float(item.get("market_value") or 0), reverse=True)
+    top1_ratio = (float(sorted_positions[0]["market_value"]) / effective_total) if sorted_positions and effective_total else 0.0
+    top3_mv = sum(float(p.get("market_value") or 0) for p in sorted_positions[:3])
     top3_ratio = (top3_mv / effective_total) if effective_total else 0.0
     by_source: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "market_value": 0.0, "pnl": 0.0})
     for p in positions:
@@ -210,6 +363,12 @@ def build_risk_report() -> Dict[str, Any]:
         flags.append("top1_concentration_high")
     if top3_ratio >= 0.70:
         flags.append("top3_concentration_high")
+    if not position_coverage["complete"]:
+        flags.append("position_coverage_incomplete")
+    if not account_metrics["source_coverage_complete"]:
+        flags.append("account_source_incomplete")
+    if account_metrics["stale_sources"]:
+        flags.append("stale_account_source")
     if total_pnl < 0:
         flags.append("portfolio_unrealized_loss")
     if not flags:
@@ -221,26 +380,35 @@ def build_risk_report() -> Dict[str, Any]:
         "snapshot_created_at": str(snapshot.get("created_at") or ""),
         "as_of": as_of,
         "snapshot_age_days": age_days,
-        "positions_count": len(positions),
+        "positions_count": len(exposures),
+        "position_rows_count": len(positions),
         "total_market_value": round(total_mv, 2),
         "effective_total_asset": round(effective_total, 2),
         "cash": round(cash, 2),
         "cash_ratio": round(cash / effective_total, 4) if effective_total else 0.0,
         "cash_complete": bool(account_metrics["cash_complete"]),
         "invalid_account_sources": account_metrics["invalid_sources"],
+        "account_source_coverage_complete": bool(account_metrics["source_coverage_complete"]),
+        "missing_account_sources": account_metrics["missing_sources"],
+        "stale_account_sources": account_metrics["stale_sources"],
+        "position_coverage_complete": bool(position_coverage["complete"]),
+        "position_market_value_gap": position_coverage["gap"],
+        "position_coverage_mismatches": position_coverage["mismatches"],
+        "reported_account_market_value": position_coverage["expected_market_value"],
         "total_unrealized_pnl": round(total_pnl, 2),
         "top1_ratio": round(top1_ratio, 4),
         "top3_ratio": round(top3_ratio, 4),
         "by_source": {k: {"count": v["count"], "market_value": round(v["market_value"], 2), "pnl": round(v["pnl"], 2)} for k, v in by_source.items()},
         "top_positions": [
             {
-                "code": _position_code(p),
-                "name": _position_name(p),
-                "source": str(p.get("_source") or "unknown"),
-                "volume": _volume(p),
-                "market_value": round(_market_value(p), 2),
-                "weight": round((_market_value(p) / effective_total) if effective_total else 0.0, 4),
-                "pnl": round(_float_profit(p), 2),
+                "code": str(p.get("code") or ""),
+                "name": str(p.get("name") or p.get("code") or ""),
+                "source": str((p.get("sources") or ["unknown"])[0]) if len(p.get("sources") or []) == 1 else "combined",
+                "sources": list(p.get("sources") or []),
+                "volume": int(p.get("volume") or 0),
+                "market_value": round(float(p.get("market_value") or 0), 2),
+                "weight": round((float(p.get("market_value") or 0) / effective_total) if effective_total else 0.0, 4),
+                "pnl": round(float(p.get("pnl") or 0), 2),
             }
             for p in sorted_positions[:8]
         ],
@@ -264,7 +432,7 @@ def format_risk_report(report: Dict[str, Any]) -> str:
         "",
         "**核心结论**",
         f"- {join_cn(flags)}。",
-        f"- {'快照记录' if report.get('fallback_snapshot') else '当前'} {report.get('positions_count')} 只持仓，市值 {money(report.get('total_market_value'))}，浮动盈亏 {money(report.get('total_unrealized_pnl'))}。",
+        f"- {'快照记录' if report.get('fallback_snapshot') else '当前'}已知 {report.get('positions_count')} 条持仓明细，市值 {money(report.get('total_market_value'))}，浮动盈亏 {money(report.get('total_unrealized_pnl'))}。",
         "",
         "**仓位结构**",
         (
@@ -272,13 +440,31 @@ def format_risk_report(report: Dict[str, Any]) -> str:
             if report.get("cash_complete")
             else f"- 可验证现金 {money(report.get('cash'))}（部分账户资产字段异常，不计算完整现金占比）；"
         )
-        + f"第一大持仓 {pct(report.get('top1_ratio', 0) * 100)}，前三大持仓 {pct(report.get('top3_ratio', 0) * 100)}。",
+        + (
+            f"第一大持仓 {pct(report.get('top1_ratio', 0) * 100)}，前三大持仓 {pct(report.get('top3_ratio', 0) * 100)}。"
+            if report.get("position_coverage_complete", True)
+            else f"按已知明细计算第一大持仓 {pct(report.get('top1_ratio', 0) * 100)}、前三大持仓 {pct(report.get('top3_ratio', 0) * 100)}，不视为完整组合比例。"
+        ),
     ]
+    if not report.get("position_coverage_complete", True):
+        lines.append(
+            f"- 持仓明细覆盖不完整：账户资产口径市值比明细合计多 {money(report.get('position_market_value_gap'))}；"
+            "可能存在跨账户同代码被合并或明细缺失，修复前不输出精确总仓位。"
+        )
     if report.get("invalid_account_sources"):
         lines.append(
             "- 账户资产降级："
             + join_cn(source_label(item) for item in report.get("invalid_account_sources") or [])
-            + " 的现金或总资产值未通过合理性校验；集中度按可验证持仓市值与现金计算。"
+            + " 的接口缺失或资产值未通过合理性校验；集中度按可验证持仓市值与现金计算。"
+        )
+    if report.get("stale_account_sources"):
+        lines.append(
+            "- 账户持仓回退："
+            + join_cn(
+                f"{source_label(source)}使用 {as_of} 快照"
+                for source, as_of in (report.get("stale_account_sources") or {}).items()
+            )
+            + "；与当前账户明细分开标注，不冒充实时持仓。"
         )
     source_parts = []
     for key, value in sorted((report.get("by_source") or {}).items()):
@@ -289,7 +475,8 @@ def format_risk_report(report: Dict[str, Any]) -> str:
         lines.append("- 实时账户链路未提供可信数据；以上为最近可验证快照，不代表当前实时持仓或成交状态。")
     lines.extend(["", "**重点持仓**"])
     for p in report.get("top_positions", [])[:8]:
-        lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{source_label(p['source'])}")
+        sources = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
+        lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{sources}")
     lines.extend(["", "**执行原则**"])
     if report.get("top1_ratio", 0) >= 0.30:
         lines.append("- 优先降低单票集中度；弱于所属板块且无放量承接时，不用补仓摊低成本。")

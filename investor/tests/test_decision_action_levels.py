@@ -13,6 +13,22 @@ def test_action_level_requires_live_evidence_and_actionable_quantity():
     assert service._action_level("observe", True, True, {}) == "observe"
 
 
+def test_cross_account_position_never_generates_one_combined_sell_quantity():
+    hint = service._reduce_execution_hint(
+        {
+            "weight": 0.62,
+            "volume": 600,
+            "source": "combined",
+            "sources": ["main", "trade"],
+        },
+        "reduce_priority",
+    )
+
+    assert hint["actionable"] is False
+    assert hint["suggested_qty"] == 0
+    assert "分账户核对可用数量" in hint["note"]
+
+
 def test_human_report_explains_prepare_level_without_claiming_execution():
     monitor = {
         "available": True,

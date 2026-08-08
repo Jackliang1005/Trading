@@ -117,6 +117,10 @@ def _build_actions(risk: Dict[str, Any], decision: Dict[str, Any], events: Dict[
         actions.append({"level": "verify", "text": "下一交易时段优先核验第一大持仓相对强弱与承接；集中度未改善前不扩张新仓。"})
     if not risk.get("cash_complete"):
         actions.append({"level": "verify", "text": "恢复并回读缺失账户的资产字段；完整现金不可验证前，不判断资金充足或不足。"})
+    if not risk.get("position_coverage_complete", True):
+        actions.append({"level": "verify", "text": "重新采集双账户持仓并核对同代码跨账户明细；覆盖完整前不按当前明细计算精确总仓位。"})
+    if risk.get("stale_account_sources"):
+        actions.append({"level": "verify", "text": "历史账户持仓只用于保持组合连续性；恢复实时接口并逐账户回读后，才能升级到准备层级。"})
     if events.get("events"):
         actions.append({"level": "observe", "text": f"跟踪“{events['events'][0]['title']}”的盘前延续性，只在板块与量价同时确认后升级。"})
     if not actions:
@@ -172,18 +176,24 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     lines.extend(["", "**账户与组合风险**"])
     if risk.get("available"):
         lines.append(
-            f"- 数据日 {risk.get('as_of') or '未知'}；{int(risk.get('positions_count', 0) or 0)} 只持仓，"
-            f"市值 {money(risk.get('total_market_value'))}，浮动盈亏 {money(risk.get('total_unrealized_pnl'))}。"
+            f"- 数据日 {risk.get('as_of') or '未知'}；已知 {int(risk.get('positions_count', 0) or 0)} 条持仓明细，"
+            f"明细市值 {money(risk.get('total_market_value'))}，浮动盈亏 {money(risk.get('total_unrealized_pnl'))}。"
         )
         if risk.get("cash_complete"):
             lines.append(f"- 现金 {money(risk.get('cash'))}（{pct(float(risk.get('cash_ratio') or 0) * 100)}）。")
         else:
             lines.append(f"- 可验证现金 {money(risk.get('cash'))}；部分账户不可验证，不计算完整现金占比。")
+        concentration_prefix = "" if risk.get("position_coverage_complete", True) else "按已知明细计算，"
         lines.append(
-            f"- 第一大持仓 {pct(float(risk.get('top1_ratio') or 0) * 100)}，"
+            f"- {concentration_prefix}第一大持仓 {pct(float(risk.get('top1_ratio') or 0) * 100)}，"
             f"前三大持仓 {pct(float(risk.get('top3_ratio') or 0) * 100)}；"
             f"{join_cn((risk_label(flag) for flag in risk.get('risk_flags') or []), '未发现重大结构风险')}。"
         )
+        if not risk.get("position_coverage_complete", True):
+            lines.append(
+                f"- 账户资产口径市值比持仓明细多 {money(risk.get('position_market_value_gap'))}；"
+                "当前持仓数量和集中度不是完整组合结论。"
+            )
     else:
         lines.append("- 持仓风险快照不可用，本次不输出账户或仓位结论。")
 

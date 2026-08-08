@@ -313,6 +313,14 @@ def _reduce_execution_hint(position: Dict[str, Any], state: str) -> Dict[str, An
         return {"actionable": False, "target_weight": None, "suggested_qty": 0, "note": ""}
     if weight <= target_weight:
         return {"actionable": False, "target_weight": target_weight, "suggested_qty": 0, "note": "仓位已在目标范围内。"}
+    sources = list(position.get("sources") or [])
+    if len(sources) > 1 or str(position.get("source") or "") == "combined":
+        return {
+            "actionable": False,
+            "target_weight": target_weight,
+            "suggested_qty": 0,
+            "note": "同一证券分布在多个账户，需先分账户核对可用数量，不能按合计股数生成卖出数量。",
+        }
     if volume <= 0:
         return {"actionable": False, "target_weight": target_weight, "suggested_qty": 0, "note": "缺少可用持仓数量，不能生成下单数量。"}
     raw_qty = volume * (weight - target_weight) / weight
