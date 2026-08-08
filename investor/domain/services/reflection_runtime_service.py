@@ -859,7 +859,15 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
     pending = int(backtest_result.get("pending", backtest_result.get("deferred", 0)) or 0)
     lines.extend(["", "**预测复盘**"])
     if checked:
-        lines.append(f"- 验证运行日累计验证 {checked} 条，正确 {correct} 条，胜率 {float(win_rate or 0):.1f}%。")
+        unclassified = max(0, checked - profiled_evaluated - legacy_evaluated)
+        classification = [f"画像化 {profiled_evaluated} 条", f"旧版或未画像化 {legacy_evaluated} 条"]
+        if unclassified:
+            classification.append(f"待分层 {unclassified} 条")
+        lines.append(
+            f"- 验证运行日累计可评分 {checked} 条，正确 {correct} 条；"
+            + "，".join(classification)
+            + "。混合样本不输出整体胜率。"
+        )
     else:
         lines.append("- 今日没有完成验证的预测样本，不输出胜率结论。")
     if profiled_evaluated:
@@ -868,7 +876,7 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
             f"胜率 {float(profiled_win_rate or 0):.1f}%；仅此口径用于评价升级后策略。"
         )
     elif legacy_evaluated:
-        lines.append(f"- 上述 {legacy_evaluated} 条均为旧版或未画像化样本，仅作迁移审计，不代表升级后策略质量。")
+        lines.append(f"- 上述 {legacy_evaluated} 条均为旧版或未画像化样本，仅作迁移审计，不计算策略胜率，也不代表升级后策略质量。")
     elif checked:
         lines.append("- 当前证据链样本数尚未达到可评价门槛，不比较升级后策略优劣。")
     if unscorable:

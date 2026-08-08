@@ -235,10 +235,12 @@ def test_reflection_uses_generation_day_validation_activity_not_only_latest_run(
         "2026-08-08",
     )
 
-    assert "\u9a8c\u8bc1\u8fd0\u884c\u65e5\u7d2f\u8ba1\u9a8c\u8bc1 3 \u6761" in text
+    assert "\u9a8c\u8bc1\u8fd0\u884c\u65e5\u7d2f\u8ba1\u53ef\u8bc4\u5206 3 \u6761" in text
     assert "\u6b63\u786e 2 \u6761" in text
-    assert "66.7%" in text
+    assert "\u6df7\u5408\u6837\u672c\u4e0d\u8f93\u51fa\u6574\u4f53\u80dc\u7387" in text
+    assert "66.7%" not in text
     assert "\u4e0a\u8ff0 3 \u6761\u5747\u4e3a\u65e7\u7248\u6216\u672a\u753b\u50cf\u5316\u6837\u672c" in text
     assert "\u4e0d\u4ee3\u8868\u5347\u7ea7\u540e\u7b56\u7565\u8d28\u91cf" in text
+    assert "\u4e0d\u8ba1\u7b97\u7b56\u7565\u80dc\u7387" in text
     assert "4 \u6761\u56e0\u4ef7\u683c\u951a\u70b9\u6216\u884c\u60c5\u8bc1\u636e\u4e0d\u4e00\u81f4\u800c\u4e0d\u53ef\u8bc4\u5206" in text
     assert "2 \u6761\u5c1a\u672a\u8d70\u6ee1\u9a8c\u8bc1\u7a97\u53e3" in text
