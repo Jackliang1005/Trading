@@ -127,6 +127,15 @@ def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
     }
 
 
+def _recent_intraday_evidence(lookback_days: int = 14) -> Dict:
+    """Expose composite direction checks without treating them as strategy samples."""
+    from domain.services.weekly_report_service import _summarize_intraday_predictions
+
+    end = datetime.now().date()
+    start = end - timedelta(days=max(1, lookback_days) - 1)
+    return _summarize_intraday_predictions(start, end)
+
+
 def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -507,6 +516,7 @@ def evolve() -> Dict:
     print(f"  ✅ Prompt 已更新 ({len(prompt)} 字符)")
     print("\n🧬 进化流程完成")
     evidence = config.get("_evolution_evidence", {}) or {}
+    intraday_evidence = _recent_intraday_evidence()
     weights_changed = bool(config.get("_weights_changed"))
     material_change = bool(weights_changed or new_rules or fewshot_result.get("added") or fewshot_result.get("removed"))
     if material_change:
@@ -530,6 +540,10 @@ def evolve() -> Dict:
             f"- 策略权重：{'已调整' if weights_changed else '未调整'}。",
             f"- 新增规则：{len(new_rules)} 条。",
             f"- Few-shot 案例：新增 {fewshot_result.get('added', 0)} 条，移除 {fewshot_result.get('removed', 0)} 条。",
+            (
+                f"- 日内方向复盘：已验证 {intraday_evidence.get('total', 0)} 次；"
+                "属于复合市场判断，未归因到单一策略维度，不进入权重更新。"
+            ),
             "",
             "**当前权重**",
             "- " + "；".join(f"{name} {weight:.1%}" for name, weight in config.get("weights", {}).items()),
@@ -545,6 +559,7 @@ def evolve() -> Dict:
         "fewshot": fewshot_result,
         "prompt_length": len(prompt),
         "evidence": evidence,
+        "intraday_evidence": intraday_evidence,
         "material_change": material_change,
         "text": text,
     }

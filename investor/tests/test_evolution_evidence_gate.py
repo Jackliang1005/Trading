@@ -50,9 +50,16 @@ def test_evolve_labels_zero_sample_run_as_audit_not_evolution(monkeypatch):
     monkeypatch.setattr(service, "update_rules_from_failures", lambda: [])
     monkeypatch.setattr(service, "update_few_shot_examples", lambda: {"added": 0, "removed": 0})
     monkeypatch.setattr(service, "generate_system_prompt", lambda: "prompt")
+    monkeypatch.setattr(
+        service,
+        "_recent_intraday_evidence",
+        lambda: {"total": 3, "attributable_to_strategy": False},
+    )
 
     result = service.evolve()
 
     assert result["material_change"] is False
     assert "不构成策略进化" in result["text"]
     assert "零样本不会被解释为 0% 胜率" in result["text"]
+    assert "日内方向复盘：已验证 3 次" in result["text"]
+    assert "不进入权重更新" in result["text"]

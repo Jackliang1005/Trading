@@ -164,6 +164,71 @@ def _summarize_predictions(start: date, end: date) -> Dict[str, Any]:
     }
 
 
+def _summarize_intraday_predictions(start: date, end: date, reports_dir: Path = REPORTS_DIR) -> Dict[str, Any]:
+    """Summarize the production 09:30→10:30→14:30 validation ledger.
+
+    The 14:30 snapshot repeats the 09:30 correction already present at 10:30,
+    so only the latest available snapshot for each trade date is counted.
+    These composite market-direction checks are deliberately kept separate
+    from strategy-attributed samples used for weight evolution.
+    """
+    samples: List[Dict[str, Any]] = []
+    cursor = start
+    while cursor <= end:
+        payload = None
+        source_slot = ""
+        compact = cursor.strftime("%Y%m%d")
+        for slot in ("1430", "1030"):
+            path = reports_dir / f"investor_intraday_outlook_{compact}_{slot}.json"
+            if not path.exists():
+                continue
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                source_slot = slot
+                break
+        if payload:
+            seen_slots: set[str] = set()
+            for item in payload.get("corrections") or []:
+                slot = str(item.get("slot") or "").strip()
+                if not slot or slot in seen_slots:
+                    continue
+                seen_slots.add(slot)
+                result = str(item.get("result") or "数据不足，无法验证")
+                samples.append(
+                    {
+                        "date": cursor.isoformat(),
+                        "slot": slot,
+                        "source_slot": source_slot,
+                        "predicted": str(item.get("predicted") or "unknown"),
+                        "observed": str(item.get("observed") or "unknown"),
+                        "result": result,
+                    }
+                )
+        cursor += timedelta(days=1)
+
+    exact = sum(1 for item in samples if item["result"] == "方向正确")
+    close = sum(1 for item in samples if item["result"] == "方向接近但强度有偏差")
+    wrong = sum(1 for item in samples if item["result"] == "方向错误")
+    unavailable = len(samples) - exact - close - wrong
+    evaluated = exact + close + wrong
+    return {
+        "total": evaluated,
+        "correct": exact,
+        "close": close,
+        "wrong": wrong,
+        "unavailable": unavailable,
+        "exact_rate": round(exact / evaluated * 100, 1) if evaluated else 0.0,
+        "usable_rate": round((exact + close) / evaluated * 100, 1) if evaluated else 0.0,
+        "days": len({item["date"] for item in samples}),
+        "samples": samples,
+        "attributable_to_strategy": False,
+    }
+
+
 def _load_audit_summary() -> Dict[str, Any]:
     path = REPORTS_DIR / "investor_assistant_capability_audit_latest.json"
     if not path.exists():
@@ -206,6 +271,7 @@ def build_weekly_report(days: int = 7, end_date: str = "") -> Dict[str, Any]:
             top_n=5,
         ),
         "predictions": _summarize_predictions(start, end),
+        "intraday_predictions": _summarize_intraday_predictions(start, end),
         "longterm": _load_longterm_summary(),
         "audit": _load_audit_summary(),
     }
@@ -238,17 +304,24 @@ def _display_compact_date(value: object) -> str:
 def format_weekly_report(report: Dict[str, Any]) -> str:
     events = report.get("events", {}) or {}
     predictions = report.get("predictions", {}) or {}
+    intraday = report.get("intraday_predictions", {}) or {}
     longterm = report.get("longterm", {}) or {}
     verified = int(predictions.get("total", 0) or 0)
-    prediction_summary = (
-        f"已验证预测 {verified} 条，正确率 {predictions.get('win_rate', 0)}%。"
-        if verified
-        else "本周暂无完成验证的预测样本，不把零样本写成 0% 正确率。"
-    )
+    if verified:
+        prediction_summary = (
+            f"已验证预测 {verified} 条，正确率 {predictions.get('win_rate', 0)}%。"
+        )
+    elif int(intraday.get("total", 0) or 0):
+        prediction_summary = (
+            f"日内方向已验证 {intraday.get('total')} 次，精确方向正确率 {intraday.get('exact_rate')}%；"
+            "暂无可归因到单一策略维度的样本，因此不据此调整策略权重。"
+        )
+    else:
+        prediction_summary = "本周暂无完成验证的预测样本，不把零样本写成 0% 正确率。"
     prediction_detail = (
         f"已验证 {verified} 条，正确 {predictions.get('correct', 0)} 条，正确率 {predictions.get('win_rate', 0)}%。"
         if verified
-        else "验证样本：暂无；本周不输出胜率结论。"
+        else "策略归因样本：暂无；本周不输出分策略胜率结论。"
     )
     lines = [
         "📅 OpenClaw A股投资周报",
@@ -256,7 +329,7 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
         "",
         "**本周结论**",
         f"- 本周主线按新鲜事件聚合并去重；{prediction_summary}",
-        "- 周报只总结已落地数据；无验证样本时不评价策略优劣。",
+        "- 周报只总结已落地数据；策略归因样本不足时不评价策略优劣。",
         "",
         "**事件与主线**",
         f"- 主题热度：{_fmt_pairs([(theme_label(name), count) for name, count in events.get('theme_counts', [])], '暂无有效主题')}。",
@@ -291,6 +364,14 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
         "**预测复盘**",
         f"- {prediction_detail}",
     ])
+    intraday_total = int(intraday.get("total", 0) or 0)
+    if intraday_total:
+        lines.append(
+            f"- 日内方向闭环：{intraday.get('days', 0)} 个交易日、{intraday_total} 次验证；"
+            f"方向正确 {intraday.get('correct', 0)} 次、接近 {intraday.get('close', 0)} 次、错误 {intraday.get('wrong', 0)} 次；"
+            f"精确方向正确率 {intraday.get('exact_rate', 0)}%，含接近结果的可用率 {intraday.get('usable_rate', 0)}%。"
+        )
+        lines.append("- 日内方向结果属于复合市场判断，未归因到技术面、基本面、情绪面或地缘维度，不进入权重更新。")
     strategies = predictions.get("strategies", []) or []
     if strategies:
         lines.append("- 分策略：" + "；".join(f"{s['strategy']} {s['correct']}/{s['total']}（{s['win_rate']}%）" for s in strategies[:4]))
