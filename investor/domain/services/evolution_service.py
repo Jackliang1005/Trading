@@ -166,9 +166,17 @@ def _rebalance_eligible_weights(
 
 
 def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
+    def profile_is_qualified(item: Dict) -> bool:
+        strategy = str(item.get("strategy_used") or "").strip()
+        expected = EVOLUTION_EVIDENCE_PROFILES.get(strategy, "")
+        profiles = {value.strip() for value in str(item.get("evidence_profiles") or "").split(",") if value.strip()}
+        return bool(expected and profiles == {expected})
+
     def profiled(item: Dict, field: str, fallback: str):
-        value = item.get(field)
-        return item.get(fallback) if value is None else value
+        del fallback  # Legacy totals must never substitute for evidence-qualified totals.
+        if not profile_is_qualified(item):
+            return 0
+        return item.get(field) or 0
 
     total = sum(int(profiled(item, "profiled_total", "total") or 0) for item in perf)
     min_total = int(config.get("min_evolution_samples", 20) or 20)
@@ -191,7 +199,7 @@ def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
         "minimum_strategies": min_strategies,
         "eligible_strategies": [str(item.get("strategy_used") or "") for item in eligible],
         "evidence_profiles": {
-            str(item.get("strategy_used") or ""): str(item.get("evidence_profiles") or "legacy-unprofiled")
+            str(item.get("strategy_used") or ""): str(item.get("evidence_profiles") or "")
             for item in eligible
         },
         "reasons": reasons,
@@ -411,7 +419,19 @@ def update_rules_from_failures(lookback_days: int = 7) -> List[Dict]:
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     print(f"📏 规则库更新 [近{lookback_days}天]")
 
-    predictions = db.get_checked_predictions_in_range(start_date, end_date)
+    performance = db.get_strategy_performance(start_date, end_date)
+    evidence = _performance_evidence(performance, load_strategy_config())
+    if not evidence.get("ready"):
+        print("  ℹ️ 画像化证据不足，不从历史未画像化失败样本生成规则：" + "；".join(evidence.get("reasons") or []))
+        return []
+    eligible = set(evidence.get("eligible_strategies") or [])
+    predictions = [
+        item for item in db.get_checked_predictions_in_range(start_date, end_date)
+        if str(item.get("strategy_used") or "") in eligible
+        and str(item.get("evidence_profile") or "")
+            == EVOLUTION_EVIDENCE_PROFILES.get(str(item.get("strategy_used") or ""), "")
+        and str(item.get("prediction_run_id") or "").strip()
+    ]
     failures = [p for p in predictions if not p.get("is_correct")]
     if not failures:
         print("  ℹ️ 无失败案例，无需更新规则")
@@ -525,7 +545,19 @@ def update_few_shot_examples(lookback_days: int = 14) -> Dict:
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     print(f"📝 Few-shot 案例库更新 [近{lookback_days}天]")
 
-    predictions = db.get_checked_predictions_in_range(start_date, end_date)
+    performance = db.get_strategy_performance(start_date, end_date)
+    evidence = _performance_evidence(performance, load_strategy_config())
+    if not evidence.get("ready"):
+        print("  ℹ️ 画像化证据不足，不从历史未画像化样本生成案例：" + "；".join(evidence.get("reasons") or []))
+        return {"added": 0, "removed": 0, "evidence_ready": False}
+    eligible = set(evidence.get("eligible_strategies") or [])
+    predictions = [
+        item for item in db.get_checked_predictions_in_range(start_date, end_date)
+        if str(item.get("strategy_used") or "") in eligible
+        and str(item.get("evidence_profile") or "")
+            == EVOLUTION_EVIDENCE_PROFILES.get(str(item.get("strategy_used") or ""), "")
+        and str(item.get("prediction_run_id") or "").strip()
+    ]
     if not predictions:
         print("  ℹ️ 无已检查的预测")
         return {"added": 0, "removed": 0}
@@ -586,9 +618,23 @@ def update_few_shot_examples(lookback_days: int = 14) -> Dict:
 def generate_system_prompt() -> str:
     config = load_strategy_config()
     strategies = db.get_strategies(enabled_only=True)
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+    recent_performance = db.get_strategy_performance(start_date, end_date)
+    performance_evidence = _performance_evidence(recent_performance, config)
+    qualified_rates = {
+        str(item.get("strategy_used") or ""): float(item.get("profiled_win_rate") or 0)
+        for item in recent_performance
+        if str(item.get("strategy_used") or "") in set(performance_evidence.get("eligible_strategies") or [])
+    } if performance_evidence.get("ready") else {}
     rules = db.get_rules(enabled_only=True)
+    if not performance_evidence.get("ready"):
+        rules = [item for item in rules if str(item.get("source") or "") != "reflection"]
     good_examples = db.get_few_shot_examples("good_analysis", limit=3)
     bad_examples = db.get_few_shot_examples("bad_analysis", limit=2)
+    if not performance_evidence.get("ready"):
+        good_examples = []
+        bad_examples = []
 
     weights_str = ", ".join(
         f"{s['name']}({config['weights'].get(s['name'], s['weight']):.0%})"
@@ -606,8 +652,10 @@ def generate_system_prompt() -> str:
     for strategy in strategies:
         weight = config["weights"].get(strategy["name"], strategy["weight"])
         prompt += f"- **{strategy['name']}** (权重 {weight:.0%}): {strategy['description']}\n"
-        if strategy.get("win_rate"):
-            prompt += f"  近期胜率: {strategy['win_rate']:.1f}%\n"
+        if strategy["name"] in qualified_rates:
+            prompt += f"  画像化样本近期胜率: {qualified_rates[strategy['name']]:.1f}%\n"
+    if not performance_evidence.get("ready"):
+        prompt += "- 策略绩效证据未达20/5/2门槛；忽略数据库中的历史未画像化胜率，不据此偏向任何策略。\n"
 
     if rules:
         prompt += "\n## 投资规则（必须遵守）\n"

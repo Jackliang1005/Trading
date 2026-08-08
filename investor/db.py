@@ -473,6 +473,8 @@ def get_checked_predictions_in_range(start: str, end: str) -> List[Dict]:
                   p.confidence,
                   p.reasoning,
                   p.strategy_used,
+                  COALESCE(p.evidence_profile, '') AS evidence_profile,
+                  COALESCE(p.prediction_run_id, '') AS prediction_run_id,
                   p.model_used,
                   p.timeframe,
                   p.predicted_change,
@@ -940,6 +942,14 @@ def get_strategy_performance(start: str, end: str) -> List[Dict]:
            merged AS (
                SELECT p.strategy_used AS strategy_used,
                       COALESCE(p.evidence_profile, '') AS evidence_profile,
+                      CASE
+                          WHEN COALESCE(p.prediction_run_id, '') != ''
+                           AND (
+                               (p.strategy_used = 'technical' AND p.evidence_profile = 'technical_price_regime_v1')
+                               OR (p.strategy_used = 'sentiment' AND p.evidence_profile = 'sentiment_flow_news_v1')
+                           )
+                          THEN 1 ELSE 0
+                      END AS evidence_qualified,
                       COALESCE(le.is_correct, p.is_correct) AS is_correct,
                       COALESCE(le.score, p.score) AS score
                FROM prediction_log p
@@ -953,11 +963,11 @@ def get_strategy_performance(start: str, end: str) -> List[Dict]:
                   SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END) as correct,
                   ROUND(AVG(CASE WHEN is_correct IS NOT NULL THEN is_correct ELSE NULL END) * 100, 1) as win_rate,
                   ROUND(AVG(score), 1) as avg_score,
-                  SUM(CASE WHEN evidence_profile != '' THEN 1 ELSE 0 END) AS profiled_total,
-                  SUM(CASE WHEN evidence_profile != '' AND is_correct=1 THEN 1 ELSE 0 END) AS profiled_correct,
-                  ROUND(AVG(CASE WHEN evidence_profile != '' THEN is_correct ELSE NULL END) * 100, 1) AS profiled_win_rate,
-                  ROUND(AVG(CASE WHEN evidence_profile != '' THEN score ELSE NULL END), 1) AS profiled_avg_score,
-                  GROUP_CONCAT(DISTINCT NULLIF(evidence_profile, '')) AS evidence_profiles
+                  SUM(CASE WHEN evidence_qualified=1 THEN 1 ELSE 0 END) AS profiled_total,
+                  SUM(CASE WHEN evidence_qualified=1 AND is_correct=1 THEN 1 ELSE 0 END) AS profiled_correct,
+                  ROUND(AVG(CASE WHEN evidence_qualified=1 THEN is_correct ELSE NULL END) * 100, 1) AS profiled_win_rate,
+                  ROUND(AVG(CASE WHEN evidence_qualified=1 THEN score ELSE NULL END), 1) AS profiled_avg_score,
+                  GROUP_CONCAT(DISTINCT CASE WHEN evidence_qualified=1 THEN evidence_profile END) AS evidence_profiles
            FROM merged
            GROUP BY strategy_used""",
         (start, end),

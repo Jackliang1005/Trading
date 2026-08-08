@@ -22,6 +22,7 @@ from domain.services.longterm_portfolio_service import (
 from domain.services.report_style_service import event_impact_label, event_summary_cn, join_cn, pct, theme_label, trend_label
 from domain.services.event_service import RawEvent, _near_duplicate_title, analyze_event
 from domain.services.concept_momentum_service import THEME_CONCEPT_KEYWORDS, build_concept_momentum_candidates
+from domain.services.evolution_service import EVOLUTION_EVIDENCE_PROFILES, load_strategy_config
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"
@@ -144,23 +145,56 @@ def _summarize_predictions(start: date, end: date) -> Dict[str, Any]:
     rows = db.get_checked_predictions_in_range(start.isoformat(), end.isoformat())
     total = len(rows)
     correct = sum(1 for item in rows if item.get("is_correct"))
+    config = load_strategy_config()
+    min_total = int(config.get("min_evolution_samples", 20) or 20)
+    min_per_strategy = int(config.get("min_strategy_samples", 5) or 5)
+    min_strategies = int(config.get("min_evolution_strategies", 2) or 2)
     by_strategy: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "correct": 0})
     for item in rows:
-        strategy = str(item.get("strategy_used") or item.get("model") or "unknown")
+        strategy = str(item.get("strategy_used") or "").strip()
+        expected_profile = EVOLUTION_EVIDENCE_PROFILES.get(strategy, "")
+        if (
+            not expected_profile
+            or str(item.get("evidence_profile") or "").strip() != expected_profile
+            or not str(item.get("prediction_run_id") or "").strip()
+        ):
+            continue
         by_strategy[strategy]["total"] += 1
         if item.get("is_correct"):
             by_strategy[strategy]["correct"] += 1
+    qualified_total = sum(stat["total"] for stat in by_strategy.values())
+    qualified_correct = sum(stat["correct"] for stat in by_strategy.values())
+    eligible = [name for name, stat in by_strategy.items() if stat["total"] >= min_per_strategy]
+    comparison_ready = qualified_total >= min_total and len(eligible) >= min_strategies
     strategies = []
-    for name, stat in by_strategy.items():
+    for name, evidence_profile in EVOLUTION_EVIDENCE_PROFILES.items():
+        stat = by_strategy[name]
         t = stat["total"]
         c = stat["correct"]
-        strategies.append({"strategy": name, "total": t, "correct": c, "win_rate": round(c / t * 100, 1) if t else 0.0})
-    strategies.sort(key=lambda item: (item["win_rate"], item["total"]), reverse=True)
+        strategies.append(
+            {
+                "strategy": name,
+                "evidence_profile": evidence_profile,
+                "total": t,
+                "correct": c,
+                "minimum": min_per_strategy,
+                "eligible": t >= min_per_strategy,
+                "win_rate": round(c / t * 100, 1) if comparison_ready and t >= min_per_strategy else None,
+            }
+        )
     return {
         "total": total,
         "correct": correct,
         "win_rate": round(correct / total * 100, 1) if total else 0.0,
-        "strategies": strategies[:6],
+        "qualified_total": qualified_total,
+        "qualified_correct": qualified_correct,
+        "unqualified_total": total - qualified_total,
+        "minimum_total": min_total,
+        "minimum_per_strategy": min_per_strategy,
+        "minimum_strategies": min_strategies,
+        "eligible_strategies": eligible,
+        "strategy_comparison_ready": comparison_ready,
+        "strategies": strategies,
     }
 
 
@@ -307,9 +341,10 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
     intraday = report.get("intraday_predictions", {}) or {}
     longterm = report.get("longterm", {}) or {}
     verified = int(predictions.get("total", 0) or 0)
+    qualified = int(predictions.get("qualified_total", 0) or 0)
     if verified:
         prediction_summary = (
-            f"已验证预测 {verified} 条，正确率 {predictions.get('win_rate', 0)}%。"
+            f"市场方向已验证 {verified} 条，整体正确率 {predictions.get('win_rate', 0)}%。"
         )
     elif int(intraday.get("total", 0) or 0):
         prediction_summary = (
@@ -319,7 +354,7 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
     else:
         prediction_summary = "本周暂无完成验证的预测样本，不把零样本写成 0% 正确率。"
     prediction_detail = (
-        f"已验证 {verified} 条，正确 {predictions.get('correct', 0)} 条，正确率 {predictions.get('win_rate', 0)}%。"
+        f"市场预测已验证 {verified} 条，正确 {predictions.get('correct', 0)} 条，整体正确率 {predictions.get('win_rate', 0)}%。"
         if verified
         else "策略归因样本：暂无；本周不输出分策略胜率结论。"
     )
@@ -373,8 +408,32 @@ def format_weekly_report(report: Dict[str, Any]) -> str:
         )
         lines.append("- 日内方向结果属于复合市场判断，未归因到技术面、基本面、情绪面或地缘维度，不进入权重更新。")
     strategies = predictions.get("strategies", []) or []
-    if strategies:
-        lines.append("- 分策略：" + "；".join(f"{s['strategy']} {s['correct']}/{s['total']}（{s['win_rate']}%）" for s in strategies[:4]))
+    strategy_labels = {"technical": "技术", "sentiment": "情绪", "fundamental": "基本面", "geopolitical": "地缘"}
+    if predictions.get("strategy_comparison_ready"):
+        comparable = [item for item in strategies if item.get("eligible") and item.get("win_rate") is not None]
+        lines.append(
+            "- 画像化分策略："
+            + "；".join(
+                f"{strategy_labels.get(str(item.get('strategy')), item.get('strategy'))} "
+                f"{item.get('correct')}/{item.get('total')}（{item.get('win_rate')}%）"
+                for item in comparable
+            )
+        )
+    elif qualified:
+        progress = "、".join(
+            f"{strategy_labels.get(str(item.get('strategy')), item.get('strategy'))}"
+            f"{item.get('total', 0)}/{item.get('minimum', predictions.get('minimum_per_strategy', 5))}"
+            for item in strategies
+        )
+        lines.append(
+            f"- 策略归因仍在采样：本周画像化 {qualified}/{predictions.get('minimum_total', 20)}；{progress}。"
+            "未达到完整门槛，不输出分策略胜率或优劣排序。"
+        )
+    elif verified:
+        lines.append(
+            f"- 策略归因样本：暂无；本周 {predictions.get('unqualified_total', verified)} 条属于历史或未画像化市场预测，"
+            "只计入总体方向复盘，不输出分策略胜率。"
+        )
 
     lines.extend([
         "",

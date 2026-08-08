@@ -678,6 +678,8 @@ def _query_strategy() -> str:
                         lines.append(f"- {label}：仅 {total} 个已验证样本，暂不足以评价胜率。")
                     else:
                         lines.append(f"- {label}：{correct}/{total} 次方向正确，胜率 {wr:.0f}%。")
+            if (latest.get("evidence") or {}).get("legacy_weights_quarantined"):
+                lines.append("- 历史未画像化样本形成的权重已隔离；当前已恢复系统基线，满足20/5/2门槛前不再校准。")
         lines.extend(["", "**使用边界**", "- 权重只用于生成研究判断，不会据此自动下单。"])
     else:
         lines.append("当前没有可用的策略配置，无法评价信号权重。")

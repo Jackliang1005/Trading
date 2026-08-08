@@ -261,8 +261,15 @@ def build_rag_context(query: str, n_results: int = 5) -> str:
         for r in reflections[:2]:
             context_parts.append(f"- {r.get('content', '')[:300]}")
 
+    from domain.services.evolution_service import build_evolution_readiness, load_strategy_config
+
+    config = load_strategy_config()
+    evolution = build_evolution_readiness()
+
     # 从结构化数据库获取规则
     rules = db.get_rules(enabled_only=True)
+    if not evolution.get("ready"):
+        rules = [item for item in rules if str(item.get("source") or "") != "reflection"]
     if rules:
         context_parts.append("\n## 📏 当前投资规则")
         for rule in rules[:10]:
@@ -271,15 +278,29 @@ def build_rag_context(query: str, n_results: int = 5) -> str:
     # 策略权重
     strategies = db.get_strategies(enabled_only=True)
     if strategies:
+        evidence_by_strategy = {str(item.get("strategy") or ""): item for item in evolution.get("strategies") or []}
         context_parts.append("\n## ⚖️ 当前策略权重")
         for s in strategies:
-            context_parts.append(f"- {s['name']}: {s['weight']:.0%} (胜率: {s['win_rate']:.1f}%)")
+            weight = float((config.get("weights") or {}).get(s["name"], s["weight"]))
+            evidence = evidence_by_strategy.get(s["name"], {})
+            context_parts.append(
+                f"- {s['name']}: {weight:.0%} "
+                f"(画像化样本: {int(evidence.get('verified', 0) or 0)}/{int(evidence.get('minimum', evolution.get('minimum_per_strategy', 5)) or 5)})"
+                if evidence
+                else f"- {s['name']}: {weight:.0%} (暂无画像化评估链)"
+            )
+        if not evolution.get("ready"):
+            context_parts.append("- 证据未达20/5/2门槛，禁止把历史未画像化胜率写入分析上下文。")
 
     return "\n".join(context_parts) if context_parts else ""
 
 
 def build_few_shot_prompt() -> str:
     """构建 few-shot 示例 prompt"""
+    from domain.services.evolution_service import build_evolution_readiness
+
+    if not build_evolution_readiness().get("ready"):
+        return ""
     examples = db.get_few_shot_examples("good_analysis", limit=3)
     if not examples:
         return ""

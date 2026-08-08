@@ -8,6 +8,7 @@ from typing import Dict, Optional
 
 import db
 from domain.repository import get_prediction_evaluation_repository
+from domain.services.evolution_service import _performance_evidence, load_strategy_config
 from domain.services.reflection_analysis_service import (
     analyze_failure_patterns,
     format_weekly_report,
@@ -25,6 +26,29 @@ def daily_reflection() -> Dict:
     return daily_reflection_runtime()
 
 
+def _qualified_strategy_performance(strategy_perf):
+    """Expose strategy rates only after the shared evolution evidence gate passes."""
+    evidence = _performance_evidence(strategy_perf, load_strategy_config())
+    if not evidence.get("ready"):
+        return [], evidence
+    eligible = set(evidence.get("eligible_strategies") or [])
+    qualified = []
+    for item in strategy_perf:
+        name = str(item.get("strategy_used") or "")
+        if name not in eligible:
+            continue
+        qualified.append(
+            {
+                **dict(item),
+                "total": int(item.get("profiled_total") or 0),
+                "correct": int(item.get("profiled_correct") or 0),
+                "win_rate": float(item.get("profiled_win_rate") or 0),
+                "avg_score": float(item.get("profiled_avg_score") or 0),
+            }
+        )
+    return qualified, evidence
+
+
 def weekly_attribution(date: Optional[str] = None) -> Dict:
     end_date = _resolve_end_date(date)
     start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -33,13 +57,17 @@ def weekly_attribution(date: Optional[str] = None) -> Dict:
     repo = get_prediction_evaluation_repository()
 
     strategy_perf = repo.get_strategy_performance(start_date, end_date)
+    qualified_perf, strategy_evidence = _qualified_strategy_performance(strategy_perf)
     print("\n📈 策略表现:")
-    for sp in strategy_perf:
-        print(
-            f"  - {sp['strategy_used']}: 胜率 {sp['win_rate']}%, "
-            f"共 {sp['total']} 次预测, 正确 {sp['correct']} 次, "
-            f"证据链 {sp.get('evidence_profiles') or '历史未标注'}"
-        )
+    if qualified_perf:
+        for sp in qualified_perf:
+            print(
+                f"  - {sp['strategy_used']}: 胜率 {sp['win_rate']}%, "
+                f"画像化预测 {sp['total']} 次, 正确 {sp['correct']} 次, "
+                f"证据链 {sp.get('evidence_profiles')}"
+            )
+    else:
+        print("  - 证据不足，不输出最佳/最差策略：" + "；".join(strategy_evidence.get("reasons") or []))
 
     predictions = repo.get_checked_predictions_in_range(start_date, end_date)
     failures = [p for p in predictions if not p.get("is_correct")]
@@ -54,13 +82,14 @@ def weekly_attribution(date: Optional[str] = None) -> Dict:
         "findings": [],
         "failures": failure_patterns,
         "suggestions": [],
-        "strategy_performance": [dict(s) for s in strategy_perf] if strategy_perf else [],
+        "strategy_performance": qualified_perf,
+        "strategy_evidence": strategy_evidence,
         "evaluation_data_source": EVALUATION_DATA_SOURCE,
     }
 
-    if strategy_perf:
-        best = max(strategy_perf, key=lambda x: x.get("win_rate", 0) or 0)
-        worst = min(strategy_perf, key=lambda x: x.get("win_rate", 100) or 100)
+    if qualified_perf:
+        best = max(qualified_perf, key=lambda x: x.get("win_rate", 0) or 0)
+        worst = min(qualified_perf, key=lambda x: x.get("win_rate", 100) or 100)
         report["findings"].append(f"最佳策略: {best['strategy_used']} (胜率 {best['win_rate']}%)")
         report["findings"].append(f"最差策略: {worst['strategy_used']} (胜率 {worst['win_rate']}%)")
     if failure_patterns:
@@ -92,8 +121,9 @@ def monthly_audit(date: Optional[str] = None) -> Dict:
     print(f"📋 月度策略审计 [{start_date} ~ {end_date}]")
     repo = get_prediction_evaluation_repository()
     strategy_perf = repo.get_strategy_performance(start_date, end_date)
+    qualified_perf, strategy_evidence = _qualified_strategy_performance(strategy_perf)
 
-    for sp in strategy_perf:
+    for sp in qualified_perf:
         name = sp.get("strategy_used", "")
         if name:
             db.update_strategy_stats(
@@ -115,16 +145,22 @@ def monthly_audit(date: Optional[str] = None) -> Dict:
         "suggestions": [],
         "actions": [],
         "strategy_adjustments": [],
+        "strategy_performance": qualified_perf,
+        "strategy_evidence": strategy_evidence,
         "evaluation_data_source": EVALUATION_DATA_SOURCE,
     }
 
-    if strategy_perf and len(strategy_perf) >= 2:
-        sorted_strats = sorted(strategy_perf, key=lambda x: x.get("win_rate", 0) or 0, reverse=True)
+    if len(qualified_perf) >= 2:
+        sorted_strats = sorted(qualified_perf, key=lambda x: x.get("win_rate", 0) or 0, reverse=True)
         report["findings"].append(f"月度最佳: {sorted_strats[0]['strategy_used']}")
         report["findings"].append(f"月度最差: {sorted_strats[-1]['strategy_used']}")
 
     report_text = f"# 📋 月度策略审计报告\n**时间：** {report['period']}\n\n"
     report_text += f"总预测 {report['total']}，正确 {report['correct']}，胜率 {report['win_rate']}%\n"
+    if qualified_perf:
+        report_text += "策略归因：仅使用达到门槛的画像化样本。\n"
+    else:
+        report_text += "策略归因：证据不足，不比较策略优劣，不回写策略统计。\n"
     report_text += f"评估数据源: {report.get('evaluation_data_source', 'unknown')}\n"
 
     db.add_reflection_report(

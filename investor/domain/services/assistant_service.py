@@ -12,7 +12,7 @@ from domain.services.analysis_context_service import (
     normalize_analysis_context_summary,
     normalize_trade_decision_summary,
 )
-from domain.services.evolution_service import generate_system_prompt, load_strategy_config
+from domain.services.evolution_service import build_evolution_readiness, generate_system_prompt, load_strategy_config
 from domain.services.longterm_portfolio_service import (
     build_longterm_snapshot_text,
     format_longterm_rejected_reasons,
@@ -135,7 +135,11 @@ def dashboard() -> str:
     """Render status dashboard text."""
     config = load_strategy_config()
     strategies = db.get_strategies()
+    evolution = build_evolution_readiness()
+    evidence_by_strategy = {str(item.get("strategy") or ""): item for item in evolution.get("strategies") or []}
     rules = db.get_rules()
+    if not evolution.get("ready"):
+        rules = [item for item in rules if str(item.get("source") or "") != "reflection"]
     overall = db.get_overall_stats()
     snapshot_data = load_prediction_snapshot_data()
     market_source = snapshot_data.get("_source", "") if snapshot_data else ""
@@ -156,10 +160,17 @@ def dashboard() -> str:
 
     for item in strategies:
         weight = config.get("weights", {}).get(item["name"], item["weight"])
-        lines.append(
-            f"- **{item['name']}**: 权重 {weight:.0%} | 胜率 {item.get('win_rate', 0):.1f}% | "
-            f"预测 {item.get('total_predictions', 0)} 次"
+        evidence = evidence_by_strategy.get(item["name"], {})
+        evidence_text = (
+            f"画像化样本 {int(evidence.get('verified', 0) or 0)}/{int(evidence.get('minimum', evolution.get('minimum_per_strategy', 5)) or 5)}"
+            if item["name"] in evidence_by_strategy
+            else "暂无画像化评估链"
         )
+        lines.append(
+            f"- **{item['name']}**: 权重 {weight:.0%} | {evidence_text}"
+        )
+    if not evolution.get("ready"):
+        lines.append("- 策略绩效证据未达完整门槛，历史未画像化胜率不参与展示或权重判断。")
 
     lines.append(f"\n## 📏 活跃规则: {len([rule for rule in rules if rule.get('enabled')])} 条")
     for rule in rules[:5]:

@@ -18,6 +18,29 @@ def _config():
     }
 
 
+def test_production_strategy_config_uses_neutral_evidence_gated_baseline():
+    config = service.load_strategy_config()
+    quarantine = next(
+        item for item in reversed(config["weight_history"])
+        if (item.get("evidence") or {}).get("legacy_weights_quarantined")
+    )
+    expected_baseline = {
+        "technical": 0.30,
+        "fundamental": 0.25,
+        "sentiment": 0.20,
+        "geopolitical": 0.25,
+    }
+
+    assert quarantine["new_weights"] == expected_baseline
+    if config["weight_history"][-1] is quarantine:
+        assert config["weights"] == expected_baseline
+    assert sum(config["weights"].values()) == 1.0
+    assert config["min_evolution_samples"] == 20
+    assert config["min_strategy_samples"] == 5
+    assert config["min_evolution_strategies"] == 2
+    assert config["weight_history"][-1]["evidence"]["legacy_weights_quarantined"] is True
+
+
 def test_weight_adjustment_requires_enough_verified_evidence(monkeypatch):
     config = _config()
     monkeypatch.setattr(service, "load_strategy_config", lambda: config)
@@ -175,6 +198,87 @@ def test_persisted_profiled_samples_reach_gate_without_legacy_rows(monkeypatch, 
     assert evidence["ready"] is True
     assert evidence["total"] == 24
     assert set(evidence["eligible_strategies"]) == {"technical", "sentiment"}
+
+
+def test_profile_label_without_a_valid_run_identity_cannot_unlock_evolution(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "investor.db"))
+    db.init_db()
+    rows = [
+        ("technical", "technical_price_regime_v1", ""),
+        ("technical", "sentiment_flow_news_v1", "wrong-profile"),
+        ("technical", "technical_price_regime_v1", "qualified-run"),
+    ]
+    for index, (strategy, profile, run_id) in enumerate(rows):
+        prediction_id = db.add_prediction(
+            target=f"target-{index}",
+            direction="neutral",
+            confidence=0.5,
+            strategy_used=strategy,
+            model_used="test",
+            actual_price=100,
+            trend_3d="ranging",
+            evidence_profile=profile,
+            prediction_run_id=run_id,
+        )
+        db.update_prediction_result(prediction_id, actual_price=100, actual_change=0, is_correct=True, score=60)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    performance = db.get_strategy_performance(today, today)
+
+    assert performance[0]["total"] == 3
+    assert performance[0]["profiled_total"] == 1
+    assert performance[0]["profiled_correct"] == 1
+    assert performance[0]["evidence_profiles"] == "technical_price_regime_v1"
+
+
+def test_rule_learning_ignores_unprofiled_legacy_failures(monkeypatch):
+    monkeypatch.setattr(service, "load_strategy_config", _config)
+    monkeypatch.setattr(
+        service.db,
+        "get_strategy_performance",
+        lambda start, end: [
+            {
+                "strategy_used": "technical",
+                "total": 30,
+                "correct": 0,
+                "profiled_total": 0,
+                "evidence_profiles": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        service.db,
+        "get_checked_predictions_in_range",
+        lambda start, end: (_ for _ in ()).throw(AssertionError("must stop before loading legacy failures")),
+    )
+
+    assert service.update_rules_from_failures() == []
+
+
+def test_few_shot_learning_ignores_unprofiled_legacy_samples(monkeypatch):
+    monkeypatch.setattr(service, "load_strategy_config", _config)
+    monkeypatch.setattr(
+        service.db,
+        "get_strategy_performance",
+        lambda start, end: [
+            {
+                "strategy_used": "sentiment",
+                "total": 30,
+                "correct": 30,
+                "profiled_total": 0,
+                "evidence_profiles": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        service.db,
+        "get_checked_predictions_in_range",
+        lambda start, end: (_ for _ in ()).throw(AssertionError("must stop before loading legacy examples")),
+    )
+
+    result = service.update_few_shot_examples()
+
+    assert result == {"added": 0, "removed": 0, "evidence_ready": False}
 
 
 def test_readiness_exposes_verified_and_pending_profiled_samples(monkeypatch):

@@ -368,11 +368,13 @@ def _make_kline(current_price: float, step: float, day: int) -> dict:
 def _get_strategy_distribution() -> dict:
     """返回 {code: strategy_name} 映射，按当前权重分配策略标签。"""
     import db as db_mod
+    from domain.services.evolution_service import load_strategy_config
 
     strategies = db_mod.get_strategies(enabled_only=True)
     if not strategies:
         return {}
-    weights = {s["name"]: s["weight"] for s in strategies}
+    configured_weights = load_strategy_config().get("weights") or {}
+    weights = {s["name"]: float(configured_weights.get(s["name"], s["weight"])) for s in strategies}
     # 按权重排序，交替分配策略标签
     sorted_names = sorted(weights, key=lambda n: -weights[n])
     # 对指数用宏观/情绪，对个股用技术/基本面

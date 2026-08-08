@@ -1,11 +1,11 @@
 {
   "version": 2,
-  "updated_at": "2026-04-25T16:31:55.677027",
+  "updated_at": "2026-08-08T16:36:00+08:00",
   "weights": {
-    "technical": 0.1,
-    "fundamental": 0.237,
-    "sentiment": 0.427,
-    "geopolitical": 0.237
+    "technical": 0.3,
+    "fundamental": 0.25,
+    "sentiment": 0.2,
+    "geopolitical": 0.25
   },
   "weight_history": [
     {
@@ -217,10 +217,37 @@
           "avg_score": 20.0
         }
       ]
+    },
+    {
+      "date": "2026-08-08",
+      "old_weights": {
+        "technical": 0.1,
+        "fundamental": 0.237,
+        "sentiment": 0.427,
+        "geopolitical": 0.237
+      },
+      "new_weights": {
+        "technical": 0.3,
+        "fundamental": 0.25,
+        "sentiment": 0.2,
+        "geopolitical": 0.25
+      },
+      "reason": "证据治理修复：隔离未画像化历史样本，在20/5/2门槛满足前恢复系统基线",
+      "evidence": {
+        "qualified_total": 0,
+        "minimum_total": 20,
+        "minimum_per_strategy": 5,
+        "minimum_strategies": 2,
+        "legacy_weights_quarantined": true
+      }
     }
   ],
   "auto_adjust_enabled": true,
   "min_weight": 0.1,
   "max_weight": 0.6,
-  "adjust_step": 0.05
+  "adjust_step": 0.05,
+  "min_evolution_samples": 20,
+  "min_strategy_samples": 5,
+  "min_evolution_strategies": 2,
+  "evidence_policy_version": 1
 }

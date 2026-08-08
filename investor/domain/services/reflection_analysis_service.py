@@ -85,6 +85,14 @@ def format_weekly_report(report: Dict) -> str:
                 f"{sp.get('correct', 0)} | {sp.get('win_rate', 0)}% | {sp.get('avg_score', 0)} |"
             )
         lines.append("")
+    elif report.get("strategy_evidence"):
+        evidence = report.get("strategy_evidence") or {}
+        lines.append("## 策略归因边界")
+        lines.append(
+            f"- 画像化样本 {evidence.get('total', 0)}/{evidence.get('minimum_total', 20)}；"
+            "未达到完整门槛，不输出最佳/最差策略，也不据此调整权重。"
+        )
+        lines.append("")
 
     if report.get("findings"):
         lines.append("## 关键发现")

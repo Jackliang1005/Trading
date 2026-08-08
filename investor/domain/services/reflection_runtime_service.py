@@ -759,23 +759,34 @@ def _build_prediction_breakdown_table(backtest_result: Dict) -> str:
         lines.append(f"| {target_name} | {total} | {correct} | {win_rate:.0f}% | {avg_score:.0f} | {avg_deviation:+.2f}% |")
     lines.append("")
 
-    # 按策略分组
-    by_strategy = {}
-    for pred in checked:
-        strategy = pred.get("strategy_used", "unknown") or "unknown"
-        by_strategy.setdefault(strategy, []).append(pred)
+    # 策略比较必须复用画像化证据门槛；旧 strategy_used 标签只保留在总体/标的复盘。
+    from domain.services.weekly_report_service import _summarize_predictions
 
-    if len(by_strategy) > 1:
+    strategy_summary = _summarize_predictions(
+        datetime.strptime(start_date, "%Y-%m-%d").date(),
+        datetime.strptime(end_date, "%Y-%m-%d").date(),
+    )
+    if strategy_summary.get("strategy_comparison_ready"):
         lines.append("#### 按策略统计")
         lines.append("| 策略 | 预测数 | 正确 | 胜率 | 平均得分 |")
         lines.append("|------|--------|------|------|----------|")
-        for strategy, preds in sorted(by_strategy.items(), key=lambda x: -len(x[1])):
-            total = len(preds)
-            correct = sum(1 for p in preds if p.get("is_correct"))
-            win_rate = correct / total * 100 if total else 0
-            avg_score = sum(p.get("score", 0) or 0 for p in preds) / total if total else 0
-            lines.append(f"| {strategy} | {total} | {correct} | {win_rate:.0f}% | {avg_score:.0f} |")
+        for item in strategy_summary.get("strategies") or []:
+            if not item.get("eligible") or item.get("win_rate") is None:
+                continue
+            lines.append(
+                f"| {item.get('strategy')} | {item.get('total')} | {item.get('correct')} | "
+                f"{float(item.get('win_rate')):.0f}% | - |"
+            )
         lines.append("")
+    else:
+        lines.extend(
+            [
+                "#### 策略归因边界",
+                f"- 画像化样本 {strategy_summary.get('qualified_total', 0)}/{strategy_summary.get('minimum_total', 20)}；"
+                "未达到完整门槛，不输出分策略胜率。",
+                "",
+            ]
+        )
 
     # 连胜/连败检测
     sorted_preds = sorted(checked, key=lambda p: p.get("created_at", ""))
