@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Dict, List
 
 from domain.services.prediction_prompt_service import build_prediction_prompt
+from domain.services.evolution_service import EVOLUTION_EVIDENCE_PROFILES
 from domain.services.prediction_service import (
     build_prediction_runtime_context,
     build_rule_based_predictions,
@@ -49,7 +50,7 @@ def parse_predictions(llm_output: str) -> List[Dict]:
 
 STRATEGY_TASKS = {
     "technical": {
-        "evidence_profile": "technical_price_regime_v1",
+        "evidence_profile": EVOLUTION_EVIDENCE_PROFILES["technical"],
         "focus": (
             "只用标的行情、涨跌幅、市场状态、支撑阻力和价格结构形成方向；"
             "新闻、宏观和资金数据不得作为方向依据，只可作为风险备注。"
@@ -62,7 +63,7 @@ STRATEGY_TASKS = {
         ),
     },
     "sentiment": {
-        "evidence_profile": "sentiment_flow_news_v1",
+        "evidence_profile": EVOLUTION_EVIDENCE_PROFILES["sentiment"],
         "focus": (
             "只用资金流向、板块热度、市场新闻、全球市场与宏观事件形成方向；"
             "标的现价只用于价格锚定，不得使用技术形态或均线推导方向。"

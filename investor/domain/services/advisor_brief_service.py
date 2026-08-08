@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from domain.services.report_style_service import event_summary_cn, join_cn, money, pct, risk_label, theme_label
 from domain.services.risk_report_service import build_risk_report
+from domain.services.evolution_service import build_evolution_readiness
 from domain.services.weekly_report_service import _summarize_intraday_predictions
 
 
@@ -22,6 +23,7 @@ BLOCKED_LABELS = {
 }
 
 ACTION_LABELS = {"observe": "观察", "verify": "核验", "prepare": "准备"}
+STRATEGY_LABELS = {"technical": "技术", "sentiment": "情绪", "fundamental": "基本面", "geopolitical": "地缘"}
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -135,6 +137,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
     events = _event_summary(reports_dir)
     decision = _decision_summary(reports_dir, current)
     intraday = _summarize_intraday_predictions(current.date() - timedelta(days=6), current.date(), reports_dir=reports_dir)
+    evolution = build_evolution_readiness(as_of=current.date())
     actions = _build_actions(risk, decision, events)
     overall_level = "prepare" if any(item["level"] == "prepare" for item in actions) else (
         "verify" if any(item["level"] == "verify" for item in actions) else "observe"
@@ -147,6 +150,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
         "events": events,
         "decision": decision,
         "intraday": intraday,
+        "evolution": evolution,
         "actions": actions,
     }
     brief["text"] = format_advisor_brief(brief)
@@ -160,6 +164,7 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
     events = brief.get("events") or {}
     decision = brief.get("decision") or {}
     intraday = brief.get("intraday") or {}
+    evolution = brief.get("evolution") or {}
     overall = str(brief.get("overall_action_level") or "observe")
     lines = [
         "🧭 OpenClaw 投顾总览",
@@ -229,6 +234,27 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
         lines.append("- 这些历史样本只评价日内方向；未完成策略归因的样本不进入权重更新。")
     else:
         lines.append("- 最近 7 日暂无可用的日内方向验证，不输出命中率。")
+    if evolution.get("ready"):
+        lines.append(
+            f"- 策略进化证据已达门槛：画像化验真样本 {evolution.get('total')}/{evolution.get('minimum_total')}，"
+            f"合格策略 {len(evolution.get('eligible_strategies') or [])}/{evolution.get('minimum_strategies')}；"
+            "下一次进化任务可比较策略，但仍只在合格策略之间调权。"
+        )
+    else:
+        strategy_parts = []
+        for item in evolution.get("strategies") or []:
+            label = STRATEGY_LABELS.get(str(item.get("strategy") or ""), str(item.get("strategy") or "未知"))
+            pending = int(item.get("pending", 0) or 0)
+            suffix = f"，待验真{pending}" if pending else ""
+            strategy_parts.append(
+                f"{label}{int(item.get('verified', 0) or 0)}/{int(item.get('minimum', 0) or 0)}{suffix}"
+            )
+        detail = join_cn(strategy_parts, "两条新证据链尚未形成首批样本")
+        lines.append(
+            f"- 策略进化仍在采样：画像化验真样本 {evolution.get('total', 0)}/{evolution.get('minimum_total', 20)}；"
+            f"{detail}。未达门槛前权重保持不变。"
+        )
+        lines.append(f"- 成熟规则：{evolution.get('maturity_rule') or '样本成熟并验真后才计入'}。")
     if decision.get("fresh"):
         lines.append(f"- 盘中决策快照：{decision.get('generated_at')}，可用于当前行动分层。")
     elif decision.get("available"):

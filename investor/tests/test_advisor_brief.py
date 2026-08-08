@@ -26,8 +26,23 @@ def _risk():
     }
 
 
+def _evolution():
+    return {
+        "ready": False,
+        "total": 6,
+        "minimum_total": 20,
+        "minimum_strategies": 2,
+        "strategies": [
+            {"strategy": "technical", "verified": 3, "minimum": 5, "pending": 3},
+            {"strategy": "sentiment", "verified": 3, "minimum": 5, "pending": 3},
+        ],
+        "maturity_rule": "新样本需走满3个真实交易日并通过价格锚点校验后才计入",
+    }
+
+
 def test_advisor_brief_unifies_risk_events_actions_and_validation(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "build_risk_report", _risk)
+    monkeypatch.setattr(service, "build_evolution_readiness", lambda as_of=None: _evolution())
     _write(
         tmp_path / "investor_assistant_capability_audit_latest.json",
         {
@@ -100,10 +115,14 @@ def test_advisor_brief_unifies_risk_events_actions_and_validation(tmp_path, monk
     assert "台积电研发二维晶体管新技术" in brief["text"]
     assert "[准备] 示例股份：建议减仓 100 股" in brief["text"]
     assert "不会自动下单" in brief["text"]
+    assert "画像化验真样本 6/20" in brief["text"]
+    assert "技术3/5，待验真3" in brief["text"]
+    assert "未达门槛前权重保持不变" in brief["text"]
 
 
 def test_stale_decision_snapshot_cannot_create_prepare_action(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "build_risk_report", _risk)
+    monkeypatch.setattr(service, "build_evolution_readiness", lambda as_of=None: _evolution())
     _write(
         tmp_path / "investor_decision_monitor_latest.json",
         {

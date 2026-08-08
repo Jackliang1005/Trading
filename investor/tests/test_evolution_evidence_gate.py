@@ -177,6 +177,57 @@ def test_persisted_profiled_samples_reach_gate_without_legacy_rows(monkeypatch, 
     assert set(evidence["eligible_strategies"]) == {"technical", "sentiment"}
 
 
+def test_readiness_exposes_verified_and_pending_profiled_samples(monkeypatch):
+    monkeypatch.setattr(service, "load_strategy_config", _config)
+    monkeypatch.setattr(
+        service.db,
+        "get_strategy_performance",
+        lambda start, end: [
+            {
+                "strategy_used": "technical",
+                "profiled_total": 3,
+                "evidence_profiles": "technical_price_regime_v1",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        service.db,
+        "get_unchecked_predictions",
+        lambda before_date=None: [
+            {
+                "strategy_used": "technical",
+                "evidence_profile": "technical_price_regime_v1",
+            },
+            {
+                "strategy_used": "sentiment",
+                "evidence_profile": "sentiment_flow_news_v1",
+            },
+            {"strategy_used": "technical", "evidence_profile": ""},
+        ],
+    )
+
+    result = service.build_evolution_readiness(as_of=datetime(2026, 8, 8).date())
+
+    assert result["total"] == 3
+    assert result["pending"] == 2
+    assert result["remaining_total"] == 17
+    assert {item["strategy"] for item in result["strategies"]} == {"technical", "sentiment"}
+
+
+def test_empty_readiness_still_names_expected_evidence_chains(monkeypatch):
+    monkeypatch.setattr(service, "load_strategy_config", _config)
+    monkeypatch.setattr(service.db, "get_strategy_performance", lambda start, end: [])
+    monkeypatch.setattr(service.db, "get_unchecked_predictions", lambda before_date=None: [])
+
+    result = service.build_evolution_readiness(as_of=datetime(2026, 8, 8).date())
+
+    assert result["total"] == 0
+    assert [(item["strategy"], item["verified"], item["minimum"]) for item in result["strategies"]] == [
+        ("sentiment", 0, 5),
+        ("technical", 0, 5),
+    ]
+
+
 def test_evolve_labels_zero_sample_run_as_audit_not_evolution(monkeypatch):
     config = _config()
     config["_weights_changed"] = False

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List
 
 import db
@@ -32,6 +32,11 @@ DEFAULT_STRATEGY_CONFIG = {
     "min_evolution_samples": 20,
     "min_strategy_samples": 5,
     "min_evolution_strategies": 2,
+}
+
+EVOLUTION_EVIDENCE_PROFILES = {
+    "technical": "technical_price_regime_v1",
+    "sentiment": "sentiment_flow_news_v1",
 }
 
 
@@ -200,6 +205,79 @@ def _recent_intraday_evidence(lookback_days: int = 14) -> Dict:
     end = datetime.now().date()
     start = end - timedelta(days=max(1, lookback_days) - 1)
     return _summarize_intraday_predictions(start, end)
+
+
+def build_evolution_readiness(
+    lookback_days: int = 14,
+    as_of: date | None = None,
+) -> Dict:
+    """Read-only evidence status for user-facing advisor reports."""
+    end_day = as_of or datetime.now().date()
+    start_day = end_day - timedelta(days=max(1, lookback_days))
+    performance = db.get_strategy_performance(start_day.isoformat(), end_day.isoformat())
+    evidence = _performance_evidence(performance, load_strategy_config())
+    pending_rows = db.get_unchecked_predictions(before_date=end_day.isoformat())
+    pending_by_strategy: Dict[str, int] = {}
+    for row in pending_rows:
+        profile = str(row.get("evidence_profile") or "").strip()
+        strategy = str(row.get("strategy_used") or "").strip()
+        if not profile or not strategy:
+            continue
+        pending_by_strategy[strategy] = pending_by_strategy.get(strategy, 0) + 1
+
+    strategies = []
+    seen = set()
+    for item in performance:
+        strategy = str(item.get("strategy_used") or "").strip()
+        profile = str(item.get("evidence_profiles") or "").strip()
+        profiled_total = int(item.get("profiled_total") or 0)
+        if not strategy or (not profile and not pending_by_strategy.get(strategy)):
+            continue
+        strategies.append(
+            {
+                "strategy": strategy,
+                "evidence_profile": profile,
+                "verified": profiled_total,
+                "minimum": int(evidence["minimum_per_strategy"]),
+                "pending": int(pending_by_strategy.get(strategy, 0)),
+            }
+        )
+        seen.add(strategy)
+    for strategy, pending in pending_by_strategy.items():
+        if strategy in seen:
+            continue
+        strategies.append(
+            {
+                "strategy": strategy,
+                "evidence_profile": "",
+                "verified": 0,
+                "minimum": int(evidence["minimum_per_strategy"]),
+                "pending": int(pending),
+            }
+        )
+        seen.add(strategy)
+    for strategy, profile in EVOLUTION_EVIDENCE_PROFILES.items():
+        if strategy in seen:
+            continue
+        strategies.append(
+            {
+                "strategy": strategy,
+                "evidence_profile": profile,
+                "verified": 0,
+                "minimum": int(evidence["minimum_per_strategy"]),
+                "pending": 0,
+            }
+        )
+    strategies.sort(key=lambda item: item["strategy"])
+    return {
+        **evidence,
+        "period": f"{start_day.isoformat()} ~ {end_day.isoformat()}",
+        "lookback_days": int(lookback_days),
+        "pending": sum(pending_by_strategy.values()),
+        "strategies": strategies,
+        "remaining_total": max(0, int(evidence["minimum_total"]) - int(evidence["total"])),
+        "maturity_rule": "新样本需走满3个真实交易日并通过价格锚点校验后才计入",
+    }
 
 
 def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
