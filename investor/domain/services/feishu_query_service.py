@@ -888,12 +888,18 @@ def _query_strategy() -> str:
         lines.append("**当前信号权重**")
         for name, weight in weights.items():
             lines.append(f"- {strategy_labels.get(name, '其他信号')}：{weight:.1%}")
-        lines.append(f"\n- 自动校准：{'已启用' if config.get('auto_adjust_enabled') else '未启用'}")
+        evolution = build_evolution_readiness(as_of=date.today())
+        auto_adjust = bool(config.get("auto_adjust_enabled"))
+        lines.append(
+            f"\n- 自动校准开关：{'已启用（受证据门槛约束）' if auto_adjust else '未启用'}"
+        )
         history = config.get("weight_history", [])
         if history:
             latest = history[-1]
             latest_date = str(latest.get("date") or "").strip()
-            lines.append(f"- 最近校准：{latest_date or '暂无记录'}")
+            lines.append(f"- 最近权重记录：{latest_date or '暂无记录'}")
+            if str(latest.get("reason") or "").strip():
+                lines.append(f"- 记录原因：{str(latest.get('reason')).strip()}。")
             try:
                 calibration_age = (date.today() - date.fromisoformat(latest_date[:10])).days
             except Exception:
@@ -902,20 +908,28 @@ def _query_strategy() -> str:
                 lines.append("- 校准日期无法验证；当前权重仅作研究参考。")
             elif calibration_age > 30:
                 lines.append(f"- 校准距今 {calibration_age} 天，已超过 30 天新鲜度要求；在新增验证样本前，当前权重仅作参考。")
-            if latest.get("performance"):
-                lines.extend(["", "**近期验证样本**"])
-                for perf in latest["performance"][:4]:
-                    name = perf.get("strategy_used", "?")
-                    wr = perf.get("win_rate", 0)
-                    correct = int(perf.get("correct", 0) or 0)
-                    total = int(perf.get("total", 0) or 0)
-                    label = strategy_labels.get(name, "其他信号")
-                    if total < 5:
-                        lines.append(f"- {label}：仅 {total} 个已验证样本，暂不足以评价胜率。")
-                    else:
-                        lines.append(f"- {label}：{correct}/{total} 次方向正确，胜率 {wr:.0f}%。")
             if (latest.get("evidence") or {}).get("legacy_weights_quarantined"):
                 lines.append("- 历史未画像化样本形成的权重已隔离；当前已恢复系统基线，满足20/5/2门槛前不再校准。")
+        lines.extend(["", "**当前校准证据**"])
+        if evolution.get("ready"):
+            lines.append(
+                f"- 画像化成熟样本 {int(evolution.get('total', 0) or 0)}/"
+                f"{int(evolution.get('minimum_total', 20) or 20)}，"
+                f"合格策略 {len(evolution.get('eligible_strategies') or [])}/"
+                f"{int(evolution.get('minimum_strategies', 2) or 2)}；已达到比较门槛。"
+            )
+        else:
+            lines.append(
+                f"- 画像化成熟样本 {int(evolution.get('total', 0) or 0)}/"
+                f"{int(evolution.get('minimum_total', 20) or 20)}；未达到门槛，当前权重保持不变。"
+            )
+        for item in evolution.get("strategies") or []:
+            name = str(item.get("strategy") or "")
+            lines.append(
+                f"- {strategy_labels.get(name, name or '其他信号')}：成熟验真 "
+                f"{int(item.get('verified', 0) or 0)}/{int(item.get('minimum', 0) or 0)}。"
+            )
+        lines.append(f"- 成熟规则：{evolution.get('maturity_rule') or '走满验证窗口并通过价格锚点校验后才计入'}。")
         lines.extend(["", "**使用边界**", "- 权重只用于生成研究判断，不会据此自动下单。"])
     else:
         lines.append("当前没有可用的策略配置，无法评价信号权重。")
@@ -1332,15 +1346,23 @@ def _query_skill_backtest(query: str) -> str:
     if not data.get("ok"):
         return _skill_failure("回测数据", data)
     return "\n".join([
-        f"🧪 策略回测｜{data.get('code')}",
+        f"🧪 固定规则历史回放｜{data.get('code')}",
         f"区间：{_format_data_time(data.get('start'))} 至 {_format_data_time(data.get('end'))}",
         "",
-        "**结果**",
-        f"- 样本 {int(data.get('bars', 0) or 0)} 个交易日，信号切换 {int(data.get('signal_changes', 0) or 0)} 次。",
-        f"- 总收益 {_display_value(data.get('total_return_pct'), '%')}，年化收益 {_display_value(data.get('annualized_return_pct'), '%')}。",
-        f"- 最大回撤 {_display_value(abs(float(data.get('max_drawdown_pct', 0) or 0)), '%')}，夏普比率 {_display_value(data.get('sharpe'))}，历史胜率 {_display_value(data.get('win_rate_pct'), '%')}。",
+        "**回放规则**",
+        "- 仅测试一条固定规则：收盘时 MA5 高于 MA20，则下一交易日持有；否则持有现金。",
+        f"- 样本 {int(data.get('bars', 0) or 0)} 个交易日；执行入场 {int(data.get('entries', 0) or 0)} 次、离场 {int(data.get('exits', 0) or 0)} 次。",
         "",
-        "- 回测假设：收盘产生信号、下一交易日执行，且未计手续费和滑点；结果可能明显高估真实收益。历史回测不代表未来收益，也不会触发自动交易。",
+        "**含简化成本的结果**",
+        f"- 规则净收益 {_display_value(data.get('net_total_return_pct'), '%')}；同期买入并持有 {_display_value(data.get('benchmark_return_pct'), '%')}；超额 {_display_value(data.get('excess_return_pct_points'), ' 个百分点')}。",
+        f"- 规则年化 {_display_value(data.get('net_annualized_return_pct'), '%')}；基准年化 {_display_value(data.get('benchmark_annualized_return_pct'), '%')}。",
+        f"- 规则最大回撤 {_display_value(abs(float(data.get('net_max_drawdown_pct', 0) or 0)), '%')}；基准最大回撤 {_display_value(abs(float(data.get('benchmark_max_drawdown_pct', 0) or 0)), '%')}；规则夏普 {_display_value(data.get('net_sharpe'))}。",
+        f"- 实际持仓 {int(data.get('active_days', 0) or 0)} 日，其中上涨日占比 {_display_value(data.get('active_day_up_rate_pct'), '%')}；这是持仓日分布，不是交易胜率。",
+        "",
+        "**证据边界**",
+        f"- 每次入场或离场按 {int(data.get('cost_bps_per_side', 0) or 0)} 个基点简化成本扣减；未单独模拟印花税、滑点、涨跌停和成交量约束。",
+        "- 行情来自腾讯日线；复权、公司行动处理未做第二数据源交叉验证，夏普按零无风险利率估算。",
+        "- 这是单标的、单区间的样本内规则回放，没有样本外或滚动验证，不能证明 OpenClaw 当前策略有效，也不能据此直接交易。",
     ])
 
 

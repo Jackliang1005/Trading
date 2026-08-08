@@ -215,13 +215,14 @@ def _technical(code: str, period: str = "day") -> dict[str, Any]:
 
 
 def _backtest(code: str, days: int = 250) -> dict[str, Any]:
-    """Long-only MA5/MA20 cross backtest with next-day execution assumption."""
+    """Research replay for one fixed MA rule with benchmark and simple costs."""
     symbol = _symbol(code)
     lookback = max(80, min(int(days), 800))
     url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{lookback},"
     payload = json.loads(urllib.request.urlopen(url, timeout=10).read().decode("utf-8", errors="replace"))
     rows = ((payload.get("data") or {}).get(symbol) or {}).get("day") or []
-    closes = [float(row[2]) for row in rows if isinstance(row, list) and len(row) >= 3]
+    valid_rows = [row for row in rows if isinstance(row, list) and len(row) >= 3]
+    closes = [float(row[2]) for row in valid_rows]
     if len(closes) < 60:
         return {"ok": False, "error": "insufficient_kline"}
     signals = []
@@ -229,22 +230,85 @@ def _backtest(code: str, days: int = 250) -> dict[str, Any]:
         ma5 = sum(closes[max(0, index - 4):index + 1]) / min(index + 1, 5)
         ma20 = sum(closes[max(0, index - 19):index + 1]) / min(index + 1, 20)
         signals.append(1.0 if index >= 19 and ma5 > ma20 else 0.0)
-    returns = [(closes[index] / closes[index - 1] - 1) * signals[index - 1] for index in range(1, len(closes))]
-    equity = 1.0
-    peak = 1.0
-    max_drawdown = 0.0
-    for value in returns:
-        equity *= 1 + value
-        peak = max(peak, equity)
-        max_drawdown = min(max_drawdown, equity / peak - 1)
-    mean = sum(returns) / len(returns)
-    variance = sum((value - mean) ** 2 for value in returns) / len(returns)
-    annualized = equity ** (252 / len(returns)) - 1 if equity > 0 else -1.0
-    sharpe = mean / math.sqrt(variance) * math.sqrt(252) if variance > 0 else 0.0
-    trades = sum(1 for index in range(1, len(signals)) if signals[index] != signals[index - 1])
-    active_returns = [value for value in returns if value != 0]
-    win_rate = sum(1 for value in active_returns if value > 0) / len(active_returns) if active_returns else 0.0
-    return {"ok": True, "code": code, "strategy": "MA5_above_MA20_long_only", "start": rows[0][0], "end": rows[-1][0], "bars": len(closes), "total_return_pct": round((equity - 1) * 100, 2), "annualized_return_pct": round(annualized * 100, 2), "max_drawdown_pct": round(max_drawdown * 100, 2), "sharpe": round(sharpe, 2), "win_rate_pct": round(win_rate * 100, 2), "signal_changes": trades, "source": "tencent_kline", "assumption": "signal at close, position applied next day; excludes fees/slippage"}
+    cost_rate = 0.001  # 10 bps on each entry or exit; intentionally conservative and explicit.
+    gross_returns = []
+    net_returns = []
+    benchmark_returns = []
+    turnovers = []
+    for index in range(1, len(closes)):
+        market_return = closes[index] / closes[index - 1] - 1
+        position = signals[index - 1]
+        prior_position = signals[index - 2] if index >= 2 else 0.0
+        turnover = abs(position - prior_position)
+        gross_return = market_return * position
+        net_return = (1 + gross_return) * (1 - cost_rate * turnover) - 1
+        benchmark_returns.append(market_return)
+        gross_returns.append(gross_return)
+        net_returns.append(net_return)
+        turnovers.append(turnover)
+
+    def metrics(series: list[float]) -> tuple[float, float, float, float]:
+        equity = 1.0
+        peak = 1.0
+        max_drawdown = 0.0
+        for value in series:
+            equity *= 1 + value
+            peak = max(peak, equity)
+            max_drawdown = min(max_drawdown, equity / peak - 1)
+        mean = sum(series) / len(series)
+        variance = sum((value - mean) ** 2 for value in series) / len(series)
+        annualized = equity ** (252 / len(series)) - 1 if equity > 0 else -1.0
+        sharpe = mean / math.sqrt(variance) * math.sqrt(252) if variance > 0 else 0.0
+        return equity - 1, annualized, max_drawdown, sharpe
+
+    gross_total, gross_annualized, gross_drawdown, gross_sharpe = metrics(gross_returns)
+    net_total, net_annualized, net_drawdown, net_sharpe = metrics(net_returns)
+    benchmark_total, benchmark_annualized, benchmark_drawdown, _ = metrics(benchmark_returns)
+    executed_positions = signals[:-1]
+    entries = sum(
+        1 for index in range(1, len(executed_positions))
+        if executed_positions[index - 1] == 0 and executed_positions[index] == 1
+    )
+    exits = sum(
+        1 for index in range(1, len(executed_positions))
+        if executed_positions[index - 1] == 1 and executed_positions[index] == 0
+    )
+    active_market_returns = [benchmark_returns[index] for index, position in enumerate(signals[:-1]) if position]
+    active_day_up_rate = (
+        sum(1 for value in active_market_returns if value > 0) / len(active_market_returns)
+        if active_market_returns else 0.0
+    )
+    gross_total_pct = round(gross_total * 100, 2)
+    net_total_pct = round(net_total * 100, 2)
+    benchmark_total_pct = round(benchmark_total * 100, 2)
+    return {
+        "ok": True,
+        "code": code,
+        "strategy": "MA5_above_MA20_long_only",
+        "start": valid_rows[0][0],
+        "end": valid_rows[-1][0],
+        "bars": len(closes),
+        "total_return_pct": gross_total_pct,
+        "annualized_return_pct": round(gross_annualized * 100, 2),
+        "max_drawdown_pct": round(gross_drawdown * 100, 2),
+        "sharpe": round(gross_sharpe, 2),
+        "net_total_return_pct": net_total_pct,
+        "net_annualized_return_pct": round(net_annualized * 100, 2),
+        "net_max_drawdown_pct": round(net_drawdown * 100, 2),
+        "net_sharpe": round(net_sharpe, 2),
+        "benchmark_return_pct": benchmark_total_pct,
+        "benchmark_annualized_return_pct": round(benchmark_annualized * 100, 2),
+        "benchmark_max_drawdown_pct": round(benchmark_drawdown * 100, 2),
+        "excess_return_pct_points": round(net_total_pct - benchmark_total_pct, 2),
+        "active_day_up_rate_pct": round(active_day_up_rate * 100, 2),
+        "active_days": len(active_market_returns),
+        "signal_changes": entries + exits,
+        "entries": entries,
+        "exits": exits,
+        "cost_bps_per_side": int(cost_rate * 10000),
+        "source": "tencent_kline",
+        "assumption": "signal at close, position applied next day; 10 bps charged on each entry or exit",
+    }
 
 
 def _akshare_subprocess(source: str, timeout: int = 18) -> dict[str, Any]:
