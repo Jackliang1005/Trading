@@ -23,13 +23,16 @@ def resolve_position_pnl(item: Dict[str, Any]) -> Dict[str, Any]:
     volume, _ = _number(item, ("volume", "m_nVolume", "total_volume", "current_volume"))
     average_price, _ = _number(item, ("avg_price", "m_dAvgPrice", "cost_price", "open_price", "m_dOpenPrice"))
     cumulative, cumulative_key = _number(item, ("position_profit", "m_dPositionProfit", "profit_loss"))
-    normalized, normalized_key = _number(item, ("unrealized_pnl",))
+    normalized, normalized_key = _number(item, ("unrealized_pnl", "pnl"))
     floating, floating_key = _number(item, ("float_profit", "m_dFloatProfit"))
+    explicit_cost, _ = _number(item, ("cost_value",))
 
     derived = None
-    cost_value = None
+    cost_value = explicit_cost if explicit_cost is not None and explicit_cost > 0 else None
     if market_value is not None and volume is not None and volume > 0 and average_price is not None and average_price > 0:
         cost_value = average_price * volume
+        derived = market_value - cost_value
+    elif market_value is not None and cost_value is not None:
         derived = market_value - cost_value
 
     tolerance = max(5.0, abs(market_value or 0.0) * 0.005)

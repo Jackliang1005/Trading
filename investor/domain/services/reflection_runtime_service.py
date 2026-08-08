@@ -353,6 +353,42 @@ def _build_reflection_trading_summary(context: Dict) -> Dict:
             ts["total_market_value"] = float(runtime.get("total_market_value", ts.get("total_market_value", 0)) or 0)
             ts["total_unrealized_pnl"] = float(runtime.get("total_unrealized_pnl", ts.get("total_unrealized_pnl", 0)) or 0)
             ts["context_source_detail"] = "runtime_fallback_for_positions"
+
+    # Reflection must use the same cross-account inventory and cumulative-P&L
+    # normalization as the portfolio risk report.  Raw packet/QMT summaries can
+    # retain daily float-profit totals or omit an account that is on a verified
+    # historical fallback, producing a materially false review.
+    try:
+        from domain.services.risk_report_service import build_risk_report
+
+        risk = build_risk_report() or {}
+    except Exception as exc:
+        risk = {"available": False, "error": type(exc).__name__}
+    risk_as_of = str(risk.get("as_of") or "")[:10]
+    summary_as_of = str(ts.get("as_of_date") or context.get("as_of_date") or "")[:10]
+    risk_positions = [item for item in (risk.get("positions") or []) if isinstance(item, dict)]
+    risk_is_not_older = not summary_as_of or not risk_as_of or risk_as_of >= summary_as_of
+    if risk.get("available") and risk_positions and risk_is_not_older:
+        ts["positions"] = risk_positions
+        ts["positions_count"] = len(risk_positions)
+        ts["total_market_value"] = round(sum(float(item.get("market_value") or 0) for item in risk_positions), 2)
+        ts["total_unrealized_pnl"] = round(sum(float(item.get("pnl") or 0) for item in risk_positions), 2)
+        ts["position_coverage_complete"] = bool(risk.get("position_coverage_complete"))
+        ts["account_source_coverage_complete"] = bool(risk.get("account_source_coverage_complete"))
+        ts["stale_account_sources"] = list(risk.get("stale_account_sources") or [])
+        ts["missing_account_sources"] = list(risk.get("missing_account_sources") or [])
+        ts["reflection_position_source"] = "portfolio_risk"
+        ts["risk_data_status"] = str(risk.get("data_status") or "")
+        if risk_as_of:
+            ts["as_of_date"] = risk_as_of
+    else:
+        ts.setdefault("position_coverage_complete", False)
+        ts.setdefault("account_source_coverage_complete", False)
+        ts.setdefault("stale_account_sources", [])
+        ts.setdefault("missing_account_sources", [])
+        ts.setdefault("reflection_position_source", "qmt_summary")
+        if risk.get("error"):
+            ts["reflection_position_error"] = str(risk.get("error"))
     return ts
 
 
@@ -426,9 +462,14 @@ def _build_positions_table(positions: list) -> tuple[str, list]:
         cost = float(pos.get("cost_price", pos.get("open_price", 0)) or 0)
         price = float(pos.get("current_price", pos.get("last_price", 0)) or 0)
         mv = float(pos.get("market_value", 0) or 0)
+        cost_value = float(pos.get("cost_value", 0) or 0)
         # 有时 mv 由 volume * price 计算
         if not mv and vol and price:
             mv = vol * price
+        if not price and vol > 0 and mv > 0:
+            price = mv / vol
+        if not cost and vol > 0 and cost_value > 0:
+            cost = cost_value / vol
         pnl_evidence = resolve_position_pnl(pos)
         pnl = float(pnl_evidence["pnl"])
         pnl_pct = float(pnl_evidence["pnl_pct"] or 0)
@@ -466,6 +507,8 @@ def _build_positions_table(positions: list) -> tuple[str, list]:
 
 def build_trading_summary_report(ts: Dict) -> str:
     """生成实盘交易摘要 (Markdown 格式)。"""
+    from domain.services.report_style_service import source_label
+
     lines = []
     lines.append("## 实盘交易摘要\n")
 
@@ -488,6 +531,20 @@ def build_trading_summary_report(ts: Dict) -> str:
             lines.append(f"- 冻结资金: {frozen:,.2f}")
             lines.append(f"- 持仓市值: {mv:,.2f}")
             lines.append("")
+
+    if ts.get("reflection_position_source") == "portfolio_risk":
+        lines.append("### 持仓数据覆盖")
+        lines.append("- 持仓与累计盈亏采用组合风险模块的跨账户聚合口径。")
+        stale_sources = [source_label(item) for item in (ts.get("stale_account_sources") or [])]
+        if stale_sources:
+            lines.append(f"- 历史降级账户: {', '.join(stale_sources)}；相关持仓不是实时账户状态。")
+        if ts.get("position_coverage_complete"):
+            lines.append("- 已知持仓明细覆盖完整。")
+        else:
+            lines.append("- 持仓明细覆盖不完整；市值和盈亏仅代表已知部分。")
+        if not ts.get("account_source_coverage_complete"):
+            lines.append("- 部分账户资产源降级；现金和总资产不按全实时口径解读。")
+        lines.append("")
 
     trades = _valid_trades(ts)
     buys = [item for item in trades if item.get("order_type", 0) in (23, "buy", "BUY")]
@@ -566,9 +623,9 @@ def build_trading_summary_report(ts: Dict) -> str:
     return "\n".join(lines)
 
 
-def _decision_monitor_attribution(trading_summary: Dict, outcome_summary: Dict | None = None) -> str:
+def _decision_monitor_attribution(trading_summary: Dict, outcome_summary: Dict | None = None, target_date: str = "") -> str:
     """Compare scheduled risk recommendations with same-day executed trades."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = str(target_date or trading_summary.get("as_of_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
     monitors = load_decision_snapshots(today, reports_dir=DECISION_MONITOR_PATH.parent)
     if not monitors:
         return "## 盘中建议闭环\n- 当日没有保存的盘中建议快照。"
@@ -708,7 +765,11 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
     _, positions = _build_positions_table(_resolve_positions(trading_summary))
     total_pnl = sum(float(item.get("pnl") or 0) for item in positions)
     is_fresh, freshness_note = _reflection_freshness(as_of, generated_at)
-    position_scope = "当前" if is_fresh else "数据快照中"
+    stale_sources = list(trading_summary.get("stale_account_sources") or [])
+    position_coverage_complete = bool(trading_summary.get("position_coverage_complete"))
+    account_coverage_complete = bool(trading_summary.get("account_source_coverage_complete"))
+    fully_current = is_fresh and position_coverage_complete and account_coverage_complete and not stale_sources
+    position_scope = "当前可验证" if fully_current else "数据快照中已知"
     lines = [
         "📝 每日交易复盘",
         f"数据日：{as_of or '未知'}",
@@ -720,6 +781,13 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
         lines.append(f"- 有 {len(raw_trades) - len(trades)} 条成交记录缺少正数成交量或成交价，已排除，不计入交易完成。")
     if total_pnl < 0:
         lines.append("- 组合处于浮亏，下一交易日先控制回撤和集中度，不以热点补仓替代风控。")
+    if stale_sources:
+        stale_labels = [source_label(item) for item in stale_sources]
+        lines.append(f"- 账户 {', '.join(stale_labels)} 使用最近可验证历史快照；组合数值不是全账户实时状态。")
+    if not position_coverage_complete:
+        lines.append("- 持仓明细覆盖不完整；持仓数量、市值和盈亏只代表已知部分，不据此生成精确交易数量。")
+    elif not account_coverage_complete:
+        lines.append("- 持仓明细已覆盖已知账户，但仍有账户资产源降级；现金和总资产不视为全实时口径。")
 
     lines.extend(["", "**有效成交**"])
     if not trades:
@@ -850,15 +918,23 @@ def daily_reflection() -> Dict:
     print("  💼 获取反思上下文...")
     reflection_context = load_reflection_context()
     trading_summary = _build_reflection_trading_summary(reflection_context)
+    data_as_of = str(trading_summary.get("as_of_date") or reflection_context.get("as_of_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_as_of):
+        data_as_of = datetime.now().strftime("%Y-%m-%d")
+    trading_summary["as_of_date"] = data_as_of
     print(f"  📦 反思上下文来源: {reflection_context.get('source', 'unknown')}")
     if reflection_context.get("as_of_date"):
         print(f"  📅 数据日期: {reflection_context.get('as_of_date')}")
 
     trading_report = build_trading_summary_report(trading_summary)
-    outcome_as_of = datetime.now().strftime("%Y-%m-%d")
+    outcome_as_of = data_as_of
     decision_outcome = build_decision_outcomes(outcome_as_of)
     save_decision_outcomes(decision_outcome)
-    decision_attribution = _decision_monitor_attribution(trading_summary, outcome_summary=decision_outcome)
+    decision_attribution = _decision_monitor_attribution(
+        trading_summary,
+        outcome_summary=decision_outcome,
+        target_date=data_as_of,
+    )
     positions = _resolve_positions(trading_summary)
     pos_count = trading_summary.get("positions_count", len(positions))
     print(
@@ -867,7 +943,7 @@ def daily_reflection() -> Dict:
         f"成交{trading_summary.get('today_trade_count', 0)}笔"
     )
 
-    bt_result = backtest_predictions()
+    bt_result = backtest_predictions(target_date=data_as_of)
     prediction_breakdown = _build_prediction_breakdown_table(bt_result)
     full_report = {
         "timestamp": datetime.now().isoformat(),
@@ -882,7 +958,7 @@ def daily_reflection() -> Dict:
 
     reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "reflection_reports")
     os.makedirs(reports_dir, exist_ok=True)
-    date_str = datetime.now().strftime("%Y%m%d")
+    date_str = data_as_of.replace("-", "")
 
     summary_path = os.path.join(reports_dir, f"trading_summary_{date_str}.json")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -892,7 +968,7 @@ def daily_reflection() -> Dict:
     md_lines = [
         "# 每日反思报告",
         f"**生成时间：** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"**数据日期：** {reflection_context.get('as_of_date', datetime.now().strftime('%Y-%m-%d'))}",
+        f"**数据日期：** {data_as_of}",
         "",
         trading_report,
         "",
@@ -917,7 +993,7 @@ def daily_reflection() -> Dict:
         decision_attribution,
         bt_result,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        str(reflection_context.get("as_of_date") or ""),
+        data_as_of,
     )
 
     today = datetime.now()

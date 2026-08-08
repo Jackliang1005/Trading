@@ -51,6 +51,21 @@ def test_float_profit_remains_a_legacy_fallback_when_no_cost_or_cumulative_field
     assert evidence["basis"] == "float_profit_fallback"
 
 
+def test_normalized_portfolio_position_preserves_cumulative_pnl_and_cost_ratio():
+    evidence = resolve_position_pnl(
+        {
+            "market_value": 250230,
+            "cost_value": 367376.14,
+            "pnl": -117146.14,
+            "volume": 600,
+        }
+    )
+
+    assert evidence["pnl"] == -117146.14
+    assert evidence["basis"] == "market_value_minus_cost"
+    assert evidence["pnl_pct"] == -31.8872
+
+
 def test_reflection_does_not_turn_a_cumulative_loss_into_a_profit():
     report = reflection_runtime_service.build_trading_summary_report(
         {"positions": [_qmt_position()], "total_market_value": 208525, "total_unrealized_pnl": 16025}
@@ -59,6 +74,69 @@ def test_reflection_does_not_turn_a_cumulative_loss_into_a_profit():
     assert "总未实现盈亏: -89,543.53" in report
     assert "-30.04%" in report
     assert "总未实现盈亏: +16,025.00" not in report
+
+
+def test_reflection_prefers_cross_account_risk_inventory_over_stale_packet_totals(monkeypatch):
+    risk = {
+        "available": True,
+        "as_of": "2026-08-08",
+        "data_status": "current_snapshot",
+        "position_coverage_complete": True,
+        "account_source_coverage_complete": False,
+        "stale_account_sources": ["guojin"],
+        "missing_account_sources": [],
+        "positions": [
+            {
+                "code": "603986.SH",
+                "name": "兆易创新",
+                "volume": 600,
+                "market_value": 250230,
+                "cost_value": 367376.14,
+                "pnl": -117146.14,
+                "pnl_ratio": -0.3189,
+            },
+            {
+                "code": "513050.SH",
+                "name": "中概互联网ETF易",
+                "volume": 66100,
+                "market_value": 76676,
+                "cost_value": 76685.3,
+                "pnl": -9.3,
+                "pnl_ratio": -0.0001,
+            },
+        ],
+    }
+    monkeypatch.setattr(risk_report_service, "build_risk_report", lambda: risk)
+    context = {
+        "as_of_date": "2026-08-08",
+        "trading_summary": {
+            "positions": [_qmt_position()],
+            "positions_count": 1,
+            "total_unrealized_pnl": 16025,
+        },
+    }
+
+    summary = reflection_runtime_service._build_reflection_trading_summary(context)
+    _, positions = reflection_runtime_service._build_positions_table(summary["positions"])
+
+    assert summary["positions_count"] == 2
+    assert summary["total_unrealized_pnl"] == -117155.44
+    assert sum(item["pnl"] for item in positions) == -117155.44
+    assert summary["reflection_position_source"] == "portfolio_risk"
+    assert summary["stale_account_sources"] == ["guojin"]
+    text = reflection_runtime_service.format_reflection_push_text(
+        summary,
+        "",
+        {},
+        "2026-08-08 20:30:00",
+        "2026-08-08",
+    )
+    assert "组合浮动盈亏 -11.72万" in text
+    assert "账户 国金 使用最近可验证历史快照" in text
+    assert "不是全账户实时状态" in text
+    report = reflection_runtime_service.build_trading_summary_report(summary)
+    assert "持仓与累计盈亏采用组合风险模块的跨账户聚合口径" in report
+    assert "历史降级账户: 国金" in report
 
 
 def test_qmt_combined_summary_uses_cumulative_position_profit(monkeypatch):
