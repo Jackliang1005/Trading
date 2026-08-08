@@ -118,6 +118,16 @@ def pct(value: Any, digits: int = 1, signed: bool = False) -> str:
     return format(number, spec) + "%"
 
 
+def position_pnl_pct(ratio: Any, signed: bool = True) -> str:
+    """Format a cost-based PnL ratio without collapsing small losses to -0.0%."""
+    try:
+        value = float(ratio) * 100
+    except (TypeError, ValueError):
+        return "待核验"
+    digits = 2 if abs(value) < 0.1 else 1
+    return pct(value, digits=digits, signed=signed)
+
+
 def risk_label(flag: Any) -> str:
     raw = str(flag or "").strip()
     if raw.startswith("snapshot_stale_"):

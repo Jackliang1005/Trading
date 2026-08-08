@@ -118,6 +118,7 @@ def test_closing_plan_describes_tiny_loss_as_cost_noise_not_trend_failure():
     assert decision["action_level"] == "observe"
     assert decision["loss_review"]["trigger"] == "below_drawdown_threshold"
     assert "\u5fae\u5c0f\u6d6e\u4e8f" in decision["advice"]
+    assert "\u56de\u64a4 0.01%" in decision["advice"]
     assert "\u6b62\u8dcc" not in decision["advice"]
 
 

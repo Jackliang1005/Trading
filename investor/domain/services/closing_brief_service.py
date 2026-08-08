@@ -21,7 +21,7 @@ from domain.services.global_impact_service import build_global_impact_brief
 from domain.services.longterm_portfolio_service import build_longterm_snapshot_text, load_longterm_snapshot, longterm_plan_status, summarize_longterm_snapshot
 from domain.services.market_review_service import build_market_review, format_market_review
 from domain.services.event_service import _independent_theme_count, _is_market_relevant_event, _near_duplicate_title
-from domain.services.report_style_service import event_impact_label, event_summary_cn, join_cn, source_label, theme_label
+from domain.services.report_style_service import event_impact_label, event_summary_cn, join_cn, position_pnl_pct, source_label, theme_label
 from domain.services.concept_momentum_service import THEME_CONCEPT_KEYWORDS
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -319,14 +319,14 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
         elif loss_evidence["required"]:
             target_weight = float(policy["loss_position_reduce_target_ratio"])
             drawdown = loss_evidence.get("drawdown_ratio")
-            drawdown_text = f"{float(drawdown) * 100:.1f}%" if drawdown is not None else "待核验"
+            drawdown_text = position_pnl_pct(drawdown, signed=False) if drawdown is not None else "待核验"
             severity = "严重回撤" if loss_evidence.get("severity") == "severe" else "亏损仓复核"
             advice = f"不补亏损仓；累计回撤 {drawdown_text} 已进入{severity}门槛，只在放量站回板块强势队列后保留，反弹无量则减仓修复组合弹性。"
         elif str(item.get("source") or "") == "trade":
             advice = "按交易仓处理；高开不追，低开无承接先降风险，强于板块才继续观察。"
         elif pnl < 0:
             drawdown = loss_evidence.get("drawdown_ratio")
-            drawdown_text = f"{float(drawdown) * 100:.1f}%" if drawdown is not None else "待核验"
+            drawdown_text = position_pnl_pct(drawdown, signed=False) if drawdown is not None else "待核验"
             if loss_evidence.get("severity") == "material":
                 advice = (
                     f"当前权重低于组合级亏损复核门槛，但累计回撤 {drawdown_text} 已有实质影响；"
@@ -377,7 +377,7 @@ def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any], policy
         weight = float(p.get("weight") or 0)
         pnl = float(p.get("pnl") or 0)
         pnl_ratio = p.get("pnl_ratio")
-        pnl_ratio_text = "收益率待核验" if pnl_ratio is None else f"收益率 {float(pnl_ratio) * 100:+.1f}%"
+        pnl_ratio_text = "收益率待核验" if pnl_ratio is None else f"收益率 {position_pnl_pct(pnl_ratio)}"
         source_names = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
         level_name = {"observe": "观察", "verify": "核验"}.get(str(p.get("action_level") or "observe"), "观察")
         lines.extend([

@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 
 import db
 from domain.policies.advisor_policy import load_advisor_policy
-from domain.services.report_style_service import join_cn, money, pct, risk_label, source_label
+from domain.services.report_style_service import join_cn, money, pct, position_pnl_pct, risk_label, source_label
 from position_pnl import resolve_position_pnl
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -558,13 +558,13 @@ def format_risk_report(report: Dict[str, Any]) -> str:
     lines.extend(["", "**重点持仓**"])
     for p in report.get("top_positions", [])[:8]:
         sources = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
-        pnl_ratio = "收益率待核验" if p.get("pnl_ratio") is None else f"收益率 {pct(float(p['pnl_ratio']) * 100, signed=True)}"
+        pnl_ratio = "收益率待核验" if p.get("pnl_ratio") is None else f"收益率 {position_pnl_pct(p['pnl_ratio'])}"
         lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{pnl_ratio}｜{sources}")
     lines.extend(["", "**执行原则**"])
     if report.get("top1_ratio", 0) >= float(policy.get("single_position_alert_ratio", 0.30)):
         lines.append("- 优先降低单票集中度；弱于所属板块且无放量承接时，不用补仓摊低成本。")
     if report.get("total_unrealized_pnl", 0) < 0:
-        lines.append("- 组合浮亏阶段先控制回撤，再考虑新增高波动仓位。")
+        lines.append("- 组合累计持仓盈亏为负时先控制回撤，再考虑新增高波动仓位。")
     if not any((report.get("top1_ratio", 0) >= float(policy.get("single_position_alert_ratio", 0.30)), report.get("total_unrealized_pnl", 0) < 0)):
         lines.append("- 当前快照未触发主要风险阈值，继续观察集中度与回撤变化。")
     return "\n".join(lines)

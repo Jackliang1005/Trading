@@ -3,6 +3,7 @@ import sys
 
 from domain.services import reflection_runtime_service
 from domain.services import risk_report_service
+from domain.services.report_style_service import position_pnl_pct
 from position_pnl import resolve_position_pnl
 from qmt_client import QMTManager
 
@@ -49,6 +50,11 @@ def test_float_profit_remains_a_legacy_fallback_when_no_cost_or_cumulative_field
 
     assert evidence["pnl"] == -500
     assert evidence["basis"] == "float_profit_fallback"
+
+
+def test_position_pnl_percentage_preserves_cost_noise_precision():
+    assert position_pnl_pct(-0.0001) == "-0.01%"
+    assert position_pnl_pct(-0.30) == "-30.0%"
 
 
 def test_normalized_portfolio_position_preserves_cumulative_pnl_and_cost_ratio():
