@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict
 
 import db
 from data_collector import collect_daily_data
 from domain.services.assistant_service import dashboard as dashboard_service
-from domain.services.evolution_service import evolve, generate_system_prompt
+from domain.services.evolution_service import EVOLUTION_EVIDENCE_PROFILES, evolve, generate_system_prompt
 from domain.services.prediction_orchestrator import generate_predictions
 from domain.services.reflection_service import daily_reflection, monthly_audit, weekly_attribution
 from domain.services.intraday_outlook_service import build_intraday_outlook
@@ -34,12 +35,40 @@ def cron_daily_collect() -> Dict[str, Any]:
     return data
 
 
+def _profiled_predictions_for_day(day: str | None = None) -> int:
+    """Count only current evidence-chain rows persisted for one production day."""
+    target_day = day or date.today().isoformat()
+    count = 0
+    for row in db.get_predictions_in_range(target_day, target_day):
+        strategy = str(row.get("strategy_used") or "").strip()
+        profile = str(row.get("evidence_profile") or "").strip()
+        run_id = str(row.get("prediction_run_id") or "").strip()
+        if run_id and profile == EVOLUTION_EVIDENCE_PROFILES.get(strategy):
+            count += 1
+    return count
+
+
 def cron_daily_predict() -> Dict[str, Any]:
     """每日预测生成（09:30收盘竞价后执行）"""
     init_system()
     prediction_ids = generate_predictions()
     outlook = build_intraday_outlook("0930", save=True)
-    return {"prediction_ids": prediction_ids, "count": len(prediction_ids), "outlook": outlook, "text": outlook.get("text", "")}
+    profiled_count = _profiled_predictions_for_day()
+    if profiled_count <= 0:
+        if str(outlook.get("text") or "").strip():
+            print(outlook["text"])
+        raise RuntimeError(
+            "画像化预测生成门禁失败：当天没有带 prediction_run_id 和正确 evidence_profile 的记录；"
+            "09:30任务不得以成功状态掩盖进化样本链路故障"
+        )
+    return {
+        "prediction_ids": prediction_ids,
+        "count": len(prediction_ids),
+        "profiled_count": profiled_count,
+        "prediction_status": "profiled_evidence_persisted",
+        "outlook": outlook,
+        "text": outlook.get("text", ""),
+    }
 
 
 def cron_daily_reflect() -> Dict[str, Any]:

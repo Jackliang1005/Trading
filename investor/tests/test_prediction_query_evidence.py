@@ -50,6 +50,9 @@ def test_prediction_query_isolates_legacy_unscorable_and_pending_samples(monkeyp
 
     assert "2026-08-02 至 2026-08-08" in text
     assert "画像化成熟样本 0/20" in text
+    assert "当前尚无画像化样本入库" in text
+    assert "下一交易日 09:30" in text
+    assert "不再静默视为成功" in text
     assert "旧版或未画像化样本 6 条，方向正确 2 条" in text
     assert "仅作迁移审计，不代表升级后策略质量" in text
     assert "共处理 24 条：可评分 9 条（当前画像化 0、旧版或未画像化 9），隔离异常 15 条" in text

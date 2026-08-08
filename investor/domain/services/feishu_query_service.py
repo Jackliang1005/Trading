@@ -736,6 +736,12 @@ def _query_predictions(as_of: date | None = None) -> str:
     else:
         lines.append("- 尚未形成可归属到当前证据画像的成熟样本。")
     lines.append(f"- 成熟规则：{evolution.get('maturity_rule') or '样本走满验证窗口并通过价格锚点校验后才计入'}。")
+    profiled_pending = sum(int(item.get("pending", 0) or 0) for item in strategies)
+    if int(evolution.get("total", 0) or 0) == 0 and profiled_pending == 0:
+        lines.append(
+            "- 生产门禁：当前尚无画像化样本入库；下一交易日 09:30 任务结束后若仍为 0，"
+            "任务会报错并应通过 `/健康` 排查，不再静默视为成功。"
+        )
 
     lines.extend(["", "**近 7 日样本审计**"])
     if profiled:
