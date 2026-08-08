@@ -92,6 +92,7 @@ def test_risk_report_uses_cumulative_pnl_and_exposes_its_basis(monkeypatch):
 
     assert report["total_unrealized_pnl"] == -89543.53
     assert report["top_positions"][0]["pnl"] == -89543.53
+    assert report["top_positions"][0]["pnl_ratio"] == -0.3004
     assert report["top_positions"][0]["pnl_bases"] == ["position_profit"]
     assert "portfolio_unrealized_loss" in report["risk_flags"]
 

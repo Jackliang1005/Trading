@@ -242,6 +242,11 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
         f"前三持仓 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)} 预警，"
         f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}（{policy_identity}）。"
     )
+    lines.append(
+        f"- 亏损仓复核：权重达到 {pct(float(policy.get('loss_position_review_ratio', 0.18)) * 100)} 且累计回撤达到 "
+        f"{pct(float(policy.get('loss_review_drawdown_ratio', 0.05)) * 100)}，或累计回撤直接达到严重阈值 "
+        f"{pct(float(policy.get('severe_loss_drawdown_ratio', 0.20)) * 100)}；不会因数元浮亏触发减仓。"
+    )
 
     lines.extend(["", "**账户与组合风险**"])
     if risk.get("available"):

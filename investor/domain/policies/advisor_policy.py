@@ -22,6 +22,8 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "single_position_reduce_target_ratio": 0.25,
     "loss_position_review_ratio": 0.18,
     "loss_position_reduce_target_ratio": 0.15,
+    "loss_review_drawdown_ratio": 0.05,
+    "severe_loss_drawdown_ratio": 0.20,
     "top3_position_alert_ratio": 0.70,
     "minimum_cash_ratio": 0.03,
 }
@@ -34,6 +36,8 @@ ADVISOR_PROFILES: Dict[str, Dict[str, Any]] = {
         "single_position_reduce_target_ratio": 0.20,
         "loss_position_review_ratio": 0.12,
         "loss_position_reduce_target_ratio": 0.10,
+        "loss_review_drawdown_ratio": 0.03,
+        "severe_loss_drawdown_ratio": 0.15,
         "top3_position_alert_ratio": 0.60,
         "minimum_cash_ratio": 0.10,
     },
@@ -44,6 +48,8 @@ ADVISOR_PROFILES: Dict[str, Dict[str, Any]] = {
         "single_position_reduce_target_ratio": 0.25,
         "loss_position_review_ratio": 0.18,
         "loss_position_reduce_target_ratio": 0.15,
+        "loss_review_drawdown_ratio": 0.05,
+        "severe_loss_drawdown_ratio": 0.20,
         "top3_position_alert_ratio": 0.70,
         "minimum_cash_ratio": 0.05,
     },
@@ -54,6 +60,8 @@ ADVISOR_PROFILES: Dict[str, Dict[str, Any]] = {
         "single_position_reduce_target_ratio": 0.35,
         "loss_position_review_ratio": 0.25,
         "loss_position_reduce_target_ratio": 0.20,
+        "loss_review_drawdown_ratio": 0.08,
+        "severe_loss_drawdown_ratio": 0.25,
         "top3_position_alert_ratio": 0.80,
         "minimum_cash_ratio": 0.02,
     },
@@ -87,6 +95,8 @@ def load_advisor_policy(path: Path | None = None) -> Dict[str, Any]:
         "single_position_reduce_target_ratio",
         "loss_position_review_ratio",
         "loss_position_reduce_target_ratio",
+        "loss_review_drawdown_ratio",
+        "severe_loss_drawdown_ratio",
         "top3_position_alert_ratio",
         "minimum_cash_ratio",
     ):
@@ -100,6 +110,10 @@ def load_advisor_policy(path: Path | None = None) -> Dict[str, Any]:
         policy["loss_position_reduce_target_ratio"],
         policy["loss_position_review_ratio"],
     )
+    policy["severe_loss_drawdown_ratio"] = max(
+        policy["severe_loss_drawdown_ratio"],
+        policy["loss_review_drawdown_ratio"],
+    )
     if policy.get("profile_status") not in {"system_default", "user_confirmed"}:
         policy["profile_status"] = "system_default"
     if policy.get("profile_name") not in ADVISOR_PROFILES:
@@ -107,6 +121,48 @@ def load_advisor_policy(path: Path | None = None) -> Dict[str, Any]:
     policy["path"] = str(target)
     policy["loaded"] = bool(payload)
     return policy
+
+
+def loss_review_evidence(position: Dict[str, Any], policy: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Require both meaningful drawdown evidence and portfolio-risk relevance."""
+    active = policy or load_advisor_policy()
+    try:
+        weight = max(0.0, float(position.get("weight") or 0))
+        pnl = float(position.get("pnl") or 0)
+    except (TypeError, ValueError):
+        weight, pnl = 0.0, 0.0
+    raw_ratio = position.get("pnl_ratio")
+    try:
+        pnl_ratio = float(raw_ratio) if raw_ratio is not None else None
+    except (TypeError, ValueError):
+        pnl_ratio = None
+    if pnl_ratio is None:
+        try:
+            market_value = float(position.get("market_value") or 0)
+        except (TypeError, ValueError):
+            market_value = 0.0
+        inferred_cost = market_value - pnl
+        pnl_ratio = pnl / inferred_cost if market_value > 0 and inferred_cost > 0 else None
+
+    review_drawdown = float(active["loss_review_drawdown_ratio"])
+    severe_drawdown = float(active["severe_loss_drawdown_ratio"])
+    drawdown = abs(min(0.0, pnl_ratio)) if pnl_ratio is not None else None
+    severe = bool(drawdown is not None and drawdown >= severe_drawdown)
+    material_weighted = bool(
+        drawdown is not None
+        and drawdown >= review_drawdown
+        and weight >= float(active["loss_position_review_ratio"])
+    )
+    required = bool(pnl < 0 and (severe or material_weighted))
+    return {
+        "required": required,
+        "severity": "severe" if severe else "material" if material_weighted else "noise" if drawdown is not None else "unavailable",
+        "pnl_ratio": pnl_ratio,
+        "drawdown_ratio": drawdown,
+        "review_drawdown_ratio": review_drawdown,
+        "severe_drawdown_ratio": severe_drawdown,
+        "weight_review_ratio": float(active["loss_position_review_ratio"]),
+    }
 
 
 def confirm_advisor_profile(

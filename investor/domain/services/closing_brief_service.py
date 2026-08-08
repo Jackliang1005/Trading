@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import db
-from domain.policies.advisor_policy import load_advisor_policy
+from domain.policies.advisor_policy import load_advisor_policy, loss_review_evidence
 from domain.services.risk_report_service import build_risk_report
 from domain.services.global_impact_service import build_global_impact_brief
 from domain.services.longterm_portfolio_service import build_longterm_snapshot_text, load_longterm_snapshot, longterm_plan_status, summarize_longterm_snapshot
@@ -245,10 +245,9 @@ def _position_theme_hint(position: Dict[str, Any], themes: List[str]) -> str:
 
 def _closing_action_level(position: Dict[str, Any], policy: Dict[str, Any]) -> str:
     weight = float(position.get("weight") or 0)
-    pnl = float(position.get("pnl") or 0)
     if weight >= float(policy["single_position_prepare_ratio"]):
         return "verify"
-    if weight >= float(policy["loss_position_review_ratio"]) and pnl < 0:
+    if loss_review_evidence(position, policy)["required"]:
         return "verify"
     return "observe"
 
@@ -262,6 +261,7 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
         item = dict(p)
         weight = float(item.get("weight") or 0)
         pnl = float(item.get("pnl") or 0)
+        loss_evidence = loss_review_evidence(item, policy)
         sources = list(item.get("sources") or ([item.get("source")] if item.get("source") else []))
         level = _closing_action_level(item, policy)
         target_weight = None
@@ -316,9 +316,12 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
                     "不加仓；若下一交易日开盘 30 分钟弱于所属板块或继续放量下跌，"
                     f"{quantity_text}目标是把单票权重压回 {target_weight:.0%} 以下。"
                 )
-        elif weight >= float(policy["loss_position_review_ratio"]) and pnl < 0:
+        elif loss_evidence["required"]:
             target_weight = float(policy["loss_position_reduce_target_ratio"])
-            advice = "不补亏损仓；只在放量站回板块强势队列后保留，反弹无量则减仓修复组合弹性。"
+            drawdown = loss_evidence.get("drawdown_ratio")
+            drawdown_text = f"{float(drawdown) * 100:.1f}%" if drawdown is not None else "待核验"
+            severity = "严重回撤" if loss_evidence.get("severity") == "severe" else "亏损仓复核"
+            advice = f"不补亏损仓；累计回撤 {drawdown_text} 已进入{severity}门槛，只在放量站回板块强势队列后保留，反弹无量则减仓修复组合弹性。"
         elif str(item.get("source") or "") == "trade":
             advice = "按交易仓处理；高开不追，低开无承接先降风险，强于板块才继续观察。"
         elif pnl < 0:
@@ -339,6 +342,7 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
                 "target_reachable": target_reachable,
                 "estimated_notional": estimated_notional,
                 "transaction_cost_estimated": False,
+                "loss_review": loss_evidence,
                 "theme_hint": _position_theme_hint(item, themes),
                 "advice": advice,
             }
@@ -359,10 +363,12 @@ def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any], policy
         name = _cn(p.get("name"), code)
         weight = float(p.get("weight") or 0)
         pnl = float(p.get("pnl") or 0)
+        pnl_ratio = p.get("pnl_ratio")
+        pnl_ratio_text = "收益率待核验" if pnl_ratio is None else f"收益率 {float(pnl_ratio) * 100:+.1f}%"
         source_names = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
         level_name = {"observe": "观察", "verify": "核验"}.get(str(p.get("action_level") or "observe"), "观察")
         lines.extend([
-            f"- **{name}（{code}）**｜行动 {level_name}｜仓位 {weight*100:.1f}%｜盈亏 {pnl:+,.0f}｜{source_names}",
+            f"- **{name}（{code}）**｜行动 {level_name}｜仓位 {weight*100:.1f}%｜盈亏 {pnl:+,.0f}｜{pnl_ratio_text}｜{source_names}",
             f"  建议：{p.get('advice')}",
         ])
     return lines

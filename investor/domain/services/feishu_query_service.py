@@ -866,8 +866,10 @@ def _query_advisor_profile(query: str) -> str:
         f"- 单票预警 / 准备 / 降风险目标：{float(policy.get('single_position_alert_ratio', 0))*100:.0f}% / "
         f"{float(policy.get('single_position_prepare_ratio', 0))*100:.0f}% / "
         f"{float(policy.get('single_position_reduce_target_ratio', 0))*100:.0f}%",
-        f"- 浮亏复核 / 降风险目标：{float(policy.get('loss_position_review_ratio', 0))*100:.0f}% / "
+        f"- 亏损仓权重复核 / 降风险目标：{float(policy.get('loss_position_review_ratio', 0))*100:.0f}% / "
         f"{float(policy.get('loss_position_reduce_target_ratio', 0))*100:.0f}%",
+        f"- 累计回撤触发：普通 {float(policy.get('loss_review_drawdown_ratio', 0.05))*100:.0f}% / "
+        f"严重 {float(policy.get('severe_loss_drawdown_ratio', 0.20))*100:.0f}%（严重回撤不受仓位下限限制）",
         f"- 前三持仓预警：{float(policy.get('top3_position_alert_ratio', 0))*100:.0f}%｜最低现金参考："
         f"{float(policy.get('minimum_cash_ratio', 0))*100:.0f}%",
     ]

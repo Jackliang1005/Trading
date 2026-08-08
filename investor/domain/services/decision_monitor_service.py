@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from domain.services.risk_report_service import build_risk_report
-from domain.policies.advisor_policy import load_advisor_policy
+from domain.policies.advisor_policy import load_advisor_policy, loss_review_evidence
 from live_monitor.collectors.qmt_auth import build_qmt_auth_headers
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -286,7 +286,9 @@ def _action_for_position(
 ) -> Tuple[str, str]:
     active_policy = policy or load_advisor_policy()
     weight = _safe_float(position.get("weight"))
-    pnl = _safe_float(position.get("pnl"))
+    loss_evidence = loss_review_evidence(position, active_policy)
+    loss_ratio = loss_evidence.get("pnl_ratio")
+    loss_label = f"{abs(float(loss_ratio)) * 100:.1f}%" if loss_ratio is not None else "待核验"
     source = str(position.get("source") or "")
     if not trading_session:
         action = "非交易时段：保留复盘计划，开盘后再按实时行情确认，不执行盘外价格判断。"
@@ -301,8 +303,8 @@ def _action_for_position(
         if weight >= float(active_policy["single_position_prepare_ratio"]):
             action = "交易建议: 减仓候选。已取得实时持仓价，但读口未提供日内涨跌；高集中度仓位按 09:35/10:30 的复盘纪律优先降风险。"
             state = "reduce_candidate_no_intraday_change"
-        elif weight >= float(active_policy["loss_position_review_ratio"]) and pnl < 0:
-            action = "交易建议: 不补仓。实时价格已核验，但缺少日内涨跌证据；反弹无量仍以减仓修复组合为先。"
+        elif loss_evidence["required"]:
+            action = f"交易建议: 不补仓。累计回撤 {loss_label} 已达到复核门槛，但缺少日内涨跌证据；反弹无量仍以减仓修复组合为先。"
             state = "hold_or_reduce_no_intraday_change"
         else:
             action = "交易建议: 实时价格已核验，暂不触发价格阈值；等待下一次盘中复核。"
@@ -322,8 +324,8 @@ def _action_for_position(
         elif change_pct >= 3:
             action = "交易建议: 不追涨。等待回踩承接或量价继续确认，已有仓位可分批锁定部分浮盈。"
             state = "no_chasing"
-        elif weight >= float(active_policy["loss_position_review_ratio"]) and pnl < 0:
-            action = "交易建议: 不补仓。只有价格转强且承接稳定时才保留，反弹无量仍以减仓修复组合为先。"
+        elif loss_evidence["required"]:
+            action = f"交易建议: 不补仓。累计回撤 {loss_label} 已达到复核门槛；只有价格转强且承接稳定时才保留，反弹无量仍以减仓修复组合为先。"
             state = "hold_or_reduce"
         elif source == "trade":
             action = "交易建议: 按交易仓处理。高开不追；跌破昨收且无承接时优先降低风险。"
@@ -522,6 +524,8 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
                 "available_volume": int(_safe_float(current.get("available_volume", 0))),
                 "available_volume_complete": bool(current.get("available_volume_complete")),
                 "pnl": _safe_float(current.get("pnl", planned.get("pnl"))),
+                "pnl_ratio": current.get("pnl_ratio", planned.get("pnl_ratio")),
+                "loss_review": loss_review_evidence(current, policy=policy),
                 "status": "current" if current_confirmed else "from_plan_unconfirmed",
                 "quote": quote,
                 "benchmark_code": benchmark_code,

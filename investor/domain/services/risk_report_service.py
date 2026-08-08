@@ -198,6 +198,7 @@ def _aggregate_security_exposures(
                 "available_volume": 0,
                 "available_volume_complete": True,
                 "market_value": 0.0,
+                "cost_value": 0.0,
                 "pnl": 0.0,
                 "pnl_bases": [],
                 "pnl_conflict": False,
@@ -217,6 +218,8 @@ def _aggregate_security_exposures(
         exposure["market_value"] += _market_value(item)
         pnl_evidence = resolve_position_pnl(item)
         exposure["pnl"] += float(pnl_evidence["pnl"])
+        if pnl_evidence.get("cost_value") is not None:
+            exposure["cost_value"] += float(pnl_evidence["cost_value"])
         if pnl_evidence["basis"] not in exposure["pnl_bases"]:
             exposure["pnl_bases"].append(pnl_evidence["basis"])
         exposure["pnl_conflict"] = bool(exposure["pnl_conflict"] or pnl_evidence["cumulative_cost_conflict"])
@@ -235,6 +238,9 @@ def _aggregate_security_exposures(
                 "pnl_conflict": pnl_evidence["cumulative_cost_conflict"],
             }
         )
+    for exposure in grouped.values():
+        cost_value = float(exposure.get("cost_value") or 0)
+        exposure["pnl_ratio"] = (float(exposure.get("pnl") or 0) / cost_value) if cost_value > 0 else None
     return list(grouped.values())
 
 
@@ -438,8 +444,10 @@ def build_risk_report() -> Dict[str, Any]:
             "stale_sources": list(p.get("stale_sources") or []),
             "account_positions": list(p.get("account_positions") or []),
             "market_value": round(float(p.get("market_value") or 0), 2),
+            "cost_value": round(float(p.get("cost_value") or 0), 2),
             "weight": round((float(p.get("market_value") or 0) / effective_total) if effective_total else 0.0, 4),
             "pnl": round(float(p.get("pnl") or 0), 2),
+            "pnl_ratio": round(float(p.get("pnl_ratio")), 4) if p.get("pnl_ratio") is not None else None,
             "pnl_bases": list(p.get("pnl_bases") or []),
             "pnl_conflict": bool(p.get("pnl_conflict")),
         }
@@ -515,6 +523,11 @@ def format_risk_report(report: Dict[str, Any]) -> str:
         f"- 风险政策：单票预警 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)}，"
         f"前三持仓预警 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)}。"
     )
+    lines.append(
+        f"- 亏损仓复核需同时满足权重 {pct(float(policy.get('loss_position_review_ratio', 0.18)) * 100)} 和累计回撤 "
+        f"{pct(float(policy.get('loss_review_drawdown_ratio', 0.05)) * 100)}；累计回撤达到 "
+        f"{pct(float(policy.get('severe_loss_drawdown_ratio', 0.20)) * 100)} 时不受仓位下限限制。"
+    )
     if not report.get("position_coverage_complete", True):
         lines.append(
             f"- 持仓明细覆盖不完整：账户资产口径市值比明细合计多 {money(report.get('position_market_value_gap'))}；"
@@ -545,7 +558,8 @@ def format_risk_report(report: Dict[str, Any]) -> str:
     lines.extend(["", "**重点持仓**"])
     for p in report.get("top_positions", [])[:8]:
         sources = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
-        lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{sources}")
+        pnl_ratio = "收益率待核验" if p.get("pnl_ratio") is None else f"收益率 {pct(float(p['pnl_ratio']) * 100, signed=True)}"
+        lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{pnl_ratio}｜{sources}")
     lines.extend(["", "**执行原则**"])
     if report.get("top1_ratio", 0) >= float(policy.get("single_position_alert_ratio", 0.30)):
         lines.append("- 优先降低单票集中度；弱于所属板块且无放量承接时，不用补仓摊低成本。")
