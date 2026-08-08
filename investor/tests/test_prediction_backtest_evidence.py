@@ -156,3 +156,89 @@ def test_unscorable_prediction_is_excluded_from_strategy_metrics(monkeypatch, tm
     assert db.get_unchecked_predictions() == []
     assert db.get_strategy_performance("2020-01-01", "2030-01-01") == []
     assert db.get_overall_stats("2020-01-01", "2030-01-01")["total"] == 0
+
+
+def test_validation_activity_includes_earlier_runs_and_separates_unscorable(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "investor.db"))
+    db.init_db()
+    evaluated_id = db.add_prediction(
+        target="sh000001",
+        direction="up",
+        confidence=0.5,
+        reasoning="valid",
+        strategy_used="technical",
+        model_used="test",
+        actual_price=100,
+    )
+    profiled_id = db.add_prediction(
+        target="sh000001",
+        direction="down",
+        confidence=0.5,
+        reasoning="current evidence chain",
+        strategy_used="technical",
+        model_used="test",
+        actual_price=100,
+        evidence_profile="technical_price_regime_v1",
+        prediction_run_id="run-current",
+    )
+    unscorable_id = db.add_prediction(
+        target="sz399001",
+        direction="up",
+        confidence=0.5,
+        reasoning="bad anchor",
+        strategy_used="technical",
+        model_used="test",
+        actual_price=1,
+    )
+    db.add_prediction(
+        target="sz399006",
+        direction="neutral",
+        confidence=0.5,
+        reasoning="pending",
+        strategy_used="technical",
+        model_used="test",
+        actual_price=100,
+    )
+    db.update_prediction_result(evaluated_id, 101, 1.0, True, 80, "valid")
+    db.update_prediction_result(profiled_id, 101, 1.0, False, 20, "wrong")
+    db.mark_prediction_unscorable(unscorable_id, "anchor mismatch")
+
+    activity = db.get_prediction_validation_activity(dt.date.today().isoformat())
+
+    assert activity["activity_processed"] == 3
+    assert activity["activity_evaluated"] == 2
+    assert activity["activity_correct"] == 1
+    assert activity["activity_win_rate"] == 50.0
+    assert activity["activity_profiled_evaluated"] == 1
+    assert activity["activity_profiled_correct"] == 0
+    assert activity["activity_profiled_win_rate"] == 0.0
+    assert activity["activity_legacy_evaluated"] == 1
+    assert activity["activity_unscorable"] == 1
+    assert activity["pending"] == 1
+
+
+def test_reflection_uses_generation_day_validation_activity_not_only_latest_run():
+    text = runtime.format_reflection_push_text(
+        {},
+        "",
+        {
+            "checked": 0,
+            "activity_evaluated": 3,
+            "activity_correct": 2,
+            "activity_win_rate": 66.6667,
+            "activity_profiled_evaluated": 0,
+            "activity_legacy_evaluated": 3,
+            "activity_unscorable": 4,
+            "pending": 2,
+        },
+        "2026-08-08 20:30:00",
+        "2026-08-08",
+    )
+
+    assert "\u751f\u6210\u65e5\u7d2f\u8ba1\u9a8c\u8bc1 3 \u6761" in text
+    assert "\u6b63\u786e 2 \u6761" in text
+    assert "66.7%" in text
+    assert "\u4e0a\u8ff0 3 \u6761\u5747\u4e3a\u65e7\u7248\u6216\u672a\u753b\u50cf\u5316\u6837\u672c" in text
+    assert "\u4e0d\u4ee3\u8868\u5347\u7ea7\u540e\u7b56\u7565\u8d28\u91cf" in text
+    assert "4 \u6761\u56e0\u4ef7\u683c\u951a\u70b9\u6216\u884c\u60c5\u8bc1\u636e\u4e0d\u4e00\u81f4\u800c\u4e0d\u53ef\u8bc4\u5206" in text
+    assert "2 \u6761\u5c1a\u672a\u8d70\u6ee1\u9a8c\u8bc1\u7a97\u53e3" in text

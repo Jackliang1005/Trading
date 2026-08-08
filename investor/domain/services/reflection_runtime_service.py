@@ -807,12 +807,33 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
 
     attribution_lines = [line for line in str(decision_attribution or "").splitlines() if line.strip() and not line.startswith("##")]
     lines.extend(["", "**建议闭环**", *(attribution_lines or ["- 当日没有可用的盘中建议快照。"])])
-    checked = int(backtest_result.get("checked", 0) or 0)
+    checked = int(backtest_result.get("activity_evaluated", backtest_result.get("checked", 0)) or 0)
+    correct = int(backtest_result.get("activity_correct", backtest_result.get("correct", 0)) or 0)
+    win_rate = backtest_result.get("activity_win_rate", backtest_result.get("win_rate"))
+    profiled_evaluated = int(backtest_result.get("activity_profiled_evaluated", 0) or 0)
+    profiled_correct = int(backtest_result.get("activity_profiled_correct", 0) or 0)
+    profiled_win_rate = backtest_result.get("activity_profiled_win_rate")
+    legacy_evaluated = int(backtest_result.get("activity_legacy_evaluated", 0) or 0)
+    unscorable = int(backtest_result.get("activity_unscorable", backtest_result.get("unscorable", 0)) or 0)
+    pending = int(backtest_result.get("pending", backtest_result.get("deferred", 0)) or 0)
     lines.extend(["", "**预测复盘**"])
     if checked:
-        lines.append(f"- 已验证 {checked} 条，正确 {int(backtest_result.get('correct', 0) or 0)} 条，胜率 {float(backtest_result.get('win_rate', 0) or 0):.1f}%。")
+        lines.append(f"- 生成日累计验证 {checked} 条，正确 {correct} 条，胜率 {float(win_rate or 0):.1f}%。")
     else:
         lines.append("- 今日没有完成验证的预测样本，不输出胜率结论。")
+    if profiled_evaluated:
+        lines.append(
+            f"- 当前证据链样本 {profiled_evaluated} 条，正确 {profiled_correct} 条，"
+            f"胜率 {float(profiled_win_rate or 0):.1f}%；仅此口径用于评价升级后策略。"
+        )
+    elif legacy_evaluated:
+        lines.append(f"- 上述 {legacy_evaluated} 条均为旧版或未画像化样本，仅作迁移审计，不代表升级后策略质量。")
+    elif checked:
+        lines.append("- 当前证据链样本数尚未达到可评价门槛，不比较升级后策略优劣。")
+    if unscorable:
+        lines.append(f"- 另有 {unscorable} 条因价格锚点或行情证据不一致而不可评分，已隔离，不计入胜率。")
+    if pending:
+        lines.append(f"- 仍有 {pending} 条尚未走满验证窗口或等待行情，继续保留为待验证样本。")
     lines.extend(
         [
             "",
@@ -829,7 +850,7 @@ def _build_prediction_breakdown_table(backtest_result: Dict) -> str:
     import db as db_mod
 
     bt = backtest_result or {}
-    if not bt.get("checked"):
+    if not (bt.get("activity_evaluated") or bt.get("checked")):
         return ""
 
     end_date = datetime.now().strftime("%Y-%m-%d")
@@ -944,6 +965,9 @@ def daily_reflection() -> Dict:
     )
 
     bt_result = backtest_predictions(target_date=data_as_of)
+    validation_activity = db.get_prediction_validation_activity(datetime.now().strftime("%Y-%m-%d"))
+    bt_result.update(validation_activity)
+    trading_summary["prediction_validation"] = dict(bt_result)
     prediction_breakdown = _build_prediction_breakdown_table(bt_result)
     full_report = {
         "timestamp": datetime.now().isoformat(),
@@ -975,9 +999,18 @@ def daily_reflection() -> Dict:
         decision_attribution,
         "",
         "## 预测回测结果",
-        f"- 已检查: {bt_result.get('checked', 0)} 条",
-        f"- 正确: {bt_result.get('correct', 0)} 条",
-        f"- 胜率: {bt_result.get('win_rate', 0):.1f}%",
+        f"- 本轮新验证: {bt_result.get('checked', 0)} 条",
+        f"- 生成日累计可评分: {bt_result.get('activity_evaluated', 0)} 条",
+        f"- 生成日累计正确: {bt_result.get('activity_correct', 0)} 条",
+        (
+            f"- 生成日胜率: {float(bt_result.get('activity_win_rate')):.1f}%"
+            if bt_result.get("activity_win_rate") is not None
+            else "- 生成日胜率: 无可评分样本，不输出"
+        ),
+        f"- 当前证据链可评分: {bt_result.get('activity_profiled_evaluated', 0)} 条",
+        f"- 旧版/未画像化可评分: {bt_result.get('activity_legacy_evaluated', 0)} 条",
+        f"- 不可评分: {bt_result.get('activity_unscorable', 0)} 条（不计入胜率）",
+        f"- 待验证: {bt_result.get('pending', 0)} 条",
     ]
     if prediction_breakdown:
         md_lines.append("")

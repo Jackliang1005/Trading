@@ -625,7 +625,7 @@ def _query_reflection() -> str:
     return format_reflection_push_text(
         summary,
         _decision_monitor_attribution(summary),
-        {},
+        summary.get("prediction_validation") or {},
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         as_of,
     )

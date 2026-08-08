@@ -495,6 +495,56 @@ def get_checked_predictions_in_range(start: str, end: str) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def get_prediction_validation_activity(activity_date: str) -> Dict:
+    """Summarize all validation work persisted on one generation day."""
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT COUNT(*) AS processed,
+                  SUM(CASE WHEN is_correct IS NOT NULL THEN 1 ELSE 0 END) AS evaluated,
+                  SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END) AS correct,
+                  SUM(CASE WHEN is_correct IS NOT NULL
+                            AND COALESCE(prediction_run_id, '') != ''
+                            AND evidence_profile IN ('technical_price_regime_v1', 'sentiment_flow_news_v1')
+                           THEN 1 ELSE 0 END) AS profiled_evaluated,
+                  SUM(CASE WHEN is_correct=1
+                            AND COALESCE(prediction_run_id, '') != ''
+                            AND evidence_profile IN ('technical_price_regime_v1', 'sentiment_flow_news_v1')
+                           THEN 1 ELSE 0 END) AS profiled_correct,
+                  SUM(CASE WHEN is_correct IS NULL THEN 1 ELSE 0 END) AS unscorable
+           FROM prediction_log
+           WHERE checked_at IS NOT NULL
+             AND date(checked_at)=date(?)""",
+        (activity_date,),
+    ).fetchone()
+    pending_row = conn.execute(
+        """SELECT COUNT(*) AS pending
+           FROM prediction_log
+           WHERE checked_at IS NULL
+             AND date(created_at) <= date(?)""",
+        (activity_date,),
+    ).fetchone()
+    conn.close()
+    evaluated = int((row["evaluated"] if row else 0) or 0)
+    correct = int((row["correct"] if row else 0) or 0)
+    profiled_evaluated = int((row["profiled_evaluated"] if row else 0) or 0)
+    profiled_correct = int((row["profiled_correct"] if row else 0) or 0)
+    return {
+        "activity_date": activity_date,
+        "activity_processed": int((row["processed"] if row else 0) or 0),
+        "activity_evaluated": evaluated,
+        "activity_correct": correct,
+        "activity_win_rate": (correct / evaluated * 100) if evaluated else None,
+        "activity_profiled_evaluated": profiled_evaluated,
+        "activity_profiled_correct": profiled_correct,
+        "activity_profiled_win_rate": (
+            profiled_correct / profiled_evaluated * 100 if profiled_evaluated else None
+        ),
+        "activity_legacy_evaluated": max(0, evaluated - profiled_evaluated),
+        "activity_unscorable": int((row["unscorable"] if row else 0) or 0),
+        "pending": int((pending_row["pending"] if pending_row else 0) or 0),
+    }
+
+
 # ──────────────── 策略操作 ────────────────
 
 def get_strategies(enabled_only: bool = True) -> List[Dict]:
