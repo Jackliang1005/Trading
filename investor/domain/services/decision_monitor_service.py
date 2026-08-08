@@ -206,7 +206,7 @@ def _fetch_realtime_quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]],
     return {}, "qmt_position_quote_unavailable" + (f" ({', '.join(errors)})" if errors else "")
 
 
-def _fetch_live_cash() -> Tuple[float | None, str]:
+def _fetch_live_cash() -> Tuple[float | None, bool, str]:
     """Aggregate available cash from both QMT accounts for intraday sizing."""
     base_urls = [
         os.getenv("QMT2HTTP_MAIN_URL", "").strip() or os.getenv("QMT2HTTP_BASE_URL", "").strip() or "http://39.105.48.176:8085",
@@ -215,7 +215,8 @@ def _fetch_live_cash() -> Tuple[float | None, str]:
     total = 0.0
     found = 0
     errors: List[str] = []
-    for base_url in list(dict.fromkeys(base_urls)):
+    unique_urls = list(dict.fromkeys(base_urls))
+    for base_url in unique_urls:
         try:
             req = urllib.request.Request(
                 f"{base_url.rstrip('/')}/api/stock/asset",
@@ -227,18 +228,26 @@ def _fetch_live_cash() -> Tuple[float | None, str]:
             data = payload.get("data") if isinstance(payload, dict) else {}
             if not isinstance(data, dict):
                 continue
-            total += _safe_float(data.get("cash", data.get("m_dCash", data.get("available", 0))))
+            cash = _safe_float(data.get("cash", data.get("m_dCash", data.get("available", 0))))
+            if cash < 0 or cash >= 10_000_000_000:
+                errors.append("invalid_cash_value")
+                continue
+            total += cash
             found += 1
         except Exception as exc:
             errors.append(type(exc).__name__)
     if found:
-        return round(total, 2), ""
-    return None, "qmt_asset_cash_unavailable" + (f" ({', '.join(errors)})" if errors else "")
+        complete = found == len(unique_urls)
+        error = "" if complete else f"partial_account_cash {found}/{len(unique_urls)}"
+        if errors:
+            error += ("; " if error else "") + ", ".join(errors)
+        return round(total, 2), complete, error
+    return None, False, "qmt_asset_cash_unavailable" + (f" ({', '.join(errors)})" if errors else "")
 
 
 def _action_for_position(
     position: Dict[str, Any],
-    cash_ratio: float,
+    cash_ratio: float | None,
     quote: Dict[str, Any],
     benchmark: Dict[str, Any],
     trading_session: bool,
@@ -287,7 +296,7 @@ def _action_for_position(
         else:
             action = "交易建议: 继续观察。价格未触发风险阈值，等待走势与市场方向进一步确认。"
             state = "observe"
-    if cash_ratio < 0.03:
+    if cash_ratio is not None and cash_ratio < 0.03:
         action += " 当前现金不足，新机会只能通过减仓腾挪资金。"
     return state, action
 
@@ -331,12 +340,19 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
     current_positions = _current_position_map(risk if risk.get("available") else {})
     trading_session = _is_trading_session(now)
     if trading_session:
-        live_cash, cash_error = _fetch_live_cash()
+        live_cash, live_cash_complete, cash_error = _fetch_live_cash()
     else:
-        live_cash, cash_error = None, "非交易时段未请求实时现金"
+        live_cash, live_cash_complete, cash_error = None, False, "非交易时段未请求实时现金"
     cash = _safe_float(risk.get("cash", 0)) if live_cash is None else live_cash
     total_market_value = _safe_float(risk.get("total_market_value", 0))
-    cash_ratio = cash / (total_market_value + cash) if total_market_value + cash > 0 else _safe_float(risk.get("cash_ratio", decision_plan.get("cash_ratio", 0)))
+    risk_cash_complete = bool(risk.get("cash_complete", bool(risk.get("available")) and "cash_complete" not in risk))
+    cash_complete = live_cash_complete if live_cash is not None else risk_cash_complete
+    if cash_complete:
+        cash_ratio = cash / (total_market_value + cash) if total_market_value + cash > 0 else _safe_float(
+            risk.get("cash_ratio", decision_plan.get("cash_ratio", 0))
+        )
+    else:
+        cash_ratio = None
     plan_positions = decision_plan.get("positions") or []
     tracked_seed = [item for item in plan_positions if _position_key(item)]
     quote_codes = [_position_key(item) for item in tracked_seed] + list(BENCHMARK_CODES)
@@ -410,6 +426,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         "risk_as_of": risk.get("as_of", ""),
         "cash_ratio": cash_ratio,
         "cash": cash,
+        "cash_complete": cash_complete,
         "cash_source": "qmt_dual_account" if live_cash is not None else "portfolio_snapshot",
         "cash_error": cash_error,
         "top1_ratio": _safe_float(risk.get("top1_ratio", decision_plan.get("top1_ratio", 0))),
@@ -446,11 +463,17 @@ def _format_decision_monitor_text_legacy(slot: str = "", max_opportunities: int 
         return f"复盘闭环交易建议: 不可用 ({monitor.get('closing_error') or 'no closing plan'})"
     slot_text = str(slot or "盘中").strip()
     quote_state = "盘中实时行情" if monitor.get("trading_session") else "非交易时段（仅复盘计划）"
+    cash_ratio = monitor.get("cash_ratio")
+    cash_text = (
+        f"现金={monitor.get('cash', 0):,.2f} ({float(cash_ratio) * 100:.1f}%, {monitor.get('cash_source')})"
+        if monitor.get("cash_complete") and cash_ratio is not None
+        else f"可验证现金={monitor.get('cash', 0):,.2f} (部分账户现金不可验证, {monitor.get('cash_source')})"
+    )
     lines = [
         f"复盘闭环交易建议 [{slot_text}]",
         (
             f"计划日期={monitor.get('plan_date') or 'unknown'} 风险快照={monitor.get('risk_as_of') or 'unknown'} "
-            f"现金={monitor.get('cash', 0):,.2f} ({monitor.get('cash_ratio', 0) * 100:.1f}%, {monitor.get('cash_source')}) "
+            f"{cash_text} "
             f"top1={monitor.get('top1_ratio', 0) * 100:.1f}% "
             f"top3={monitor.get('top3_ratio', 0) * 100:.1f}%"
         ),
@@ -537,9 +560,13 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
     else:
         wait_text = "等待交易时段再核验" if not monitor.get("trading_session") else "继续按盘前纪律观察"
         lines.append(f"- 当前没有持仓触发可执行数量；{wait_text}，不自动下单。")
+    if monitor.get("cash_complete") and monitor.get("cash_ratio") is not None:
+        cash_summary = f"现金 {money(monitor.get('cash'))}（{pct(float(monitor.get('cash_ratio')) * 100)}）"
+    else:
+        cash_summary = f"可验证现金 {money(monitor.get('cash'))}（部分账户不可验证，不计算完整现金占比）"
     lines.append(
-        f"- 现金 {money(monitor.get('cash'))}（{pct(monitor.get('cash_ratio', 0) * 100)}）；"
-        f"第一大持仓 {pct(monitor.get('top1_ratio', 0) * 100)}，前三大持仓 {pct(monitor.get('top3_ratio', 0) * 100)}。"
+        f"- {cash_summary}；第一大持仓 {pct(monitor.get('top1_ratio', 0) * 100)}，"
+        f"前三大持仓 {pct(monitor.get('top3_ratio', 0) * 100)}。"
     )
     flags = [risk_label(item) for item in monitor.get("risk_flags") or []]
     if flags:
@@ -577,7 +604,9 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
         lines.append("- 实时行情链路降级；缺失行情的标的不生成价格触发结论。")
     else:
         lines.append(f"- 已取得 {monitor.get('quote_available_count', 0)} 条实时行情，建议仍需结合成交量确认。")
-    if monitor.get("cash_error"):
+    if not monitor.get("cash_complete"):
+        lines.append("- 部分账户现金不可验证；不据此判断资金是否充足，也不触发“现金不足”的交易建议。")
+    elif monitor.get("cash_error"):
         if monitor.get("trading_session"):
             lines.append("- 实时现金读取失败，现金比例退回组合快照口径。")
         else:
