@@ -18,7 +18,7 @@ from data_collector import (
     fetch_qmt_trading_summary,
 )
 from domain.policies.scoring_policy import calculate_prediction_score
-from domain.services.position_pnl_service import resolve_position_pnl
+from position_pnl import resolve_position_pnl
 
 # 评分阈值
 NEUTRAL_THRESHOLD = 0.3

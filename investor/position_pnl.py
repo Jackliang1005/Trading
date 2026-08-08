@@ -18,12 +18,7 @@ def _number(item: Dict[str, Any], keys: Iterable[str]) -> Tuple[float | None, st
 
 
 def resolve_position_pnl(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Return cumulative unrealized P&L, its basis, and consistency evidence.
-
-    QMT payloads can contain both ``position_profit`` (cumulative position
-    profit) and ``float_profit`` (which some gateways expose as a daily
-    floating value). They are not interchangeable.
-    """
+    """Return cumulative unrealized P&L, its basis, and consistency evidence."""
     market_value, _ = _number(item, ("market_value", "m_dMarketValue"))
     volume, _ = _number(item, ("volume", "m_nVolume", "total_volume", "current_volume"))
     average_price, _ = _number(item, ("avg_price", "m_dAvgPrice", "cost_price", "open_price", "m_dOpenPrice"))
@@ -40,8 +35,6 @@ def resolve_position_pnl(item: Dict[str, Any]) -> Dict[str, Any]:
     tolerance = max(5.0, abs(market_value or 0.0) * 0.005)
     cumulative_cost_conflict = bool(derived is not None and cumulative is not None and abs(cumulative - derived) > tolerance)
     if cumulative_cost_conflict:
-        # Conflicting broker fields must not understate downside. The report is
-        # flagged for manual verification and uses the more conservative value.
         pnl = min(float(cumulative), float(derived))
         basis = "conservative_conflict_min"
     elif cumulative is not None:
@@ -64,7 +57,6 @@ def resolve_position_pnl(item: Dict[str, Any]) -> Dict[str, Any]:
         inferred_cost = market_value - pnl
         cost_value = inferred_cost if inferred_cost > 0 else None
     pnl_pct = (pnl / cost_value * 100.0) if cost_value and cost_value > 0 else None
-
     return {
         "pnl": round(pnl, 4),
         "pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,

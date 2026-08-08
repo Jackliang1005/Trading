@@ -28,7 +28,7 @@ import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional
 
-from domain.services.position_pnl_service import resolve_position_pnl
+from position_pnl import resolve_position_pnl
 
 
 def _env(key: str, default: str = "") -> str:

@@ -15,8 +15,8 @@ from typing import Any, Dict, List
 
 import db
 from domain.policies.advisor_policy import load_advisor_policy
-from domain.services.position_pnl_service import resolve_position_pnl
 from domain.services.report_style_service import join_cn, money, pct, risk_label, source_label
+from position_pnl import resolve_position_pnl
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 REPORTS_DIR = WORKSPACE / "reports"

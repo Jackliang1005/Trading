@@ -1,7 +1,21 @@
+import subprocess
+import sys
+
 from domain.services import reflection_runtime_service
 from domain.services import risk_report_service
-from domain.services.position_pnl_service import resolve_position_pnl
+from position_pnl import resolve_position_pnl
 from qmt_client import QMTManager
+
+
+def test_data_collector_cold_import_has_no_qmt_circular_dependency():
+    completed = subprocess.run(
+        [sys.executable, "-c", "import data_collector; import qmt_client"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _qmt_position():
