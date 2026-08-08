@@ -1484,12 +1484,17 @@ def _query_skill_screener(query: str) -> str:
         "\u0032\u0030\u65e5\u6da8\u5e45": "momentum_20d",
         "\u0036\u0030\u65e5\u6da8\u5e45": "momentum_60d",
     }
-    conditions: Dict[str, Dict[str, float]] = {"min": {}, "max": {}}
+    conditions: Dict[str, object] = {"min": {}, "max": {}}
+    exclusive: Dict[str, List[str]] = {"min": [], "max": []}
     for label, metric in aliases.items():
         for operator, value in re.findall(rf"{re.escape(label)}\s*([<>])\s*(\d+(?:\.\d+)?)", query, flags=re.IGNORECASE):
-            conditions["min" if operator == ">" else "max"][metric] = float(value)
+            bound = "min" if operator == ">" else "max"
+            conditions[bound][metric] = float(value)
+            exclusive[bound].append(metric)
     conditions = {key: value for key, value in conditions.items() if value}
     requested = set((conditions.get("min") or {})) | set((conditions.get("max") or {}))
+    if any(exclusive.values()):
+        conditions["exclusive"] = {key: value for key, value in exclusive.items() if value}
     payload: Dict = {"action": "screener", "codes": codes[:10], "conditions": conditions}
     rank_by = (
         "value" if "\u4ef7\u503c\u56e0\u5b50" in query
@@ -1566,13 +1571,66 @@ def _query_skill_screener(query: str) -> str:
             revenue = f"{float(metrics.get('revenue')) / 100000000:.2f}亿"
         except (TypeError, ValueError):
             revenue = "--"
-        lines.append(f"- {item.get('name') or item.get('code')}（{item.get('code', '')}）：ROE {_display_value(metrics.get('roe'), '%')}；负债率 {_display_value(metrics.get('debt_ratio'), '%')}；营收 {revenue}。")
+        period = _format_data_time(item.get("financial_period")) if item.get("financial_period") else ""
+        period_text = f"，财报 {period}" if period else ""
+        lines.append(f"- {item.get('name') or item.get('code')}（{item.get('code', '')}{period_text}）：ROE {_display_value(metrics.get('roe'), '%')}；负债率 {_display_value(metrics.get('debt_ratio'), '%')}；营收 {revenue}。")
     remaining = max(0, int(data.get("match_count", len(data.get("matches") or []))) - 15)
     if remaining:
         lines.append(f"其他 {remaining} 只仅作候选，需结合行业、估值、走势与公告复核。")
-    rejected_count = len(data.get("rejected") or [])
-    if rejected_count:
-        lines.append(f"- 另有 {rejected_count} 只未满足筛选条件，不展示内部过滤代码。")
+    rejected = data.get("rejected") or []
+    if rejected and data.get("scope") == "provided_codes":
+        metric_labels = {
+            "pe_ttm": "市盈率",
+            "pb": "市净率",
+            "roe": "ROE",
+            "revenue_growth": "营收同比",
+            "net_profit_growth": "净利润同比",
+            "debt_ratio": "负债率",
+            "momentum_20d": "20日动量",
+            "momentum_60d": "60日动量",
+        }
+        percent_metrics = {"roe", "revenue_growth", "net_profit_growth", "debt_ratio", "momentum_20d", "momentum_60d"}
+        exclusive_rules = conditions.get("exclusive") or {}
+
+        def rejection_evidence(item: Dict) -> str:
+            metrics = item.get("metrics") or {}
+            failures = []
+            for bound, operator in (("min", ">"), ("max", "<")):
+                for metric, threshold in (conditions.get(bound) or {}).items():
+                    actual = metrics.get(metric)
+                    suffix = "%" if metric in percent_metrics else ""
+                    label = metric_labels.get(metric, metric)
+                    if actual in (None, ""):
+                        failures.append(f"{label}缺失（要求 {operator} {float(threshold):g}{suffix}）")
+                        continue
+                    try:
+                        number = float(actual)
+                    except (TypeError, ValueError):
+                        failures.append(f"{label}不可解析（要求 {operator} {float(threshold):g}{suffix}）")
+                        continue
+                    is_exclusive = metric in set(exclusive_rules.get(bound) or [])
+                    passed = number > float(threshold) if bound == "min" and is_exclusive else (
+                        number >= float(threshold) if bound == "min" else (
+                            number < float(threshold) if is_exclusive else number <= float(threshold)
+                        )
+                    )
+                    if not passed:
+                        failures.append(f"{label} {_display_value(number, suffix)}（要求 {operator} {float(threshold):g}{suffix}）")
+            if failures:
+                return "；".join(failures)
+            return "所需财务或行情数据不可用" if item.get("reason") != "conditions_not_met" else "未满足筛选条件"
+
+        lines.extend(["", "**未通过及原因**"])
+        for item in rejected[:10]:
+            period = _format_data_time(item.get("financial_period")) if item.get("financial_period") else ""
+            period_text = f"，财报 {period}" if period else ""
+            lines.append(
+                f"- {item.get('name') or item.get('code')}（{item.get('code', '')}{period_text}）：{rejection_evidence(item)}。"
+            )
+        if len(rejected) > 10:
+            lines.append(f"- 其余 {len(rejected) - 10} 只未通过标的未展开。")
+    elif rejected:
+        lines.append(f"- 另有 {len(rejected)} 只未满足筛选条件，不展开全市场淘汰明细。")
     if data.get("limitations"):
         lines.append("- 数据限制：部分估值、增长或动量字段覆盖不足时，结果只基于可用字段，不作缺失值推断。")
     lines.append("- 筛选结果只是候选池，仍需结合行业、估值、走势和公告人工复核。")
@@ -1651,6 +1709,42 @@ def _query_skill_overview(query: str) -> str:
     notice = _skill_request({"action": "news_interpretation", "code": code, "date": _extract_query_date(query)})
     quote = (quote_data.get("quotes") or [{}])[0]
     lines = [f"🧭 个股综合分析｜{quote.get('name') or code}（{code}）", ""]
+    try:
+        risk = build_risk_report()
+    except Exception:
+        risk = {}
+    code_digits = "".join(char for char in str(code) if char.isdigit())[-6:]
+    position = next(
+        (
+            item for item in (risk.get("positions") or [])
+            if "".join(char for char in str(item.get("code") or "") if char.isdigit())[-6:] == code_digits
+        ),
+        None,
+    )
+    if position:
+        weight_pct = float(position.get("weight") or 0) * 100
+        pnl_ratio_pct = float(position.get("pnl_ratio") or 0) * 100
+        lines.extend(
+            [
+                f"**组合关联｜持仓快照 {risk.get('as_of') or '日期待核验'}**",
+                f"- 当前已知持仓 {int(float(position.get('volume') or 0))} 股，市值 {money(position.get('market_value'))}，"
+                f"占已知组合 {_display_value(weight_pct, '%')}；累计持仓盈亏 {money(position.get('pnl'))}"
+                f"（{_display_value(pnl_ratio_pct, '%')}）。",
+            ]
+        )
+        policy = risk.get("advisor_policy") or {}
+        risk_notes = []
+        concentration_limit = float(policy.get("single_position_alert_ratio", 0.3) or 0.3) * 100
+        severe_loss_limit = float(policy.get("severe_loss_drawdown_ratio", 0.2) or 0.2) * 100
+        if weight_pct >= concentration_limit:
+            risk_notes.append(f"持仓占比超过 {_display_value(concentration_limit, '%')} 集中度警戒")
+        if pnl_ratio_pct <= -severe_loss_limit:
+            risk_notes.append(f"累计持仓亏损幅度超过 {_display_value(severe_loss_limit, '%')} 深度亏损复核线")
+        if risk_notes:
+            lines.append(f"- 组合风险：{'；'.join(risk_notes)}；个股信号必须服从组合降险优先级。")
+        if position.get("stale_sources") or not risk.get("account_source_coverage_complete", True):
+            lines.append("- 数据边界：部分账户源处于降级状态；股数、可用量与实时性须在交易前复核。")
+        lines.append("")
     if quote_data.get("ok"):
         lines.append(f"- **行情｜{_format_data_time(quote.get('as_of'))}**：价格 {_display_value(quote.get('price'), digits=3)}，涨跌 {_display_value(quote.get('change_pct'), '%')}，成交额 {_display_value(quote.get('turnover_yi'), '亿元')}。")
     else:

@@ -670,6 +670,9 @@ def _screener(request: dict[str, Any]) -> dict[str, Any]:
             return {"ok": False, "error": "mootdx_cache_missing", "message": "Build the daily mootdx finance cache before full-universe screening."}
         cache = json.loads(cache_path.read_text(encoding="utf-8"))
         conditions = request.get("conditions") or {}
+        exclusive = conditions.get("exclusive") or {}
+        exclusive_min = set(exclusive.get("min") or [])
+        exclusive_max = set(exclusive.get("max") or [])
         supported = {"roe", "debt_ratio", "revenue", "net_profit", "operating_cashflow"}
         valuation_metrics = {"pe_ttm", "pb", "ps"}
         growth_metrics = {"revenue_growth", "net_profit_growth", "gross_margin", "peg"}
@@ -712,7 +715,9 @@ def _screener(request: dict[str, Any]) -> dict[str, Any]:
                 if key in {"pe_ttm", "pb", "ps", "peg"} and value <= 0:
                     passed = False
                     break
-                passed = passed and value >= float(minimum)
+                passed = passed and (
+                    value > float(minimum) if key in exclusive_min else value >= float(minimum)
+                )
             for key, maximum in (conditions.get("max") or {}).items():
                 try:
                     value = float(item[key])
@@ -722,7 +727,9 @@ def _screener(request: dict[str, Any]) -> dict[str, Any]:
                 if key in {"pe_ttm", "pb", "ps", "peg"} and value <= 0:
                     passed = False
                     break
-                passed = passed and value <= float(maximum)
+                passed = passed and (
+                    value < float(maximum) if key in exclusive_max else value <= float(maximum)
+                )
             if passed:
                 matches.append(item)
         if rank_by == "value":
@@ -827,6 +834,9 @@ def _screener(request: dict[str, Any]) -> dict[str, Any]:
             matches.sort(key=lambda item: str(item.get("code") or ""))
         return {"ok": True, "scope": "mootdx_full_universe", "as_of": cache.get("generated_at"), "conditions": conditions, "rank_by": rank_by or None, "matches": matches[:200], "match_count": len(matches), "source": cache.get("source"), "universe_size": universe_size, "metric_coverage": metric_coverage, "growth_report_period": cache.get("growth_report_period"), "quote_coverage": quote_coverage, "valuation_coverage": cache.get("valuation_coverage"), "momentum_coverage": momentum_coverage, "momentum_as_of": cache.get("momentum_refreshed_at"), "screening_defaults": {"exclude_st": exclude_st}, "limitations": cache.get("limitations")}
     conditions = request.get("conditions") or {}
+    exclusive = conditions.get("exclusive") or {}
+    exclusive_min = set(exclusive.get("min") or [])
+    exclusive_max = set(exclusive.get("max") or [])
     matches = []
     rejected = []
     quote_map = {str(item.get("code") or "").zfill(6): item for item in (_quote(codes).get("quotes") or [])}
@@ -842,20 +852,25 @@ def _screener(request: dict[str, Any]) -> dict[str, Any]:
         for key, minimum in (conditions.get("min") or {}).items():
             try:
                 value = _number(metrics.get(key))
-                passed = passed and value is not None and value >= float(minimum)
+                passed = passed and value is not None and (
+                    value > float(minimum) if key in exclusive_min else value >= float(minimum)
+                )
             except Exception:
                 passed = False
         for key, maximum in (conditions.get("max") or {}).items():
             try:
                 value = _number(metrics.get(key))
-                passed = passed and value is not None and value <= float(maximum)
+                passed = passed and value is not None and (
+                    value < float(maximum) if key in exclusive_max else value <= float(maximum)
+                )
             except Exception:
                 passed = False
         display_name = str(quote.get("name") or "").strip()
+        financial_period = data.get("period")
         (matches if passed else rejected).append(
-            {"code": code, "name": display_name, "metrics": metrics}
+            {"code": code, "name": display_name, "financial_period": financial_period, "metrics": metrics}
             if passed
-            else {"code": code, "name": display_name, "reason": "conditions_not_met", "metrics": metrics}
+            else {"code": code, "name": display_name, "financial_period": financial_period, "reason": "conditions_not_met", "metrics": metrics}
         )
     return {"ok": True, "scope": "provided_codes", "conditions": conditions, "matches": matches, "rejected": rejected, "source": "akshare_financial"}
 
