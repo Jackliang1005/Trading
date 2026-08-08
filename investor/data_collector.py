@@ -356,14 +356,26 @@ def fetch_historical_kline(symbol: str, start_date: str, end_date: str) -> List[
     """
     try:
         import akshare as ak
+        import pandas as pd
+
+        raw_symbol = str(symbol or "").strip()
+        lower_symbol = raw_symbol.lower()
+        # The prediction ledger uses prefixed codes for indices (sh000001) and
+        # exchange-suffixed codes for positions (603986.SH).  AKShare's stock
+        # endpoint only accepts the six-digit code.
+        is_index = lower_symbol.startswith(("sh", "sz"))
+        stock_symbol = raw_symbol.split(".", 1)[0]
         start = start_date.replace("-", "")
         end = end_date.replace("-", "")
-        if symbol.startswith("sh") or symbol.startswith("sz"):
-            clean = symbol[2:]
-            df = ak.stock_zh_index_daily(symbol=f"{symbol[:2]}{clean}")
+        if is_index:
+            clean = lower_symbol[2:]
+            df = ak.stock_zh_index_daily(symbol=f"{lower_symbol[:2]}{clean}")
             if df is None or df.empty:
                 return []
-            df = df[(df["date"] >= start) & (df["date"] <= end)]
+            normalized_dates = pd.to_datetime(df["date"], errors="coerce")
+            start_ts = pd.Timestamp(start_date)
+            end_ts = pd.Timestamp(end_date)
+            df = df[(normalized_dates >= start_ts) & (normalized_dates <= end_ts)]
             records = []
             for _, row in df.iterrows():
                 records.append({
@@ -387,7 +399,7 @@ def fetch_historical_kline(symbol: str, start_date: str, end_date: str) -> List[
                     ) if rec["open"] > 0 else 0
             return records
         else:
-            df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
+            df = ak.stock_zh_a_hist(symbol=stock_symbol, period="daily",
                                      start_date=start, end_date=end, adjust="qfq")
             if df is None or df.empty:
                 return []

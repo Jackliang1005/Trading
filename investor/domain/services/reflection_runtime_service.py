@@ -22,7 +22,22 @@ from domain.policies.scoring_policy import calculate_prediction_score
 # 评分阈值
 NEUTRAL_THRESHOLD = 0.3
 MICRO_MOVE_THRESHOLD = 0.1
+PREDICTION_PRICE_ANCHOR_TOLERANCE = 0.02
 DECISION_MONITOR_PATH = Path("/root/.openclaw/workspace/reports/investor_decision_monitor_latest.json")
+
+
+def _prediction_price_anchor_is_valid(price_at_predict: float, first_bar: Dict) -> bool:
+    """Require the saved prediction price to agree with its first real bar."""
+    try:
+        anchor = float(price_at_predict or 0)
+        low = float(first_bar.get("low", 0) or 0)
+        high = float(first_bar.get("high", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if anchor <= 0 or low <= 0 or high <= 0 or low > high:
+        return False
+    tolerance = PREDICTION_PRICE_ANCHOR_TOLERANCE
+    return low * (1 - tolerance) <= anchor <= high * (1 + tolerance)
 
 
 def backtest_predictions(target_date: str | None = None) -> Dict:
@@ -37,12 +52,13 @@ def backtest_predictions(target_date: str | None = None) -> Dict:
       - 使用旧评分逻辑兼容
     """
     if target_date is None:
-        target_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        target_date = datetime.now().strftime("%Y-%m-%d")
 
-    print(f"🔍 回测预测 (截止日期: {target_date}, 给3天K线走完)")
+    print(f"🔍 回测预测 (数据截止: {target_date}, 满3个交易日后评分)")
 
-    # Get unchecked predictions from 3+ days ago AND already-checked ones from 3 days ago
-    # that were marked with the old scoring and have new-format data
+    # Query all predictions no later than the as-of date. Maturity is determined
+    # from actual trading bars below, not calendar-day subtraction (weekends and
+    # holidays otherwise make a 3-day prediction mature too early or never).
     unchecked = db.get_unchecked_predictions(before_date=target_date)
 
     # Also include predictions from exactly 3 days ago that were checked
@@ -54,6 +70,8 @@ def backtest_predictions(target_date: str | None = None) -> Dict:
     print(f"  📋 找到 {len(unchecked)} 条待回测预测")
     checked = 0
     correct = 0
+    deferred = 0
+    unscorable = 0
 
     for pred in unchecked:
         pred_id = pred["id"]
@@ -72,12 +90,32 @@ def backtest_predictions(target_date: str | None = None) -> Dict:
             end_date = target_date
             actual_kline = fetch_historical_kline(target, pred_date, end_date)
 
-            if not actual_kline or len(actual_kline) < 1:
-                print(f"  ⚠️ 无法获取 {target} 的3日K线数据，跳过")
+            if not actual_kline:
+                print(f"  ⚠️ 无法获取 {target} 的历史K线数据，跳过")
+                deferred += 1
+                continue
+
+            if len(actual_kline) < 3:
+                print(
+                    f"  ⏳ {target} 尚未走满3个交易日 "
+                    f"({len(actual_kline)}/3)，延后评分"
+                )
+                deferred += 1
                 continue
 
             # Take up to 3 days
             actual_3d = actual_kline[:3]
+            if not _prediction_price_anchor_is_valid(price_at_predict, actual_3d[0]):
+                first_low = float(actual_3d[0].get("low", 0) or 0)
+                first_high = float(actual_3d[0].get("high", 0) or 0)
+                note = (
+                    "不可评分：预测时价格与首个真实交易日区间不一致 "
+                    f"(预测价{price_at_predict:.3f}, 实际区间{first_low:.3f}-{first_high:.3f})"
+                )
+                db.mark_prediction_unscorable(pred_id=pred_id, note=note)
+                print(f"  🚫 [{target}] {note}")
+                unscorable += 1
+                continue
             actual_3d_high = max(d.get("high", 0) or 0 for d in actual_3d)
             actual_3d_low = min(d.get("low", float("inf")) or float("inf") for d in actual_3d)
             if actual_3d_low == float("inf"):
@@ -195,6 +233,8 @@ def backtest_predictions(target_date: str | None = None) -> Dict:
         "checked": checked,
         "correct": correct,
         "win_rate": win_rate,
+        "deferred": deferred,
+        "unscorable": unscorable,
     }
     print(f"\n📊 回测完成: {checked}/{len(unchecked)} 已检查, 胜率 {win_rate:.1f}%")
     return result

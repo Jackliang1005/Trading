@@ -364,6 +364,21 @@ def update_prediction_result(pred_id: int, actual_price: float,
     conn.close()
 
 
+def mark_prediction_unscorable(pred_id: int, note: str = "") -> None:
+    """Close an invalid prediction without turning it into a win/loss sample."""
+    conn = get_conn()
+    conn.execute(
+        """UPDATE prediction_log
+           SET checked_at=datetime('now'), check_note=?,
+               actual_price_at_check=NULL, actual_change=NULL,
+               is_correct=NULL, score=NULL
+           WHERE id=?""",
+        (note, pred_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def add_prediction_evaluation(
     prediction_id: int,
     actual_price: float,
@@ -451,7 +466,7 @@ def get_checked_predictions_in_range(start: str, end: str) -> List[Dict]:
            FROM prediction_log p
            LEFT JOIN latest_eval le ON le.prediction_id = p.id
            WHERE date(p.created_at) BETWEEN date(?) AND date(?)
-             AND (le.id IS NOT NULL OR p.checked_at IS NOT NULL)""",
+             AND COALESCE(le.is_correct, p.is_correct) IS NOT NULL""",
         (start, end),
     ).fetchall()
     conn.close()
@@ -909,7 +924,7 @@ def get_strategy_performance(start: str, end: str) -> List[Dict]:
                FROM prediction_log p
                LEFT JOIN latest_eval le ON le.prediction_id = p.id
                WHERE date(p.created_at) BETWEEN date(?) AND date(?)
-                 AND (le.id IS NOT NULL OR p.checked_at IS NOT NULL)
+                 AND COALESCE(le.is_correct, p.is_correct) IS NOT NULL
                  AND p.strategy_used != ''
            )
            SELECT strategy_used,
@@ -928,7 +943,7 @@ def get_strategy_performance(start: str, end: str) -> List[Dict]:
 def get_overall_stats(start: str = None, end: str = None) -> Dict:
     """获取整体统计"""
     conn = get_conn()
-    where = "WHERE (le.id IS NOT NULL OR p.checked_at IS NOT NULL)"
+    where = "WHERE COALESCE(le.is_correct, p.is_correct) IS NOT NULL"
     params = []
     if start and end:
         where += " AND date(p.created_at) BETWEEN date(?) AND date(?)"
