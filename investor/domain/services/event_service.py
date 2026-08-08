@@ -139,6 +139,10 @@ MARKET_CATALYST_WORDS = (
 )
 NON_MARKET_STORY_WORDS = ("jacket", "auction", "wedding", "birthday", "celebrity", "sports")
 DIGEST_TITLE_PATTERN = re.compile(r"^(?:早报|午报|晚报|财经早餐|盘前必读|每日财经|市场早报)\s*[丨|：:]", re.IGNORECASE)
+ENGLISH_DIGEST_TITLE_PATTERN = re.compile(
+    r"^(?:CNBC\s+Daily\s+Open|Daily\s+Open|Morning\s+Brief|Market\s+Wrap)\s*[:|]",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -456,6 +460,8 @@ def _theme_matches(text: str) -> List[Dict[str, Any]]:
 def _is_multi_story_digest_title(title: object) -> bool:
     text = re.sub(r"^\d{1,2}:\s*\d{2}\s+", "", str(title or "").strip())
     separators = text.count("；") + text.count(";")
+    if ENGLISH_DIGEST_TITLE_PATTERN.search(text):
+        return separators >= 1
     return bool(DIGEST_TITLE_PATTERN.search(text) and separators >= 2)
 
 

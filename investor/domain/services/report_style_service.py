@@ -161,6 +161,12 @@ def event_summary_cn(title: Any, themes: Iterable[Any] = ()) -> str:
         return "美伊军事冲突升级，避险与能源风险升温"
     if ("chip stocks" in lowered or "semiconductor shares" in lowered) and any(token in lowered for token in ("sink", "sell-off", "rout", "plunge")):
         return "亚洲AI芯片股跟随美股下跌"
+    if "treasury yield" in lowered and "oil" in lowered and any(token in lowered for token in ("iran", "de-escalation")):
+        return "伊朗局势缓和预期推动油价与美债收益率回落"
+    if "treasury yield" in lowered and "iran" in lowered:
+        return "伊朗局势变化牵动美国国债收益率"
+    if "russia sanctions" in lowered:
+        return "美国参议院推进对俄罗斯的新制裁法案"
     if any(token in lowered for token in ("nvidia", "ai chip", "semiconductor")):
         return "海外AI芯片与半导体产业出现新变化"
     if any(token in lowered for token in ("fed", "rate cut", "rate hike", "inflation")):
