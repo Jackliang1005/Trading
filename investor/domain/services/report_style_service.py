@@ -167,6 +167,8 @@ def event_summary_cn(title: Any, themes: Iterable[Any] = ()) -> str:
         return "伊朗局势变化牵动美国国债收益率"
     if "russia sanctions" in lowered:
         return "美国参议院推进对俄罗斯的新制裁法案"
+    if "oil" in lowered and "iran" in lowered and any(token in lowered for token in ("hormuz", "strait")):
+        return "伊朗霍尔木兹海峡限制方案推升石油供应担忧"
     if any(token in lowered for token in ("nvidia", "ai chip", "semiconductor")):
         return "海外AI芯片与半导体产业出现新变化"
     if any(token in lowered for token in ("fed", "rate cut", "rate hike", "inflation")):

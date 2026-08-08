@@ -282,6 +282,10 @@ def _normalize_intent(text: str) -> str:
         return "t_monitor"
     if any(key in query for key in ("推送验收", "投递验收")):
         return "live_delivery_acceptance"
+    if query.strip().lower() in {"/投顾", "投顾", "/advisor", "advisor brief"} or any(
+        key in query for key in ("投顾总览", "今日投顾", "助理简报")
+    ):
+        return "advisor_brief"
     if any(key in query for key in ("推送状态", "投递状态")):
         return "delivery_audit"
     if "\u677f\u5757" in query and any(key in query for key in ("\u6da8", "\u5f3a", "\u70ed", "\u8d44\u91d1")):
@@ -1405,6 +1409,10 @@ def handle_feishu_query(query_text: str) -> str:
         return _query_skill_sector_flow(query)
     if intent == "assistant_status":
         return _query_assistant_status()
+    if intent == "advisor_brief":
+        from domain.services.advisor_brief_service import build_advisor_brief
+
+        return build_advisor_brief().get("text", "投顾总览生成失败；本次不输出账户或交易结论。")
     if intent == "delivery_audit":
         return format_delivery_audit_text()
     if intent == "live_delivery_acceptance":

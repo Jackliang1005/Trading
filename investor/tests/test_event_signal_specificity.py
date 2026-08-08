@@ -29,3 +29,7 @@ def test_english_macro_headlines_keep_the_specific_catalyst():
         "U.S. Treasury yields fall as traders monitor possible Iran war deal",
         ["Global Macro", "Geopolitics"],
     ) == "伊朗局势变化牵动美国国债收益率"
+    assert event_summary_cn(
+        "Oil rises as Iran's draft plan sees U.S. and Israel banned from Strait of Hormuz",
+        ["Energy Commodities", "Geopolitics"],
+    ) == "伊朗霍尔木兹海峡限制方案推升石油供应担忧"

@@ -61,6 +61,7 @@ from domain.services.weekly_report_service import build_weekly_report, save_week
 from domain.services.risk_report_service import build_risk_report, save_risk_report
 from domain.services.morning_brief_service import build_morning_brief, save_morning_brief
 from domain.services.assistant_status_service import build_assistant_status
+from domain.services.advisor_brief_service import build_advisor_brief
 from domain.services.watchlist_report_service import build_watchlist_report
 from domain.services.closing_brief_service import build_closing_brief, save_closing_brief
 from domain.services.decision_monitor_service import build_decision_monitor, format_decision_monitor_text
@@ -86,6 +87,10 @@ NEW_COMMAND_SPECS = {
     "assistant-status": {
         "description": "生成 OpenClaw assistant operational status",
         "usage": "python3 main.py assistant-status [--json]",
+    },
+    "advisor-brief": {
+        "description": "生成账户、风险、事件、行动层级与验证闭环的一页投顾总览",
+        "usage": "python3 main.py advisor-brief [--json]",
     },
     "capability-audit": {
         "description": "查看投资助理能力审计与阻塞项",
@@ -399,6 +404,9 @@ def run_command(command: str):
     if command == "assistant-status":
         status = build_assistant_status()
         return status if _has_flag("--json") else status.get("text", "")
+    if command == "advisor-brief":
+        brief = build_advisor_brief()
+        return brief if _has_flag("--json") else brief.get("text", "")
     if command == "capability-audit":
         return _run_capability_audit_command()
     if command == "record":
