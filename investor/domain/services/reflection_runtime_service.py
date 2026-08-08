@@ -483,6 +483,34 @@ def _trade_amount(item: Dict) -> float:
     return amount if amount > 0 else _trade_volume(item) * _trade_price(item)
 
 
+def _trade_side(item: Dict) -> str:
+    return "buy" if item.get("order_type", item.get("m_nOrderType", 0)) in (23, "buy", "BUY") else "sell"
+
+
+def _aggregate_trades(trades: list) -> list:
+    """Merge broker partial fills by security and direction for advisor-facing review."""
+    grouped: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for item in trades:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("stock_code") or item.get("code") or item.get("m_strStockCode") or "").strip()
+        volume = _trade_volume(item)
+        price = _trade_price(item)
+        if not code or volume <= 0 or price <= 0:
+            continue
+        side = _trade_side(item)
+        key = (code, side)
+        row = grouped.setdefault(key, {"code": code, "side": side, "volume": 0.0, "amount": 0.0, "fills": 0})
+        row["volume"] += volume
+        row["amount"] += _trade_amount(item)
+        row["fills"] += 1
+    rows = []
+    for row in grouped.values():
+        row["avg_price"] = row["amount"] / row["volume"] if row["volume"] > 0 else 0.0
+        rows.append(row)
+    return rows
+
+
 def _build_positions_table(positions: list) -> tuple[str, list]:
     """Build position P&L table. Returns (markdown_lines, enriched_objects)."""
     enriched = []
@@ -833,12 +861,43 @@ def format_reflection_push_text(trading_summary: Dict, decision_attribution: str
     lines.extend(["", "**有效成交**"])
     if not trades:
         lines.append("- 未取得可验证成交；不根据委托或零值记录推断已成交。")
+    trade_groups = _aggregate_trades(trades)
+    if trade_groups:
+        lines.append("- 以下先按证券与方向合并部分成交，再保留逐笔明细。")
+        for group in trade_groups:
+            side = "买入" if group.get("side") == "buy" else "卖出"
+            lines.append(
+                f"- 汇总 {side} **{group.get('code')}**｜{group.get('volume'):g} 股｜"
+                f"均价 {group.get('avg_price'):.3f} 元｜成交额 {money(group.get('amount'))}｜{group.get('fills')} 笔"
+            )
+        buy_amount = sum(float(item.get("amount") or 0) for item in trade_groups if item.get("side") == "buy")
+        sell_amount = sum(float(item.get("amount") or 0) for item in trade_groups if item.get("side") == "sell")
+        net_flow = sell_amount - buy_amount
+        flow_label = "净流入" if net_flow > 0 else "净流出" if net_flow < 0 else "持平"
+        lines.append(f"- 成交额口径资金{flow_label} {money(abs(net_flow))}；未计费用，不等同于完整账户现金变化。")
+        lines.append("- 逐笔明细：")
     for item in trades[:8]:
-        side = "买入" if item.get("order_type", 0) in (23, "buy", "BUY") else "卖出"
+        side = "买入" if _trade_side(item) == "buy" else "卖出"
         code = item.get("stock_code", item.get("code", ""))
         volume = _trade_volume(item)
         price = _trade_price(item)
         lines.append(f"- {side} **{code}**｜{volume:g} 股｜{price:.3f} 元")
+
+    if trade_groups:
+        current_volume = {str(item.get("code") or ""): int(float(item.get("volume") or 0)) for item in positions}
+        dates_comparable = bool(portfolio_as_of != "未知" and trading_review_date != "未知" and portfolio_as_of >= trading_review_date)
+        lines.extend(["", "**成交后持仓对照**"])
+        for group in trade_groups:
+            code = str(group.get("code") or "")
+            side = "买入" if group.get("side") == "buy" else "卖出"
+            latest_volume = current_volume.get(code)
+            if not dates_comparable:
+                comparison = "账户快照早于复盘交易日，无法对照成交后的持仓。"
+            elif latest_volume is None:
+                comparison = "最新已知持仓未显示该标的，与卖出或清仓方向相符，但不据此认定实时清仓。" if side == "卖出" else "最新已知持仓未显示该标的，买入后的持仓状态需要继续核验。"
+            else:
+                comparison = f"最新已知持仓 {latest_volume} 股；仅作数量对照，不等同于实时账户确认。"
+            lines.append(f"- **{code}**｜复盘交易日{side} {group.get('volume'):g} 股｜{comparison}")
 
     lines.extend(["", "**持仓风险**"])
     if not positions:
