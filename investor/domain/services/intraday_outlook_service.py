@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+import db
 from domain.services.decision_monitor_service import build_decision_monitor
 from domain.services.report_style_service import money, pct, risk_label, source_label
 
@@ -92,6 +93,69 @@ def _prediction_result(predicted: str, observed: str) -> str:
     return "方向错误"
 
 
+def _prediction_confidence(market: Dict[str, Any]) -> float:
+    """Return a conservative confidence for the technical persistence baseline."""
+    benchmark_count = len(market.get("benchmarks") or [])
+    strength = min(abs(float(market.get("average_change_pct") or 0)) / 2.0, 1.0)
+    coverage = min(max(benchmark_count - 2, 0) / 2.0, 1.0)
+    return round(min(0.75, 0.50 + 0.10 * strength + 0.10 * coverage), 2)
+
+
+def _record_intraday_prediction(report: Dict[str, Any], existing: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    """Persist one idempotent, strategy-attributed forecast for later evaluation."""
+    direction = str(report.get("prediction_direction") or "unknown")
+    slot = str(report.get("slot") or "")
+    if slot not in {"0930", "1030"} or direction == "unknown":
+        return None
+    existing_record = (existing or {}).get("prediction_record") or {}
+    if existing_record.get("id"):
+        return existing_record
+    market = report.get("market") or {}
+    trade_date = str(report.get("trade_date") or "")
+    attribution = report.get("prediction_attribution") or {}
+    strategy = str(attribution.get("strategy_used") or "technical")
+    basis = str(attribution.get("basis") or "宽基指数当日涨跌、方向一致性与时段延续性")
+    confidence = float(attribution.get("confidence") or _prediction_confidence(market))
+    prediction_id = db.add_prediction(
+        target=f"intraday_market:{trade_date}:{slot}",
+        target_name=f"A股宽基日内方向 {slot}",
+        direction=direction,
+        confidence=confidence,
+        reasoning=basis,
+        strategy_used=strategy,
+        model_used="intraday-market-state-v1",
+        timeframe="intraday",
+        actual_price=None,
+    )
+    return {
+        "id": prediction_id,
+        "strategy_used": strategy,
+        "basis": basis,
+        "confidence": confidence,
+    }
+
+
+def _evaluate_recorded_prediction(correction: Dict[str, Any], previous: Dict[str, Any] | None, market: Dict[str, Any]) -> None:
+    record = (previous or {}).get("prediction_record") or {}
+    prediction_id = int(record.get("id") or 0)
+    result = str(correction.get("result") or "")
+    if not prediction_id or result == "数据不足，无法验证":
+        return
+    score = {"方向正确": 1.0, "方向接近但强度有偏差": 0.5, "方向错误": 0.0}.get(result, 0.0)
+    actual_change = float(market.get("average_change_pct") or 0)
+    db.update_prediction_result(
+        prediction_id,
+        actual_price=0.0,
+        actual_change=actual_change,
+        is_correct=result == "方向正确",
+        score=score,
+        note=f"日内闭环：{correction.get('slot')} 预测，当前观察为 {correction.get('observed')}；{result}",
+    )
+    correction["prediction_id"] = prediction_id
+    correction["strategy_used"] = str(record.get("strategy_used") or "technical")
+    correction["score"] = score
+
+
 def _clearance_assessment(monitor: Dict[str, Any], market: Dict[str, Any]) -> Dict[str, Any]:
     positions = monitor.get("tracked_positions") or []
     if not market.get("available") or not monitor.get("trading_session") or not monitor.get("calendar_open"):
@@ -142,6 +206,7 @@ def build_intraday_outlook(slot: str, now: datetime | None = None, reports_dir: 
     market = _market_state(monitor, current=current, require_fresh=True)
     previous_0930 = _load_snapshot(trade_date, "0930", reports_dir)
     previous_1030 = _load_snapshot(trade_date, "1030", reports_dir)
+    existing_current = {"0930": previous_0930, "1030": previous_1030}.get(normalized)
 
     if not market.get("available"):
         prediction = "unknown"
@@ -179,12 +244,27 @@ def build_intraday_outlook(slot: str, now: datetime | None = None, reports_dir: 
         "clearance": clearance,
         "monitor": monitor,
     }
-    report["text"] = format_intraday_outlook(report)
+    if normalized in {"0930", "1030"} and prediction != "unknown":
+        report["prediction_attribution"] = {
+            "strategy_used": "technical",
+            "basis": "宽基指数当日涨跌、方向一致性与时段延续性",
+            "confidence": _prediction_confidence(market),
+        }
     if save:
+        previous_by_label = {"09:30": previous_0930, "10:30": previous_1030}
+        for correction in corrections:
+            previous = previous_by_label.get(str(correction.get("slot") or ""))
+            _evaluate_recorded_prediction(correction, previous, market)
+        prediction_record = _record_intraday_prediction(report, existing=existing_current)
+        if prediction_record:
+            report["prediction_record"] = prediction_record
         reports_dir.mkdir(parents=True, exist_ok=True)
         path = _snapshot_path(trade_date, normalized, reports_dir)
+        report["text"] = format_intraday_outlook(report)
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         report["report_path"] = str(path)
+    else:
+        report["text"] = format_intraday_outlook(report)
     return report
 
 
@@ -199,12 +279,19 @@ def format_intraday_outlook(report: Dict[str, Any]) -> str:
         lines.append(f"- 宽基指数：{index_text}；平均 {float(market.get('average_change_pct') or 0):+.2f}%。")
     else:
         lines.append("- 宽基指数行情不可用，本次预测按不可验证处理。")
+    attribution = report.get("prediction_attribution") or {}
+    if attribution:
+        lines.append(
+            f"- 预测归因：技术面（置信度 {float(attribution.get('confidence') or 0):.0%}）；"
+            f"依据为{attribution.get('basis')}。"
+        )
 
     corrections = report.get("corrections") or []
     if corrections:
         lines.extend(["", "**预测修正**"])
         for item in corrections:
-            lines.append(f"- {item.get('slot')} 预测：{item.get('result')}。")
+            attribution_text = f"｜归因 {item.get('strategy_used')}" if item.get("strategy_used") else ""
+            lines.append(f"- {item.get('slot')} 预测：{item.get('result')}{attribution_text}。")
 
     positions = monitor.get("tracked_positions") or []
     lines.extend(["", "**持仓处理**"])
