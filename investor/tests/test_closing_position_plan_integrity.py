@@ -127,3 +127,38 @@ def test_next_session_monitor_inherits_plan_but_gates_cross_account_quantity(mon
         text = monitor_service.format_decision_monitor_text(slot="1030")
     assert "进入“核验”层级" in text
     assert "数量参考：" not in text
+
+
+def test_closing_catalysts_fall_back_to_same_day_local_events():
+    payload = {
+        "date": "2026-08-07",
+        "generated_at": "2026-08-07 16:05:00",
+        "events": {
+            "top_events": [
+                {
+                    "title": "Oil rises as Iran's draft plan restricts the Strait of Hormuz",
+                    "published_at": "2026-08-07 13:27:03",
+                    "severity": "P1",
+                    "themes": [{"theme": "Energy Commodities"}, {"theme": "Geopolitics"}],
+                },
+                {
+                    "title": "Oil rises amid Iran restrictions in the Strait of Hormuz",
+                    "published_at": "2026-08-07 09:00:40",
+                    "severity": "P2",
+                    "themes": [{"theme": "Energy Commodities"}, {"theme": "Geopolitics"}],
+                },
+            ]
+        },
+        "global_impact": {"urgent_events": []},
+        "risk": {"available": False},
+        "longterm": {"summary": {"available": False}},
+        "audit": {},
+        "market_review": {"sentiment": "震荡", "indices": [], "quality_issues": []},
+        "decision_plan": {"position_actions": [], "opportunities": [], "opening_triggers": []},
+    }
+
+    text = service.format_closing_brief(payload)
+
+    assert "伊朗霍尔木兹海峡限制方案推升石油供应担忧" in text
+    assert text.count("伊朗霍尔木兹海峡限制方案推升石油供应担忧") == 1
+    assert "2026-08-07 没有通过新鲜度" not in text

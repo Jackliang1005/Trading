@@ -463,10 +463,29 @@ def format_closing_brief(payload: Dict[str, Any]) -> str:
         event for event in (impact.get("urgent_events") or [])
         if str(event.get("published_at") or "")[:10] == report_date
     ]
-    if urgent:
-        for event in urgent[:3]:
+    catalysts: List[Dict[str, Any]] = []
+    seen_catalyst_titles: List[str] = []
+    seen_catalyst_summaries: set[str] = set()
+    for event in [*urgent, *((events.get("top_events") or []))]:
+        title = str(event.get("title") or "")
+        display_summary = event_summary_cn(event.get("title"), (item.get("theme") for item in event.get("themes") or []))
+        if (
+            not title
+            or display_summary in seen_catalyst_summaries
+            or any(_near_duplicate_title(title, previous) for previous in seen_catalyst_titles)
+        ):
+            continue
+        seen_catalyst_titles.append(title)
+        seen_catalyst_summaries.add(display_summary)
+        catalyst = dict(event)
+        catalyst["_display_summary"] = display_summary
+        catalysts.append(catalyst)
+        if len(catalysts) >= 3:
+            break
+    if catalysts:
+        for event in catalysts:
             themes = join_cn((theme_label(item.get("theme")) for item in (event.get("themes") or [])[:3]), "未分类")
-            summary = event_summary_cn(event.get("title"), (item.get("theme") for item in event.get("themes") or []))
+            summary = str(event.get("_display_summary") or event_summary_cn(event.get("title"), (item.get("theme") for item in event.get("themes") or [])))
             lines.append(f"- **{summary}**｜{event_impact_label(event.get('severity'))}")
             lines.append(f"  主题：{themes}｜发布时间：{event.get('published_at', '未知')}")
             guidance = event.get("guidance") or {}
