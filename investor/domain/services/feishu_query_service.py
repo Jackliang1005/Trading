@@ -265,16 +265,19 @@ def _summarize_log_payload(data: Dict) -> Dict:
 
     totals = {"error_hits": 0, "recovered_error_hits": 0}
     categories: Dict[str, int] = {}
+    signatures = set()
     for lines in groups:
         summary = _summarize_log_errors(lines)
         totals["error_hits"] += int(summary.get("error_hits", 0) or 0)
         totals["recovered_error_hits"] += int(summary.get("recovered_error_hits", 0) or 0)
         for name, count in (summary.get("error_categories") or {}).items():
             categories[name] = categories.get(name, 0) + int(count or 0)
+        signatures.update(str(item) for item in (summary.get("error_signatures") or []) if item)
     return {
         "line_count": sum(len(lines) for lines in groups),
         **totals,
         "error_categories": categories,
+        "error_signatures": sorted(signatures),
         "file_count": len(groups),
     }
 
@@ -301,10 +304,19 @@ def _summarize_log_errors(lines: List[str]) -> Dict:
             categories["数据质量"] += 1
         else:
             categories["运行异常"] += 1
+    active_region = "\n".join(str(line).lower() for line in lines[min(active_indexes):]) if active_indexes else ""
+    signatures = []
+    if "qmt trader connect failed" in active_region:
+        signatures.append("QMT交易连接失败")
+    if "无法连接行情服务" in active_region or "no provider returned realtime quotes" in active_region:
+        signatures.append("行情服务不可用")
+    if "invalid stockcode" in active_region or "invalid symbol" in active_region:
+        signatures.append("证券代码无效")
     return {
         "error_hits": len(active_indexes),
         "recovered_error_hits": len(recovered_indexes),
         "error_categories": {key: value for key, value in categories.items() if value},
+        "error_signatures": signatures,
     }
 
 
@@ -651,6 +663,9 @@ def _query_account_health_evidence(account: str, token: str) -> str:
             )
             suffix = f"（{category_text}）" if category_text else ""
             lines.append(f"- 当日策略日志：读取 {line_count} 行，存在 {error_hits} 条活跃异常{suffix}，需要检查。")
+            signatures = "、".join(str(item) for item in (log_item.get("error_signatures") or []) if item)
+            if signatures:
+                lines.append(f"- 根因签名：{signatures}。请在对应 Windows QMT 客户端核验登录、交易连接与行情连接。")
         elif recovered_hits:
             lines.append(f"- 当日策略日志：早前 {recovered_hits} 条异常后已有健康心跳，当前按已恢复记录。")
         else:

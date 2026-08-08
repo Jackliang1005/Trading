@@ -61,6 +61,7 @@ def test_log_errors_after_latest_healthy_heartbeat_remain_active():
     assert summary["error_hits"] == 1
     assert summary["recovered_error_hits"] == 0
     assert summary["error_categories"] == {"连接链路": 1}
+    assert summary["error_signatures"] == ["行情服务不可用"]
 
 
 def test_assistant_status_uses_automatic_health_probe_state():
@@ -82,3 +83,22 @@ def test_log_payload_checks_every_file_without_cross_file_recovery():
     assert summary["error_hits"] == 1
     assert summary["recovered_error_hits"] == 0
     assert summary["error_categories"] == {"连接链路": 1}
+
+
+def test_log_payload_surfaces_qmt_root_cause_signatures():
+    summary = service._summarize_log_payload(
+        {
+            "entries": [
+                {
+                    "content": [
+                        "Traceback (most recent call last):",
+                        "RuntimeError: QMT trader connect failed: -1",
+                    ]
+                },
+                {"content": ["Exception: 无法连接行情服务！"]},
+            ]
+        }
+    )
+
+    assert summary["error_hits"] == 2
+    assert summary["error_signatures"] == ["QMT交易连接失败", "行情服务不可用"]
