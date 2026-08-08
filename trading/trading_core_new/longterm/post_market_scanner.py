@@ -258,7 +258,7 @@ def _fallback_row(
 # Heat Rotation helpers
 # ---------------------------------------------------------------------------
 
-_CONCEPT_DB_PATH = Path("/root/qmttrader/concept_db/concepts.db")
+_CONCEPT_DB_PATH = Path("/root/qmttrader_v2/concept_db/concepts.db")
 
 
 def _load_concept_db_date(cursor, trade_date: str) -> str:

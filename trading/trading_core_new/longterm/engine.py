@@ -157,6 +157,9 @@ def _compute_hrs(scan_row: Dict, settings: LongTermSettings) -> float:
 
     When THS heat data is missing (heat_accel=0, sector_mom=0), uses
     neutral defaults (50) so stocks without THS coverage aren't penalized.
+
+    A mainstream sector bonus (0-20) is added to reward stocks in
+    mainstream A-share industry/thematic sectors.
     """
     ha, sm, pt, lq = _hrs_weights(settings)
     heat_accel = float(scan_row.get("heat_accel", 0.0) or 0.0)
@@ -174,6 +177,13 @@ def _compute_hrs(scan_row: Dict, settings: LongTermSettings) -> float:
     # Scale heat_accel into 0-100 (typical range -1 to +2 → 25-100)
     heat_accel_scaled = max(0.0, min(100.0, 50.0 + heat_accel * 20.0))
     score = heat_accel_scaled * ha + sector_mom * sm + price_trend * pt + liquidity * lq
+
+    # Bonus: stocks in mainstream sectors get a lift (0-20 pts)
+    code = str(scan_row.get("code", "") or "").upper()
+    industry = str(scan_row.get("industry", "") or "")
+    sector_bonus = _get_mainstream_sector_bonus(code, industry, scan_row)
+    score += sector_bonus
+
     return round(max(0.0, min(100.0, score)), 3)
 
 
@@ -181,6 +191,84 @@ def _extract_themes_from_scan(scan_row: Dict) -> List[str]:
     """Extract hot concept names from scan row."""
     concepts = list(scan_row.get("ths_hot_concepts", []) or [])
     return [str(c).strip() for c in concepts if str(c).strip()]
+
+
+# ---------------------------------------------------------------------------
+# Mainstream sector quality bonus
+# ---------------------------------------------------------------------------
+
+# 定义主流板块关键词，包括行业板块（申万一级/二级）和热门主题概念
+# 按先行业后主题排列，行业权重大于主题
+_MAINSTREAM_INDUSTRY_KEYWORDS = [
+    # 核心赛道行业
+    "人工智能", "AI", "算力", "半导体", "芯片", "光模块", "CPO", "PCB",
+    "机器人", "人形机器人", "减速器", "传感器",
+    "新能源", "光伏", "储能", "锂电池", "固态电池", "钠离子",
+    "汽车", "智能驾驶", "无人驾驶", "汽车零部件", "一体化压铸",
+    "医药", "创新药", "医疗器械", "CXO", "生物医药", "医药生物", "医疗服务",
+    "消费电子", "MR", "VR", "AR",
+    "军工", "航天", "大飞机", "船舶",
+    "电力", "特高压", "智能电网",
+    "计算机", "软件", "IT服务", "云计算", "大数据",
+    "电子", "元件", "光学",
+    "通信", "5G", "物联网",
+    "传媒", "游戏", "互联网",
+    "机械设备", "专用设备", "通用设备",
+    "化工", "新材料", "稀土",
+    "有色金属", "黄金", "钢铁",
+]
+
+_MAINSTREAM_THEME_KEYWORDS = [
+    "AI算力", "AI应用", "大模型", "多模态",
+    "国产替代", "自主可控", "信创", "鸿蒙", "华为产业链",
+    "低空经济", "飞行汽车", "eVTOL",
+    "出海", "跨境电商",
+    "中特估", "中字头", "高股息",
+    "智能制造", "工业母机", "工业互联网",
+]
+
+
+_STOCK_CODE_TO_NAME_CACHE: Dict[str, str] = {}
+
+
+def _get_mainstream_sector_bonus(code: str, industry: str, scan_row: Dict) -> float:
+    """Compute a sector quality bonus 0-20 for a stock.
+
+    Awards points if the stock's industry or hot concepts match
+    mainstream A-share sector keywords.
+
+    - Industry-level match (core track): +15
+    - Industry-level match (extended): +10
+    - Theme-level match (hot concept): +8
+    - Multiple matches: up to 20 max, with diminishing returns
+    """
+    bonus = 0.0
+    matched_keywords: set = set()
+
+    # 1. Check industry field
+    industry_lower = (industry or "").lower()
+    for kw in _MAINSTREAM_INDUSTRY_KEYWORDS:
+        if kw.lower() in industry_lower and kw not in matched_keywords:
+            bonus += 15.0
+            matched_keywords.add(kw)
+
+    # 2. Check hot concepts from scan
+    concepts = _extract_themes_from_scan(scan_row)
+    for concept in concepts:
+        cl = concept.lower()
+        for kw in _MAINSTREAM_INDUSTRY_KEYWORDS:
+            if kw.lower() in cl and kw not in matched_keywords:
+                bonus += 10.0
+                matched_keywords.add(kw)
+        for kw in _MAINSTREAM_THEME_KEYWORDS:
+            if kw.lower() in cl and kw not in matched_keywords:
+                bonus += 8.0
+                matched_keywords.add(kw)
+
+    # Diminishing returns: cap at 20, second half at half-rate
+    if bonus > 10.0:
+        bonus = 10.0 + (bonus - 10.0) * 0.5
+    return min(20.0, bonus)
 
 
 def _theme_strength(theme_name: str, all_scan_rows: List[Dict]) -> float:
@@ -481,7 +569,8 @@ def mark_to_market(portfolio: PortfolioState, quotes: Dict[str, Dict]) -> Portfo
         last_price = float(quote.get("price", 0) or 0)
         if last_price <= 0:
             last_price = float(item.last_price or item.cost_price)
-        pos.append(replace(item, last_price=last_price))
+        highest_price = max(float(item.highest_price or 0.0), last_price)
+        pos.append(replace(item, last_price=last_price, highest_price=highest_price))
     return PortfolioState(
         as_of=portfolio.as_of,
         initial_capital=portfolio.initial_capital,
@@ -490,6 +579,8 @@ def mark_to_market(portfolio: PortfolioState, quotes: Dict[str, Dict]) -> Portfo
         frozen_cash=portfolio.frozen_cash,
         positions=pos,
         target_weights=dict(portfolio.target_weights),
+        realized_pnl=float(portfolio.realized_pnl),
+        total_fees=float(portfolio.total_fees),
     )
 
 
@@ -501,8 +592,55 @@ def build_rebalance_plan(
     settings: LongTermSettings,
     *,
     rotation_scan: Optional[Dict] = None,
+    history_by_code: Optional[Dict[str, Dict[str, List[float]]]] = None,
 ) -> Tuple[RebalancePlan, PortfolioState]:
     portfolio_mtm = mark_to_market(portfolio, quotes)
+
+    # --- High-tech momentum strategy path ---
+    high_tech_mode = bool(getattr(settings, "high_tech_mode", False))
+    if high_tech_mode and history_by_code is not None:
+        from .high_tech_strategy import (
+            build_high_tech_weights,
+            generate_high_tech_exit_signals,
+        )
+        logger.info("HT: using high-tech momentum strategy")
+        target_weights = build_high_tech_weights(
+            history_by_code=history_by_code,
+            quotes=quotes,
+            settings=settings,
+            portfolio=portfolio_mtm,
+        )
+        if not target_weights:
+            logger.warning("HT: no weights from momentum scoring, keeping current portfolio weights")
+            # 保持现有持仓，不触发大规模卖出
+            nav = max(portfolio_mtm.nav, 1.0)
+            target_weights = {
+                str(p.code).upper(): float(p.market_value) / nav
+                for p in portfolio_mtm.positions if p.quantity > 0
+            }
+            if not target_weights:
+                target_weights = _safe_weight_map(candidates, settings)
+
+        # Generate exit signals (momentum rank drop + stop-loss)
+        exit_signals_list = generate_high_tech_exit_signals(
+            portfolio=portfolio_mtm,
+            history_by_code=history_by_code,
+            quotes=quotes,
+            settings=settings,
+            trade_date=trade_date,
+        )
+
+        source_label = "high-tech-momentum"
+        return _build_rebalance_plan_from_weights(
+            trade_date=trade_date,
+            candidates=candidates,
+            portfolio=portfolio_mtm,
+            quotes=quotes,
+            settings=settings,
+            target_weights=target_weights,
+            extra_sells=exit_signals_list,
+            source_label=source_label,
+        )
 
     rotation_mode = bool(getattr(settings, "rotation_mode", False))
     if rotation_mode and rotation_scan:
@@ -511,6 +649,19 @@ def build_rebalance_plan(
         if not scan_rows:
             scan_rows = list((rotation_scan.get("top_candidates") or []) or [])
 
+        # Portfolio-aware path (new): assess → capital plan → gradual rotation
+        gradual = bool(getattr(settings, "gradual_rotation", True))
+        if gradual:
+            return build_portfolio_aware_plan(
+                trade_date=trade_date,
+                candidates=candidates,
+                portfolio=portfolio_mtm,
+                quotes=quotes,
+                settings=settings,
+                scan_rows=scan_rows,
+            )
+
+        # Legacy rotation path: theme-based weight map + exit signals
         # Detect market trend and adjust max_holdings
         is_bull, effective_holdings = _detect_market_trend(quotes, settings)
         # Temporarily override max_holdings for bear market
@@ -553,6 +704,116 @@ def build_rebalance_plan(
         settings=settings,
         target_weights=target_weights,
         source_label="longterm-sim-engine",
+    )
+
+
+def build_portfolio_aware_plan(
+    trade_date: str,
+    candidates: List[StockCandidate],
+    portfolio: PortfolioState,
+    quotes: Dict[str, Dict],
+    settings: LongTermSettings,
+    scan_rows: List[Dict],
+) -> Tuple[RebalancePlan, PortfolioState]:
+    """Portfolio-aware rebalancing replacing the mechanical rotation path.
+
+    Instead of "dump all non-GEM and reload", this:
+      1. Assesses every holding's quality (keep / trim / exit / gradual_reduce)
+      2. Plans capital deployment (sell → buffer → limited new buys)
+      3. Builds a gradual rotation schedule for non-urgent exits
+      4. Generates the final RebalancePlan with sells first, buys constrained
+    """
+    from .portfolio_manager import (
+        assess_holdings_quality,
+        build_capital_deployment_plan,
+        build_gradual_rotation_schedule,
+    )
+
+    portfolio_mtm = mark_to_market(portfolio, quotes)
+
+    # 1. Assess every holding
+    holding_assessments = assess_holdings_quality(
+        portfolio_mtm, quotes, scan_rows, settings
+    )
+
+    # 2. Detect market trend for effective holdings count
+    is_bull, effective_holdings = _detect_market_trend(quotes, settings)
+    saved_holdings = settings.max_holdings
+    settings.max_holdings = effective_holdings
+    try:
+        candidate_weights = _theme_based_weight_map(candidates, scan_rows, settings)
+    finally:
+        settings.max_holdings = saved_holdings
+    if not candidate_weights:
+        candidate_weights = _safe_weight_map(candidates, settings)
+
+    # 3. Capital deployment plan (sells first → buffer → limited buys)
+    capital_plan = build_capital_deployment_plan(
+        portfolio_mtm, holding_assessments, candidate_weights, settings
+    )
+
+    # 4. Gradual rotation schedule (phase non-urgent exits)
+    rotation_schedule = build_gradual_rotation_schedule(
+        portfolio_mtm, holding_assessments, settings
+    )
+
+    # 5. Build combined target weights from assessments + new candidates
+    nav = max(portfolio_mtm.nav, 1.0)
+    target_weights: Dict[str, float] = {}
+
+    for pos in portfolio_mtm.positions:
+        code = str(pos.code).upper()
+        mv = float(pos.market_value)
+        current_w = mv / nav
+        assessment = holding_assessments.get(code)
+
+        if assessment is None:
+            target_weights[code] = current_w
+        elif assessment.recommendation == "keep":
+            target_weights[code] = current_w
+        elif assessment.recommendation == "trim":
+            target_weights[code] = current_w * (1.0 - assessment.trim_ratio)
+        elif assessment.recommendation == "gradual_reduce":
+            ratio = rotation_schedule.sell_ratio_this_cycle
+            target_weights[code] = current_w * (1.0 - ratio)
+        elif assessment.recommendation == "exit":
+            target_weights[code] = 0.0
+
+    # Add new buys from capital plan
+    for buy in capital_plan.planned_buys:
+        target_weights[buy.code] = buy.target_weight
+
+    # Normalise to respect cash buffer
+    cash_buffer_ratio = float(settings.cash_buffer_ratio)
+    weight_sum = sum(target_weights.values())
+    if weight_sum > (1.0 - cash_buffer_ratio) and weight_sum > 0:
+        scale = (1.0 - cash_buffer_ratio) / weight_sum
+        target_weights = {c: w * scale for c, w in target_weights.items()}
+
+    # 6. Generate rotation exit signals (additional safety net)
+    exit_signals_list = _generate_exit_signals(
+        portfolio_mtm, quotes, scan_rows, settings, trade_date
+    )
+
+    # 7. Collect extra sells: assessment-based + rotation-schedule + exit-signals
+    extra_sells: List[RebalanceActionItem] = (
+        list(capital_plan.planned_sells) + list(rotation_schedule.actions)
+    )
+    existing_sell_codes = {s.code for s in extra_sells}
+    for es in exit_signals_list:
+        if es.code not in existing_sell_codes:
+            extra_sells.append(es)
+
+    # 8. Pass through constraint checker
+    return _build_rebalance_plan_from_weights(
+        trade_date=trade_date,
+        candidates=candidates,
+        portfolio=portfolio_mtm,
+        quotes=quotes,
+        settings=settings,
+        target_weights=target_weights,
+        extra_sells=extra_sells,
+        source_label="portfolio-aware-engine",
     )
 
 
@@ -847,24 +1108,42 @@ def _build_rebalance_plan_from_weights(
 def apply_manual_executions(portfolio: PortfolioState, records: List[ManualExecutionItem]) -> PortfolioState:
     by_code = {item.code: item for item in portfolio.positions}
     cash = float(portfolio.cash)
+    realized_pnl = float(portfolio.realized_pnl)
+    total_fees = float(portfolio.total_fees)
+    as_of = str(portfolio.as_of or "")
 
     for rec in records:
         if rec.quantity <= 0 or rec.price <= 0:
             continue
         code = rec.code.upper()
+        if code == "POS_SYNC":
+            continue
+        as_of = max(as_of, str(rec.trade_date or as_of or ""))
         pos = by_code.get(code)
         if pos is None:
-            pos = SimPosition(code=code, name=rec.name or code, quantity=0, cost_price=rec.price, last_price=rec.price)
+            pos = SimPosition(
+                code=code,
+                name=rec.name or code,
+                quantity=0,
+                cost_price=rec.price,
+                last_price=rec.price,
+                entry_date=str(rec.trade_date or ""),
+                highest_price=rec.price,
+            )
             by_code[code] = pos
         amount = rec.price * rec.quantity
         fee = max(0.0, rec.fee)
+        total_fees += fee
 
         if rec.side == "buy":
             new_qty = pos.quantity + rec.quantity
             new_cost = (pos.cost_price * pos.quantity + amount + fee) / max(new_qty, 1)
+            if pos.quantity <= 0:
+                pos.entry_date = str(rec.trade_date or "")
             pos.quantity = new_qty
             pos.cost_price = round(new_cost, 4)
             pos.last_price = rec.price
+            pos.highest_price = max(float(pos.highest_price or 0.0), rec.price)
             cash -= (amount + fee)
         else:
             sell_qty = min(pos.quantity, rec.quantity)
@@ -873,15 +1152,79 @@ def apply_manual_executions(portfolio: PortfolioState, records: List[ManualExecu
             effective_fee = fee * (float(sell_qty) / float(rec.quantity))
             pos.quantity -= sell_qty
             pos.last_price = rec.price
+            pos.highest_price = max(float(pos.highest_price or 0.0), rec.price)
+            trade_pnl = (rec.price - float(pos.cost_price)) * sell_qty - effective_fee
+            realized_pnl += trade_pnl
+            pos.realized_pnl = round(float(pos.realized_pnl) + trade_pnl, 2)
             cash += (rec.price * sell_qty - effective_fee)
 
     next_positions = [item for item in by_code.values() if item.quantity > 0]
     return PortfolioState(
-        as_of=portfolio.as_of,
+        as_of=as_of or portfolio.as_of,
         initial_capital=portfolio.initial_capital,
         cash=round(cash, 2),
         available_cash=round(max(0.0, cash - float(portfolio.frozen_cash or 0.0)), 2),
         frozen_cash=float(portfolio.frozen_cash or 0.0),
         positions=sorted(next_positions, key=lambda x: x.market_value, reverse=True),
         target_weights=dict(portfolio.target_weights),
+        realized_pnl=round(realized_pnl, 2),
+        total_fees=round(total_fees, 2),
     )
+
+
+def rebuild_portfolio_from_executions(
+    *,
+    initial_capital: float,
+    records: List[ManualExecutionItem],
+    as_of: str,
+    target_weights: Optional[Dict[str, float]] = None,
+) -> PortfolioState:
+    """Rebuild portfolio state from the execution ledger.
+
+    POS_SYNC audit markers are ignored because they are snapshots, not fills.
+    """
+    ordered = sorted(
+        [
+            item for item in records
+            if str(item.code or "").strip().upper() != "POS_SYNC"
+            and int(item.quantity or 0) > 0
+            and float(item.price or 0.0) > 0
+        ],
+        key=lambda x: (str(x.trade_date or ""), str(x.trade_time or ""), str(x.code or "")),
+    )
+    state = PortfolioState(
+        as_of=as_of,
+        initial_capital=float(initial_capital),
+        cash=float(initial_capital),
+        available_cash=float(initial_capital),
+        frozen_cash=0.0,
+        positions=[],
+        target_weights=dict(target_weights or {}),
+    )
+    rebuilt = apply_manual_executions(state, ordered)
+    rebuilt.as_of = as_of
+    return rebuilt
+
+
+def build_execution_records_from_plan(plan: RebalancePlan) -> List[ManualExecutionItem]:
+    """Convert accepted rebalance actions into internal simulated fills."""
+    records: List[ManualExecutionItem] = []
+    for action in sorted(plan.actions, key=lambda x: (0 if x.action == "sell" else 1, -abs(x.estimated_amount))):
+        qty = abs(int(action.delta_shares))
+        price = float(action.reference_price or 0.0)
+        if qty <= 0 or price <= 0:
+            continue
+        records.append(
+            ManualExecutionItem(
+                trade_date=plan.trade_date,
+                code=str(action.code).upper(),
+                name=action.name or action.code,
+                side="buy" if action.action == "buy" else "sell",
+                price=price,
+                quantity=qty,
+                trade_time="",
+                fee=0.0,
+                note=f"auto_rebalance:{plan.plan_id}:{action.reason}"[:200],
+            )
+        )
+    return records

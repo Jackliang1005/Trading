@@ -38,6 +38,7 @@ INVESTOR_DIR = Path(os.environ.get("INVESTOR_ROOT", "/root/.openclaw/workspace/i
 LOG_PATH = INVESTOR_DIR / "logs" / "feishu_webhook.log"
 DEFAULT_FEISHU_TARGET = "ou_f7d5ef82efd4396dea7a604691c56f75"
 OPENCLAW_FEISHU_SEND_TIMEOUT = int(os.environ.get("OPENCLAW_FEISHU_SEND_TIMEOUT", "180"))
+os.environ.setdefault("INVESTOR_FEISHU_TARGET", DEFAULT_FEISHU_TARGET)
 
 FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
 FEISHU_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
@@ -57,6 +58,7 @@ _PAIR_TIMEOUT = 60  # seconds to wait for the counterpart
 # ── investor imports ────────────────────────────────────────
 sys.path.insert(0, str(INVESTOR_DIR))
 from domain.services.feishu_query_service import handle_feishu_query
+from domain.services.qmt_t_workflow_service import get_t_workflow_service
 from domain.services.report_style_service import (
     build_report_card,
     is_diagnostic_message,
@@ -260,6 +262,11 @@ def _is_investor_query(text: str) -> bool:
     if INVESTOR_PREFIX_RE.match(text):
         return True
     return any(k in text for k in INVESTOR_KEYWORDS)
+
+
+def _is_t_workflow_command(text: str) -> bool:
+    value = str(text or "").strip()
+    return value.startswith(("T状态", "T确认", "T回补确认", "T取消"))
 
 
 def _is_longterm_manual_command(text: str) -> bool:
@@ -705,6 +712,18 @@ class Handler(BaseHTTPRequestHandler):
             sent = _send_feishu(sender_id, reply)
             log_line(f"longterm_manual replied={sent} text={text[:60]}")
             self._send_json(200, {"ok": True, "route": "longterm_manual", "replied": sent})
+            return
+
+        # --- route: human-confirmed T workflow (must precede broad investor keywords) ---
+        if _is_t_workflow_command(text):
+            try:
+                reply = get_t_workflow_service().handle_command(text, sender_id)
+            except Exception as exc:
+                reply = f"做T指令处理失败：{type(exc).__name__}: {exc}。未提交任何委托。"
+                log_line(f"t workflow error: {type(exc).__name__}: {exc}")
+            sent = _send_feishu(sender_id, reply)
+            log_line(f"t_workflow replied={sent} sender={sender_id} command={text.split(' ', 1)[0]}")
+            self._send_json(200, {"ok": True, "route": "t_workflow", "replied": sent})
             return
 
         # --- route: investor query ---

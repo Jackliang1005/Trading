@@ -109,6 +109,7 @@ display_title = {
     "investor-closing-brief": "投资助理收盘简报",
     "investor-morning-brief": "投资助理盘前简报",
     "investor-risk-report": "投资助理风险报告",
+    "investor-capability-audit": "投资助理能力审计",
     "investor-predict": "09:30 开盘预测",
     "investor-decision-0935": "09:35 开盘风险检查",
     "investor-decision-1030": "10:30 走势修正",
@@ -140,8 +141,9 @@ diagnostic_elements = [
         ],
     },
     {"tag": "hr"},
-    {"tag": "div", "text": {"tag": "lark_md", "content": f"**Command**\n`{command}`"}},
 ]
+if title != "investor-capability-audit":
+    diagnostic_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**Command**\n`{command}`"}})
 content_elements = [
     {"tag": "div", "text": {"tag": "lark_md", "content": body}},
     {"tag": "note", "elements": [{"tag": "plain_text", "content": f"生成时间：{ended}"}]},

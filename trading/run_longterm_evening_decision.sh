@@ -4,6 +4,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
+# A caller's explicit safety/test overrides must win over dotenv defaults.
+CALLER_NO_PUSH_SET="${NO_PUSH+x}"
+CALLER_NO_PUSH="${NO_PUSH-}"
+CALLER_NO_LLM_SET="${NO_LLM_SCAN+x}"
+CALLER_NO_LLM="${NO_LLM_SCAN-}"
+CALLER_CLEANUP_SET="${LONGTERM_AUTO_CLEANUP+x}"
+CALLER_CLEANUP="${LONGTERM_AUTO_CLEANUP-}"
+CALLER_IGNORE_CALENDAR_SET="${IGNORE_TRADING_CALENDAR+x}"
+CALLER_IGNORE_CALENDAR="${IGNORE_TRADING_CALENDAR-}"
+CALLER_SKIP_SYNC_SET="${SKIP_SYNC_UNIVERSE+x}"
+CALLER_SKIP_SYNC="${SKIP_SYNC_UNIVERSE-}"
+CALLER_DATA_DIR_SET="${LONGTERM_DATA_DIR+x}"
+CALLER_DATA_DIR="${LONGTERM_DATA_DIR-}"
+
 if [[ -f "$ROOT_DIR/.env.longterm" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -11,14 +25,29 @@ if [[ -f "$ROOT_DIR/.env.longterm" ]]; then
   set +a
 fi
 
+if [[ "$CALLER_NO_PUSH_SET" == "x" ]]; then export NO_PUSH="$CALLER_NO_PUSH"; fi
+if [[ "$CALLER_NO_LLM_SET" == "x" ]]; then export NO_LLM_SCAN="$CALLER_NO_LLM"; fi
+if [[ "$CALLER_CLEANUP_SET" == "x" ]]; then export LONGTERM_AUTO_CLEANUP="$CALLER_CLEANUP"; fi
+if [[ "$CALLER_IGNORE_CALENDAR_SET" == "x" ]]; then export IGNORE_TRADING_CALENDAR="$CALLER_IGNORE_CALENDAR"; fi
+if [[ "$CALLER_SKIP_SYNC_SET" == "x" ]]; then export SKIP_SYNC_UNIVERSE="$CALLER_SKIP_SYNC"; fi
+if [[ "$CALLER_DATA_DIR_SET" == "x" ]]; then export LONGTERM_DATA_DIR="$CALLER_DATA_DIR"; fi
+
+export DISABLE_FILE_LOGGING="${DISABLE_FILE_LOGGING:-1}"
+
 notify_failure() {
   local exit_code="$1"
   local line_no="$2"
   local run_date="${DATE_ARG:-$(date +%F)}"
-  local msg="【长线任务失败】evening-decision ${run_date} exit=${exit_code} line=${line_no} host=$(hostname)"
-  python3 - <<PY || true
-from trading_core_new.longterm.notifier import push_feishu_text
-push_feishu_text(${msg@Q})
+  local msg="日期：${run_date}
+任务：长线收盘复盘
+退出码：${exit_code}
+故障行：${line_no}
+主机：$(hostname)"
+  OPENCLAW_FAILURE_MESSAGE="$msg" python3 - <<'PY' || true
+import os
+from trading_core_new.longterm.notifier import build_diagnostic_card, push_feishu_rich
+message = os.environ.get("OPENCLAW_FAILURE_MESSAGE", "")
+push_feishu_rich(message, card=build_diagnostic_card("长线收盘复盘失败", message), diagnostic=True)
 PY
 }
 

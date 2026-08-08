@@ -76,3 +76,24 @@ def last_trading_day(before_date: Optional[str] = None) -> str:
 
     # Fallback: return original date
     return (datetime.strptime(str(before_date)[:10], "%Y-%m-%d") if before_date else datetime.now()).strftime("%Y-%m-%d")
+
+
+def next_trading_day(after_date: Optional[str] = None) -> str:
+    """Return the next trading day on or after the given date.
+
+    Walks forward from after_date (default: today) until a trading day is found.
+    """
+    if after_date:
+        dt = datetime.strptime(str(after_date).strip()[:10], "%Y-%m-%d")
+    else:
+        dt = datetime.now()
+
+    for _ in range(30):
+        ds = dt.strftime("%Y-%m-%d")
+        is_open, _ = is_cn_trading_day(ds)
+        if is_open:
+            return ds
+        dt = dt + timedelta(days=1)
+
+    # Fallback: return +1 weekday
+    return (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")

@@ -451,13 +451,13 @@ journalctl -u feishu-webhook -f   # 实时日志
 
 ## Packet 日常维护快照（自动生成）
 
-- 同步时间：2026-07-20 18:31:01
-- run_at：2026-07-20T18:31:01
+- 同步时间：2026-08-07 18:31:01
+- run_at：2026-08-07T18:31:01
 - dry_run：False
 - force：False
 - limits：daily_close=200 intraday=200
-- merged：processed=97 success=0 skipped_already_backfilled=97 failed=0
-- coverage_before：research_packets=404 portfolio_snapshots=106 packet_dates=85 portfolio_dates=85
-- coverage_after：research_packets=404 portfolio_snapshots=106 packet_dates=85 portfolio_dates=85
+- merged：processed=117 success=0 skipped_already_backfilled=117 failed=0
+- coverage_before：research_packets=484 portfolio_snapshots=126 packet_dates=100 portfolio_dates=100
+- coverage_after：research_packets=484 portfolio_snapshots=126 packet_dates=100 portfolio_dates=100
 
 <!-- packet-maintenance:end -->

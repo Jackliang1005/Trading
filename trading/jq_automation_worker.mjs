@@ -136,6 +136,36 @@ async function main() {
   });
   await context.addCookies(cookies);
   const page = await context.newPage();
+  const apiEvents = [];
+
+  page.on('response', async (response) => {
+    const url = response.url();
+    if (!url.includes('joinquant.com')) return;
+    if (!/backtest|algorithm|simulate|paper|run/i.test(url)) return;
+    if (apiEvents.length >= 60) return;
+
+    const headers = response.headers ? response.headers() : {};
+    const contentType = String(headers['content-type'] || headers['Content-Type'] || '');
+    const event = {
+      url,
+      status: response.status(),
+      method: response.request().method(),
+      content_type: contentType,
+    };
+    try {
+      if (contentType.includes('json') || contentType.includes('text')) {
+        const text = await response.text();
+        event.body_excerpt = String(text || '').slice(0, 600);
+        const idMatch = event.body_excerpt.match(/backtestId["'=:\s]+([A-Za-z0-9_-]+)/i);
+        if (idMatch) {
+          event.backtest_id = idMatch[1];
+        }
+      }
+    } catch (e) {
+      event.read_error = e.message;
+    }
+    apiEvents.push(event);
+  });
 
   try {
     // ─── Step 1: 打开策略编辑页 ───
@@ -282,6 +312,7 @@ async function main() {
     const beforeUrl = page.url();
     await triggerBacktest();
     console.log('Backtest trigger sent');
+    writeStatus({ recent_api_events_after_trigger: apiEvents.slice(-12) });
 
     // 等待页面响应: 导航到 detail 页 或 弹窗 或 错误
     await page.waitForTimeout(3000);
@@ -334,12 +365,13 @@ async function main() {
       // 尝试直接导航到回测列表
       await page.goto('https://www.joinquant.com/algorithm/backtest/list', { waitUntil: 'networkidle', timeout: 15000 });
       await page.waitForTimeout(2000);
-      // 看有没有正在运行的回测
-      const hasRunning = await page.evaluate(() => {
-        const text = document.body ? document.body.innerText || '' : '';
-        return text.includes('运行中') || text.includes('排队中');
-      });
-      console.log(`Backtest list page — has running: ${hasRunning}`);
+      const listSnapshot = await inspectBacktestList(page);
+      console.log(`Backtest list page — has running: ${listSnapshot.hasRunning}, rows=${listSnapshot.rowCount}, links=${listSnapshot.detailLinks.length}`);
+      if (listSnapshot.bodyExcerpt) {
+        writeStatus({ list_page_excerpt_after_trigger: listSnapshot.bodyExcerpt });
+      }
+      const enteredDetail = await openLatestBacktestDetail(page);
+      console.log(`Entered detail after trigger: ${enteredDetail}`);
     }
 
     // 关闭可能残留的弹窗
@@ -355,6 +387,20 @@ async function main() {
     while (Date.now() - startTime < timeoutMs) {
       pollCount++;
       await page.waitForTimeout(9000);
+
+      // 每次轮询前先关闭任何弹窗（新建模拟交易等）
+      await dismissModals(page);
+      await page.keyboard.press('Escape').catch(() => {});
+      // 无脑点所有可见的「取消」按钮来关闭弹窗
+      await page.evaluate(() => {
+        const allBtns = document.querySelectorAll('button, a.btn, .ant-btn, [role="button"]');
+        for (const b of allBtns) {
+          const t = (b.innerText || b.textContent || '').trim();
+          if (t === '取消' || t === '×' || t === 'x' || t === 'X' || t === '关闭') {
+            if (b.offsetParent !== null) { b.click(); return; }  // 只点可见按钮
+          }
+        }
+      }).catch(() => {});
 
       const currentUrl = page.url();
       // 如果在编辑页，尝试去回测列表页
@@ -381,19 +427,16 @@ async function main() {
         }
       }
 
-      // 如果在列表页，点击第一个回测结果进入详情
+      // 如果在列表页，尽量进入最新回测详情页
       const onListPage = page.url().includes('backtest/list');
       if (onListPage) {
-        // Try clicking the first backtest result to get to detail page
-        try {
-          await page.evaluate(() => {
-            const links = document.querySelectorAll('a[href*="backtest/detail"]');
-            if (links.length > 0) {
-              links[0].click();
-            }
-          });
-          await page.waitForTimeout(3000);
-        } catch (e) {}
+        const listSnapshot = await inspectBacktestList(page);
+        writeStatus({
+          [`list_excerpt_poll_${pollCount}`]: listSnapshot.bodyExcerpt,
+          [`list_links_poll_${pollCount}`]: listSnapshot.detailLinks.slice(0, 10),
+        });
+        const enteredDetail = await openLatestBacktestDetail(page);
+        console.log(`  Poll #${pollCount}: on list page, entered detail=${enteredDetail}, rows=${listSnapshot.rowCount}, links=${listSnapshot.detailLinks.length}`);
       }
 
       // 探针
@@ -431,6 +474,9 @@ async function main() {
       });
 
       writeStatus({ metrics: probe.metrics, running_elapsed_sec: Math.round((Date.now() - startTime) / 1000), url: probe.url });
+      if (pollCount <= 3) {
+        writeStatus({ [`api_events_poll_${pollCount}`]: apiEvents.slice(-12) });
+      }
 
       console.log(`  Poll #${pollCount}: ${Math.round((Date.now() - startTime) / 1000)}s, running=${probe.hasRunningHint}, complete=${probe.hasCompleteHint}, failed=${probe.hasFailedHint}, runtime=${probe.hasRuntimeHint}, url=${probe.url?.slice(0, 80)}`);
 
@@ -599,6 +645,111 @@ async function scrapeLog(page) {
   });
 }
 
+async function inspectBacktestList(page) {
+  return await page.evaluate(() => {
+    const body = document.body ? (document.body.innerText || document.body.textContent || '') : '';
+    const anchors = [...document.querySelectorAll('a[href]')];
+    const detailLinks = anchors
+      .map(a => a.href || '')
+      .filter(href => href.includes('backtest/detail'))
+      .slice(0, 20);
+    const rowSelectors = [
+      'tr',
+      '.ant-table-row',
+      '.ant-list-item',
+      '.backtest-item',
+      '.backtest-card',
+      '[class*="backtest"]',
+      '[class*="Backtest"]',
+    ];
+    let rowCount = 0;
+    for (const selector of rowSelectors) {
+      const count = document.querySelectorAll(selector).length;
+      if (count > rowCount) rowCount = count;
+    }
+    return {
+      hasRunning: /运行中|排队中|提交中|等待执行|正在回测/.test(body),
+      detailLinks,
+      rowCount,
+      bodyExcerpt: body.slice(0, 3000),
+    };
+  });
+}
+
+async function openLatestBacktestDetail(page) {
+  const methods = [
+    async () => {
+      const link = page.locator('a[href*="backtest/detail"]').first();
+      if (await link.count()) {
+        await link.click({ timeout: 5000 });
+        return true;
+      }
+      return false;
+    },
+    async () => {
+      const detailText = page.locator('a,button').filter({ hasText: /详情|查看详情|结果|日志/ }).first();
+      if (await detailText.count()) {
+        await detailText.click({ timeout: 5000 });
+        return true;
+      }
+      return false;
+    },
+    async () => {
+      return await page.evaluate(() => {
+        const link = document.querySelector('a[href*="backtest/detail"]');
+        if (link) {
+          link.click();
+          return true;
+        }
+        const detailNode = [...document.querySelectorAll('a,button,span,div')]
+          .find(node => {
+            const text = (node.innerText || node.textContent || '').trim();
+            return text.includes('详情') || text.includes('查看详情') || text.includes('结果');
+          });
+        if (detailNode) {
+          detailNode.click();
+          return true;
+        }
+        const clickableRow = [...document.querySelectorAll('tr, .ant-table-row, .ant-list-item, .backtest-item, .backtest-card')]
+          .find(node => {
+            const text = (node.innerText || node.textContent || '').trim();
+            return text && (text.includes('回测') || text.includes('策略') || text.includes('运行'));
+          });
+        if (clickableRow) {
+          clickableRow.click();
+          return true;
+        }
+        return false;
+      });
+    },
+  ];
+
+  for (const method of methods) {
+    try {
+      const clicked = await method();
+      if (!clicked) continue;
+      await page.waitForTimeout(3000);
+      if (page.url().includes('backtest/detail')) {
+        return true;
+      }
+      const href = await page.evaluate(() => {
+        const link = document.querySelector('a[href*="backtest/detail"]');
+        return link ? link.href : '';
+      });
+      if (href) {
+        await page.goto(href, { waitUntil: 'networkidle', timeout: 15000 });
+        await page.waitForTimeout(1000);
+        if (page.url().includes('backtest/detail')) {
+          return true;
+        }
+      }
+    } catch (e) {
+      console.log(`  openLatestBacktestDetail method failed: ${e.message}`);
+    }
+  }
+  return false;
+}
+
 /** 关闭各类弹窗 */
 async function dismissModals(page) {
   // 新手指引: 「使用Python语言编辑策略」
@@ -655,21 +806,30 @@ async function dismissModals(page) {
   // 模拟交易弹窗 (backtest detail page)
   try {
     await page.evaluate(() => {
-      const modals = document.querySelectorAll('.modal, .ant-modal-wrap, .ant-modal');
-      for (const m of modals) {
-        const text = m.innerText || m.textContent || '';
-        if (text.includes('模拟交易') || text.includes('新建模拟交易') || text.includes('无可用模拟交易位')) {
-          const buttons = m.querySelectorAll('button');
-          for (const btn of buttons) {
-            const txt = btn.innerText || btn.textContent || '';
-            if (txt.includes('取消')) {
-              btn.click(); return;
+      // 宽泛选择器: 覆盖各种可能的弹窗结构
+      const selectors = [
+        '.modal', '.ant-modal-wrap', '.ant-modal', '.modal-dialog',
+        '.getNewAlgorithmDialog', '#myModal', '[class*="modal"]',
+        '[role="dialog"]', '.popup', '.overlay',
+      ];
+      for (const sel of selectors) {
+        const modals = document.querySelectorAll(sel);
+        for (const m of modals) {
+          const text = (m.innerText || m.textContent || '');
+          if (text.includes('模拟交易') || text.includes('新建模拟交易') || text.includes('无可用模拟交易位')) {
+            // 找取消按钮
+            const allButtons = m.querySelectorAll('button, a.btn, .ant-btn, [role="button"]');
+            for (const btn of allButtons) {
+              const txt = (btn.innerText || btn.textContent || '').trim();
+              if (txt === '取消' || txt.includes('取消')) {
+                btn.click(); return;
+              }
             }
-          }
-          // Also try clicking the X close button
-          const closeBtns = m.querySelectorAll('.ant-modal-close, .close, [aria-label="Close"]');
-          for (const cb of closeBtns) {
-            try { cb.click(); return; } catch(e) {}
+            // 找关闭图标
+            const closeIcons = m.querySelectorAll('.close, .ant-modal-close, [aria-label="Close"], [aria-label="关闭"]');
+            for (const c of closeIcons) {
+              try { c.click(); return; } catch(_) {}
+            }
           }
         }
       }

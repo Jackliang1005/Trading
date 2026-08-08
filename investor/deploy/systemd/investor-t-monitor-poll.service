@@ -1,5 +1,5 @@
 [Unit]
-Description=Investor read-only T-monitor poll
+Description=Investor deduplicated T-monitor proposal push (live trading disabled by default)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/root/.openclaw/workspace/investor
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/root/.openclaw/workspace/investor/.env
+Environment=INVESTOR_T_LIVE_ENABLED=0
 ExecStart=/root/.openclaw/workspace/investor/deploy/systemd/run_t_monitor_poll.sh
 StandardOutput=append:/root/.openclaw/workspace/investor/logs/t_monitor_poll.log
 StandardError=append:/root/.openclaw/workspace/investor/logs/t_monitor_poll_error.log

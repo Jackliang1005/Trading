@@ -5,17 +5,33 @@ import json
 import logging
 import os
 import re
+import sys
+import tempfile
 from collections import defaultdict
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+from shared_report_card_renderer import build_feishu_report_card
+
 from .data_source import OpenClawChinaStockDataSource
-from .engine import apply_manual_executions, build_rebalance_plan, _generate_exit_signals, _theme_based_weight_map
+from .engine import (
+    apply_manual_executions,
+    build_execution_records_from_plan,
+    build_rebalance_plan,
+    rebuild_portfolio_from_executions,
+    _generate_exit_signals,
+    _theme_based_weight_map,
+)
 from .llm_advisor import build_evening_decision, build_morning_decision, build_quality_improvement_advice
 from .llm_runtime import chat_vision_json
-from .models import LongTermSettings, ManualExecutionItem, StockCandidate
+from .models import LongTermSettings, ManualExecutionItem, PortfolioState, SimPosition, StockCandidate
 from .notifier import push_feishu_rich
+from .ninedb import build_trade_orders, load_9db_config, parse_9db_url, save_9db_config, submit_trade_orders
 from .industry_normalizer import normalize_industry_name, normalize_industry_with_concepts
 from .industry_policy import industry_cap_for, theme_cap_for
 from .industry_normalizer import extract_themes
@@ -25,18 +41,26 @@ from .post_market_scanner import (
 )
 from .repository import LongTermRepository
 from .trading_calendar import is_cn_trading_day, last_trading_day
+from .intraday_monitor import IntradayMonitor, MonitorConfig
 
 LONGTERM_MANUAL_COMMAND_RE = re.compile(r"^\s*/?(长线成交|长线执行|长线回填|线成交)\b", re.IGNORECASE)
 LONGTERM_MANUAL_INLINE_RE = re.compile(r"^\s*/?长线\s+(?:\d{4}-\d{2}-\d{2}\s+)?(买|买入|卖|卖出|buy|sell|b|s)\b", re.IGNORECASE)
 LONGTERM_MANUAL_HELP_RE = re.compile(r"^\s*/?(长线帮助|长线命令)\b", re.IGNORECASE)
+LONGTERM_POSITION_SYNC_RE = re.compile(r"^\s*/?(更新持仓|同步持仓)\b", re.IGNORECASE)
+TIME_ONLY_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
 def _configure_logging() -> None:
     root = logging.getLogger()
     if root.handlers:
         return
-    log_dir = Path(__file__).resolve().parents[2] / "trading_data" / "longterm" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     level_name = str((os.getenv("LONGTERM_LOG_LEVEL", "INFO")) or "INFO").upper().strip()
     level = getattr(logging, level_name, logging.INFO)
     formatter = logging.Formatter(
@@ -47,12 +71,23 @@ def _configure_logging() -> None:
     stream_handler.setFormatter(formatter)
     root.setLevel(level)
     root.addHandler(stream_handler)
-    try:
-        file_handler = logging.FileHandler(log_dir / "longterm.log", encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
-    except OSError:
-        root.warning("longterm file logger disabled: path=%s", log_dir / "longterm.log")
+    log_candidates = []
+    env_log_dir = str(os.getenv("LONGTERM_LOG_DIR", "") or "").strip()
+    if env_log_dir:
+        log_candidates.append(Path(env_log_dir).expanduser())
+    log_candidates.append(Path(__file__).resolve().parents[2] / "trading_data" / "longterm" / "logs")
+    log_candidates.append(Path(tempfile.gettempdir()) / "openclaw-longterm" / "logs")
+
+    for log_dir in log_candidates:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_dir / "longterm.log", encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+            return
+        except OSError:
+            continue
+    root.warning("longterm file logger disabled: no writable log directory found")
 
 
 def _load_manual_file(path: Path) -> List[ManualExecutionItem]:
@@ -70,7 +105,12 @@ def is_feishu_manual_command(text: str) -> bool:
         LONGTERM_MANUAL_COMMAND_RE.match(raw)
         or LONGTERM_MANUAL_INLINE_RE.match(raw)
         or LONGTERM_MANUAL_HELP_RE.match(raw)
+        or LONGTERM_POSITION_SYNC_RE.match(raw)
     )
+
+
+def is_feishu_position_sync_command(text: str) -> bool:
+    return bool(LONGTERM_POSITION_SYNC_RE.match(str(text or "").strip()))
 
 
 def build_feishu_manual_command_help() -> str:
@@ -85,6 +125,18 @@ def build_feishu_manual_command_help() -> str:
         "/长线成交\n"
         "买入 600120 1000 5.69 浙江东方 fee=1.2\n"
         "卖出 688316 200 70 青云科技-U"
+    )
+
+
+def build_feishu_position_sync_help() -> str:
+    return (
+        "📸 更新持仓 — 上传券商持仓截图，自动同步持仓和现金\n\n"
+        "用法: /更新持仓 [截图]  (或 /同步持仓)\n"
+        "支持飞书直接上传图片后发命令，或先发命令再上传图片。\n\n"
+        "截图应包含:\n"
+        "  - 持仓列表（代码/名称/数量/成本价/现价）\n"
+        "  - 可用资金 / 总资产\n\n"
+        "系统将自动识别并以截图为权威直接覆盖同步长线组合持仓和现金。"
     )
 
 
@@ -119,8 +171,11 @@ def _parse_manual_command_record(line: str, *, default_date: str) -> ManualExecu
     if not tokens:
         raise ValueError("empty_record")
     trade_date = default_date
+    trade_time = ""
     if _is_iso_trade_date(tokens[0]):
         trade_date = tokens.pop(0)
+    if tokens and TIME_ONLY_RE.match(tokens[0]):
+        trade_time = f"{trade_date} {tokens.pop(0)}"
     if len(tokens) < 4:
         raise ValueError(f"invalid_record:{line}")
     side = _normalize_manual_side(tokens[0])
@@ -163,6 +218,7 @@ def _parse_manual_command_record(line: str, *, default_date: str) -> ManualExecu
         side=side,
         price=price,
         quantity=quantity,
+        trade_time=trade_time,
         fee=fee,
         note=" ".join([x for x in note_parts if str(x).strip()]).strip(),
     )
@@ -204,10 +260,63 @@ def _apply_manual_records(
     repo.append_manual_executions(records)
     repo.save_portfolio(next_state)
     snapshot_path = repo.save_investor_snapshot(_build_investor_snapshot(repo, source=source))
+    ninedb_sync = _sync_manual_records_to_9db(repo, records)
     return {
         "records_count": len(records),
         "portfolio": next_state,
         "snapshot_path": snapshot_path,
+        "ninedb_sync": ninedb_sync,
+    }
+
+
+def _build_review_plan(repo: LongTermRepository, trade_date: str) -> tuple:
+    universe = repo.load_universe()
+    portfolio = repo.load_portfolio()
+    settings = repo.load_settings()
+    data_source = OpenClawChinaStockDataSource()
+    code_set = {item.code.upper() for item in universe} | {item.code.upper() for item in portfolio.positions}
+    market_index = str(getattr(settings, "market_trend_index", "") or "").strip().upper()
+    if market_index:
+        code_set.add(market_index)
+    codes = sorted(code_set)
+    quotes = data_source.fetch_quotes(codes) if codes else {}
+    rotation_scan = repo.load_latest_post_market_scan() if bool(getattr(settings, "rotation_mode", False)) else None
+    history_by_code_arg = None
+    if bool(getattr(settings, "high_tech_mode", False)) and codes:
+        history_by_code_arg = data_source.fetch_batch_daily_history(
+            codes, lookback_days=int(getattr(settings, "ht_lookback_days", 20) or 20) + 10,
+        )
+    plan, mtm_portfolio = build_rebalance_plan(
+        trade_date=trade_date,
+        candidates=universe,
+        portfolio=portfolio,
+        quotes=quotes,
+        settings=settings,
+        rotation_scan=rotation_scan,
+        history_by_code=history_by_code_arg,
+    )
+    return plan, mtm_portfolio
+
+
+def _sync_manual_records_to_9db(repo: LongTermRepository, records: List[ManualExecutionItem]) -> dict:
+    filtered = [
+        item for item in records
+        if str(item.code or "").strip().upper() != "POS_SYNC"
+        and int(item.quantity or 0) > 0
+        and float(item.price or 0.0) > 0
+    ]
+    config = load_9db_config(repo.ninedb_config_file)
+    if not config:
+        return {"enabled": False, "ok": False, "submitted_count": 0, "error": "9db not configured"}
+    orders = build_trade_orders(filtered)
+    result = submit_trade_orders(config, orders)
+    return {
+        "enabled": True,
+        "ok": bool(result.get("ok")),
+        "submitted_count": int(result.get("submitted_count", 0) or 0),
+        "error": str(result.get("error", "") or ""),
+        "attempts": int(result.get("attempts", 0) or 0),
+        "order_name": str(config.get("order_name", "") or ""),
     }
 
 
@@ -216,6 +325,8 @@ def handle_feishu_manual_command(text: str, repo: LongTermRepository | None = No
     raw = str(text or "").strip()
     if LONGTERM_MANUAL_HELP_RE.match(raw):
         return build_feishu_manual_command_help()
+    if LONGTERM_POSITION_SYNC_RE.match(raw):
+        return build_feishu_position_sync_help()
     repo = repo or LongTermRepository()
     repo.init_if_missing()
     latest_plan = repo.load_latest_plan() or {}
@@ -240,6 +351,14 @@ def handle_feishu_manual_command(text: str, repo: LongTermRepository | None = No
             f"- {item.trade_date} {side_text} {item.code} qty={int(item.quantity)} px={float(item.price):.3f} {item.name}{fee}{note}"
         )
     lines.append(f"investor_snapshot: {result['snapshot_path']}")
+    ninedb = result.get("ninedb_sync", {}) or {}
+    if ninedb.get("enabled"):
+        lines.append(
+            f"9db_sync: {'ok' if ninedb.get('ok') else 'failed'} "
+            f"submitted={int(ninedb.get('submitted_count', 0) or 0)} "
+            f"attempts={int(ninedb.get('attempts', 0) or 0)} "
+            f"error={str(ninedb.get('error', '') or '-')}"
+        )
     return "\n".join(lines)
 
 
@@ -394,6 +513,11 @@ def _build_investor_snapshot(repo: LongTermRepository, *, source: str) -> dict:
             "available_cash": round(float(portfolio.available_cash), 2),
             "frozen_cash": round(float(portfolio.frozen_cash), 2),
             "cash_ratio": round((float(portfolio.cash) / nav) if nav > 0 else 0.0, 6),
+            "realized_pnl": round(float(portfolio.realized_pnl), 2),
+            "unrealized_pnl": round(float(portfolio.unrealized_pnl), 2),
+            "total_pnl": round(float(portfolio.total_pnl), 2),
+            "total_return_pct": round(float(portfolio.total_return_pct), 6),
+            "total_fees": round(float(portfolio.total_fees), 2),
             "holdings_count": len(holdings),
             "top_positions": [
                 {
@@ -404,6 +528,10 @@ def _build_investor_snapshot(repo: LongTermRepository, *, source: str) -> dict:
                     "last_price": float(item.last_price),
                     "market_value": round(float(item.market_value), 2),
                     "weight": round((float(item.market_value) / nav) if nav > 0 else 0.0, 6),
+                    "unrealized_pnl": round(float(item.unrealized_pnl), 2),
+                    "unrealized_pnl_pct": round(float(item.unrealized_pnl_pct), 6),
+                    "entry_date": str(item.entry_date or ""),
+                    "highest_price": round(float(item.highest_price or 0.0), 3),
                 }
                 for item in holdings[:15]
             ],
@@ -523,6 +651,13 @@ def cmd_run_review(args: argparse.Namespace) -> int:
         settings.max_portfolio_drawdown = float(args.max_portfolio_drawdown)
 
     rotation_scan = getattr(args, "rotation_scan", None)
+    # High-tech mode: fetch history_by_code for momentum scoring
+    history_by_code_arg = None
+    if bool(getattr(settings, "high_tech_mode", False)):
+        # 使用近期数据（不含 end_date），实时行情将补齐最新价格
+        history_by_code_arg = data_source.fetch_batch_daily_history(
+            codes, lookback_days=int(getattr(settings, "ht_lookback_days", 20) or 20) + 10,
+        )
     plan, mtm_portfolio = build_rebalance_plan(
         trade_date=trade_date,
         candidates=universe,
@@ -530,6 +665,7 @@ def cmd_run_review(args: argparse.Namespace) -> int:
         quotes=quotes,
         settings=settings,
         rotation_scan=rotation_scan,
+        history_by_code=history_by_code_arg,
     )
     path = repo.save_plan(plan)
     repo.save_portfolio(mtm_portfolio)
@@ -595,6 +731,7 @@ def _extract_trades_from_image(image_path: Path, trade_date: str) -> List[Manual
                 side=side,
                 price=price,
                 quantity=quantity,
+                trade_time="",
                 fee=0.0,
                 note="image_ocr",
             ))
@@ -636,7 +773,472 @@ def cmd_apply_manual_from_image(args: argparse.Namespace) -> int:
     next_state = result["portfolio"]
     print(f"\napplied {int(result['records_count'])} records")
     print(f"nav: {next_state.nav:,.2f}  cash: {next_state.cash:,.2f}  holdings: {len(next_state.positions)}")
+    ninedb = result.get("ninedb_sync", {}) or {}
+    print(
+        f"9db_sync: {'ok' if ninedb.get('ok') else 'skipped' if not ninedb.get('enabled') else 'failed'} "
+        f"submitted={int(ninedb.get('submitted_count', 0) or 0)} "
+        f"error={str(ninedb.get('error', '') or '-')}"
+    )
     return 0
+
+
+def _extract_positions_from_image(image_path: Path) -> dict:
+    """Use vision LLM to extract holdings + cash from a brokerage position screenshot.
+
+    After OCR extraction, validates stock codes by cross-checking with real-time quotes.
+    If the quoted price differs from the OCR market_price by > 50% (or if the quote
+    returns a wildly different price for the given code), the code is likely OCR-misread.
+    The fix attempts a name-based code lookup via Tencent quotes.
+    """
+    system_prompt = (
+        "你是一个证券持仓截图信息提取工具。从用户提供的截图/图片中提取持仓和资金信息。\n"
+        "返回严格的 JSON 格式，不要增加任何额外文字：\n"
+        "{\n"
+        "  \"positions\": [\n"
+        "    {\"code\": \"6位代码\", \"name\": \"股票名称\", \"quantity\": 整数股数, "
+        "\"cost_price\": 成本价, \"market_price\": 现价}\n"
+        "  ],\n"
+        "  \"available_cash\": 可用资金,\n"
+        "  \"total_assets\": 总资产,\n"
+        "  \"frozen_cash\": 冻结资金(找不到填0)\n"
+        "}\n"
+        "规则：\n"
+        "1. code 必须是纯 6 位数字字符串，如 \"300475\"\n"
+        "2. quantity 必须是整数\n"
+        "3. cost_price / market_price / available_cash / total_assets 保留小数精度\n"
+        "4. 如果找不到某字段，填 0 或空数组 []\n"
+        "5. 不需要推断缺失的数据，只提取图中明确显示的\n"
+        "6. 注意区分\"可用资金\"和\"总资产\"，两者通常不同\n"
+        "7. 持仓表格通常有：证券代码、证券名称、持仓数量、成本价、现价等列\n"
+        "8. ⚠️ 代码识别准确率至关重要！注意：\n"
+        "   - 科创板(688xxx)和创业板(300xxx/301xxx)的代码容易混淆\n"
+        "   - 请逐位核对数字，特别是第1-3位（市场前缀）\n"
+        "   - 香农芯创是 300475（创业板），不是 688327（科创板）\n"
+        "   - 天孚通信是 300394（创业板），不是 603025（沪市）\n"
+        "   - 如果不确定，优先检查截图上是否标注了\"创\"或\"科创\"字样"
+    )
+    user_text = "请提取截图中的持仓列表和资金信息"
+    result = chat_vision_json(image_path=image_path, system_prompt=system_prompt, user_text=user_text)
+    if not result:
+        return {"positions": [], "available_cash": 0.0, "total_assets": 0.0, "frozen_cash": 0.0}
+    positions_raw = result.get("positions", [])
+    if not isinstance(positions_raw, list):
+        positions_raw = []
+    positions: list[dict] = []
+    for item in positions_raw:
+        try:
+            code = str(item.get("code", "") or "").strip()
+            if not code or len(code) != 6 or not code.isdigit():
+                continue
+            quantity = int(item.get("quantity", 0) or 0)
+            if quantity <= 0:
+                continue
+            name = str(item.get("name", "") or "").strip() or code
+            cost_price = float(item.get("cost_price", 0) or 0)
+            market_price = float(item.get("market_price", 0) or 0)
+            if cost_price <= 0 and market_price <= 0:
+                continue
+            if cost_price <= 0:
+                cost_price = market_price
+            if market_price <= 0:
+                market_price = cost_price
+            positions.append({
+                "code": code,
+                "name": name,
+                "quantity": quantity,
+                "cost_price": cost_price,
+                "market_price": market_price,
+            })
+        except (TypeError, ValueError):
+            continue
+
+    # ── Code validation: cross-check with real-time quotes ──────────────
+    try:
+        from .data_source import OpenClawChinaStockDataSource
+        ds = OpenClawChinaStockDataSource()
+        ocr_codes = [p["code"] for p in positions]
+        if ocr_codes:
+            live_quotes = ds.fetch_quotes(ocr_codes)
+            for idx, pos in enumerate(positions):
+                code = pos["code"]
+                q = live_quotes.get(code, {}) or {}
+                live_price = float(q.get("price", 0) or 0)
+                live_name = str(q.get("name", "") or "").strip()
+                ocr_price = pos["market_price"]
+                ocr_name = pos["name"]
+
+                # If live price is available, validate it against OCR market_price
+                if live_price > 0 and ocr_price > 0:
+                    ratio = ocr_price / max(live_price, 0.01)
+                    # If the prices differ by more than 50% (ratio < 0.5 or > 2), the code may be OCR-misread
+                    if not (0.5 <= ratio <= 2.0):
+                        logger.warning(
+                            "position_sync: OCR code %s (name=%s) price mismatch: "
+                            "ocr=%.2f vs live=%.2f (ratio=%.2f), attempting correction",
+                            code, ocr_name, ocr_price, live_price, ratio,
+                        )
+                        corrected_code = _correct_stock_code(code, ocr_price, ocr_name, ds)
+                        if corrected_code and corrected_code != code:
+                            logger.info("position_sync: corrected code %s→%s", code, corrected_code)
+                            positions[idx]["code"] = corrected_code
+                            # Re-fetch quote for corrected code to update market_price
+                            new_q = ds.fetch_quotes([corrected_code]).get(corrected_code, {}) or {}
+                            new_px = float(new_q.get("price", 0) or 0)
+                            new_name = str(new_q.get("name", "") or "").strip()
+                            if new_px > 0:
+                                positions[idx]["market_price"] = round(new_px, 3)
+                            if new_name:
+                                positions[idx]["name"] = new_name
+                elif live_price > 0 and ocr_price <= 0:
+                    # OCR didn't get market price, fill from live quote
+                    positions[idx]["market_price"] = round(live_price, 3)
+    except Exception:
+        logger.warning("position_sync: code validation failed (non-critical)")
+
+    try:
+        available_cash = float(result.get("available_cash", 0) or 0)
+    except (TypeError, ValueError):
+        available_cash = 0.0
+    try:
+        total_assets = float(result.get("total_assets", 0) or 0)
+    except (TypeError, ValueError):
+        total_assets = 0.0
+    try:
+        frozen_cash = float(result.get("frozen_cash", 0) or 0)
+    except (TypeError, ValueError):
+        frozen_cash = 0.0
+    # If total_assets given but available_cash not, infer cash from total minus holdings
+    holdings_value = sum(
+        float(p["quantity"]) * float(p["market_price"] or p["cost_price"])
+        for p in positions
+    )
+    if total_assets > 0 and available_cash <= 0:
+        available_cash = max(0.0, total_assets - holdings_value - frozen_cash)
+    # If available_cash exceeds total_assets, clamp
+    if total_assets > 0 and available_cash > total_assets:
+        available_cash = max(0.0, total_assets - holdings_value - frozen_cash)
+    return {
+        "positions": positions,
+        "available_cash": round(available_cash, 2),
+        "total_assets": round(total_assets, 2),
+        "frozen_cash": round(frozen_cash, 2),
+    }
+
+
+def _correct_stock_code(
+    ocr_code: str,
+    ocr_price: float,
+    ocr_name: str,
+    ds: "OpenClawChinaStockDataSource",
+) -> str | None:
+    """Try to correct an OCR-misread stock code by matching name/price.
+
+    Strategy:
+    1. Query Tencent quotes for same-suffix variants (688↔300↔603 prefix swaps)
+    2. Match by price range (ratio within 0.5-2.0) AND name match
+    3. Fallback: if suffix-based candidates fail and OCR name is useful,
+       search Tencent by stock name to find the real code
+    """
+    import urllib.request
+
+    _logger = logging.getLogger(__name__)
+
+    # ── Step 1: suffix-based candidates ──────────────────────────────
+    candidates_map: dict[str, list[str]] = {}
+    suffix = ocr_code[3:]  # last 3 digits
+    if ocr_code.startswith("688"):
+        candidates_map["300" + suffix] = f"sz300{suffix}"
+    elif ocr_code.startswith(("603", "600")):
+        candidates_map["300" + suffix] = f"sz300{suffix}"
+        candidates_map["688" + suffix] = f"sh688{suffix}"
+    elif ocr_code.startswith("300"):
+        candidates_map["688" + suffix] = f"sh688{suffix}"
+        candidates_map["603" + suffix] = f"sh603{suffix}"
+    elif ocr_code.startswith("301"):
+        candidates_map["300" + suffix] = f"sz300{suffix}"
+
+    if candidates_map:
+        tencent_codes = list(candidates_map.values())
+        url = f"https://qt.gtimg.cn/q={','.join(tencent_codes)}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read()
+            try:
+                text = raw.decode("gbk", errors="replace")
+            except Exception:
+                text = raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            _logger.warning("code_correction: Tencent query failed: %s", e)
+            text = ""
+
+        for candidate_code, tencent_symbol in candidates_map.items():
+            pattern = f"v_{tencent_symbol}="
+            for line in text.split(";"):
+                if not line.startswith(pattern):
+                    continue
+                try:
+                    _, data_part = line.split("=", 1)
+                    parts = data_part.strip('"').strip("'\n").split("~")
+                    if len(parts) < 5:
+                        continue
+                    live_name = str(parts[1] if len(parts) > 1 else "").strip()
+                    live_price = float(parts[3] if len(parts) > 3 else 0)
+                    if live_price <= 0:
+                        continue
+                    ratio = ocr_price / live_price if live_price > 0 else 0
+                    price_ok = 0.5 <= ratio <= 2.0
+                    name_ok = bool(ocr_name and live_name) and (
+                        ocr_name in live_name or live_name in ocr_name
+                    )
+                    if price_ok and name_ok:
+                        _logger.info(
+                            "code_correction: suffix perfect match %s→%s (name=%s, price=%.2f)",
+                            ocr_code, candidate_code, live_name, live_price,
+                        )
+                        return candidate_code
+                except (IndexError, ValueError, TypeError):
+                    continue
+
+    # ── Step 2: name-based search via Sina suggest API ─────────────
+    if ocr_name:
+        name = ocr_name.strip()
+        import urllib.parse
+        try:
+            quoted = urllib.parse.quote(name)
+            search_url = f"https://suggest3.sinajs.cn/suggest/type=11,12,13&key={quoted}"
+            req = urllib.request.Request(search_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read()
+            try:
+                text = raw.decode("gbk", errors="replace")
+            except Exception:
+                text = raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            _logger.warning("code_correction: Sina suggest failed: %s", e)
+            text = ""
+
+        if text and "=" in text and "pv_none" not in text:
+            try:
+                # Format: var suggestvalue="name,type,code,market_code,...";
+                eq_idx = text.index("=")
+                raw_val = text[eq_idx + 1:].strip().strip('"').strip("'\n; ")
+                for part in raw_val.split(","):
+                    part = part.strip()
+                segments = raw_val.split(",")
+                if len(segments) >= 3:
+                    live_code = str(segments[2]).strip()
+                    live_name_result = str(segments[0]).strip()
+                    if len(live_code) == 6 and live_code.isdigit():
+                        _logger.info(
+                            "code_correction: Sina suggest match %s→%s (name=%s)",
+                            ocr_code, live_code, live_name_result,
+                        )
+                        return live_code
+            except (IndexError, ValueError, TypeError):
+                pass
+
+    return None
+
+
+def _apply_position_sync(repo: LongTermRepository, extracted: dict, as_of: str) -> dict:
+    """Apply position sync: replace portfolio positions/cash with extracted data."""
+    old_portfolio = repo.load_portfolio()
+
+    new_positions = [
+        SimPosition(
+            code=p["code"],
+            name=p["name"],
+            quantity=p["quantity"],
+            cost_price=p["cost_price"],
+            last_price=p["market_price"],
+        )
+        for p in extracted["positions"]
+    ]
+    new_positions.sort(key=lambda x: x.market_value, reverse=True)
+
+    available_cash = extracted["available_cash"]
+    frozen_cash = extracted.get("frozen_cash", 0.0)
+    total_cash = available_cash + frozen_cash
+
+    new_portfolio = PortfolioState(
+        as_of=as_of,
+        initial_capital=old_portfolio.initial_capital,
+        cash=round(total_cash, 2),
+        available_cash=round(available_cash, 2),
+        frozen_cash=round(frozen_cash, 2),
+        positions=new_positions,
+        target_weights=dict(old_portfolio.target_weights),
+        realized_pnl=float(old_portfolio.realized_pnl),
+        total_fees=float(old_portfolio.total_fees),
+    )
+
+    # Build diff summary for audit
+    old_by_code = {p.code: p for p in old_portfolio.positions}
+    new_by_code = {p.code: p for p in new_positions}
+    all_codes = set(old_by_code) | set(new_by_code)
+
+    diffs: list[str] = []
+    for code in sorted(all_codes):
+        old_pos = old_by_code.get(code)
+        new_pos = new_by_code.get(code)
+        if old_pos and new_pos:
+            if old_pos.quantity != new_pos.quantity:
+                diffs.append(
+                    f"{code} qty: {old_pos.quantity}→{new_pos.quantity} "
+                    f"cost: {old_pos.cost_price:.3f}→{new_pos.cost_price:.3f}"
+                )
+            elif abs(old_pos.cost_price - new_pos.cost_price) > 0.01:
+                diffs.append(
+                    f"{code} cost: {old_pos.cost_price:.3f}→{new_pos.cost_price:.3f} (qty unchanged)"
+                )
+        elif new_pos and not old_pos:
+            diffs.append(f"{code} NEW: {new_pos.quantity}股 cost={new_pos.cost_price:.3f}")
+        elif old_pos and not new_pos:
+            diffs.append(f"{code} REMOVED: was {old_pos.quantity}股")
+
+    cash_diff = total_cash - old_portfolio.cash
+    if abs(cash_diff) > 0.01:
+        diffs.append(f"cash: {old_portfolio.cash:.2f}→{total_cash:.2f} (Δ{cash_diff:+.2f})")
+
+    # Save
+    repo.save_portfolio(new_portfolio)
+
+    # Record sync event in manual execution log (for audit trail)
+    sync_note = f"position_sync from image: {'; '.join(diffs) if diffs else 'no changes'}"
+    repo.append_manual_executions([
+        ManualExecutionItem(
+            trade_date=as_of,
+            code="POS_SYNC",
+            name="持仓同步",
+            side="buy" if cash_diff >= 0 else "sell",
+            price=abs(cash_diff) if cash_diff != 0 else 0.01,
+            quantity=len(new_positions),
+            trade_time="",
+            fee=0.0,
+            note=sync_note[:200],
+        )
+    ])
+
+    snapshot_path = repo.save_investor_snapshot(
+        _build_investor_snapshot(repo, source="position-sync-image")
+    )
+
+    return {
+        "old_portfolio": old_portfolio,
+        "new_portfolio": new_portfolio,
+        "diffs": diffs,
+        "snapshot_path": snapshot_path,
+        "holdings_value": sum(p.market_value for p in new_positions),
+    }
+
+
+def cmd_sync_positions_from_image(args: argparse.Namespace) -> int:
+    repo = LongTermRepository()
+    repo.init_if_missing()
+    image_path = Path(args.image).expanduser().resolve()
+    if not image_path.exists():
+        print(f"image not found: {image_path}")
+        return 1
+    as_of = args.date or datetime.now().strftime("%Y-%m-%d")
+    print(f"extracting positions from: {image_path}")
+    extracted = _extract_positions_from_image(image_path)
+    positions = extracted.get("positions", [])
+    available_cash = extracted.get("available_cash", 0.0)
+    total_assets = extracted.get("total_assets", 0.0)
+    frozen_cash = extracted.get("frozen_cash", 0.0)
+
+    if not positions and available_cash <= 0:
+        print("no positions or cash extracted from image (try clearer screenshot)")
+        return 1
+
+    print(f"\nextracted {len(positions)} holdings:")
+    holdings_value = 0.0
+    for p in positions:
+        mv = float(p["quantity"]) * float(p["market_price"] or p["cost_price"])
+        holdings_value += mv
+        print(
+            f"  {p['code']} {p['name']} qty={p['quantity']} "
+            f"cost={p['cost_price']:.3f} px={p['market_price']:.3f} mv={mv:,.2f}"
+        )
+    print(f"  持仓市值: {holdings_value:,.2f}")
+    print(f"  可用资金: {available_cash:,.2f}")
+    print(f"  冻结资金: {frozen_cash:,.2f}")
+    print(f"  总资产: {total_assets:,.2f}")
+    if total_assets > 0:
+        implied_nav = holdings_value + available_cash + frozen_cash
+        print(f"  推算净资产: {implied_nav:,.2f} (vs 截图总资产 {total_assets:,.2f})")
+
+    if args.dry_run:
+        print("\n[dry-run] not syncing to portfolio")
+        return 0
+
+    result = _apply_position_sync(repo, extracted, as_of)
+    old = result["old_portfolio"]
+    new = result["new_portfolio"]
+    diffs = result["diffs"]
+    print(f"\nsynced to portfolio:")
+    print(f"  nav: {old.nav:,.2f} → {new.nav:,.2f}")
+    print(f"  cash: {old.cash:,.2f} → {new.cash:,.2f}")
+    print(f"  holdings: {len(old.positions)} → {len(new.positions)}")
+    if diffs:
+        print(f"  changes:")
+        for d in diffs:
+            print(f"    {d}")
+    else:
+        print("  (no changes)")
+    print(f"  snapshot: {result['snapshot_path']}")
+    return 0
+
+
+def handle_feishu_position_sync(image_path: Path, repo: LongTermRepository | None = None) -> str:
+    """Handle /更新持仓 command: extract positions from image and sync to portfolio."""
+    _configure_logging()
+    repo = repo or LongTermRepository()
+    repo.init_if_missing()
+    as_of = datetime.now().strftime("%Y-%m-%d")
+
+    extracted = _extract_positions_from_image(image_path)
+    positions = extracted.get("positions", [])
+    available_cash = extracted.get("available_cash", 0.0)
+    total_assets = extracted.get("total_assets", 0.0)
+    frozen_cash = extracted.get("frozen_cash", 0.0)
+
+    if not positions and available_cash <= 0:
+        return "未能从截图中识别出持仓信息，请确认截图清晰并包含完整持仓列表（代码、数量、成本价、现价）和可用资金"
+
+    lines = [f"📸 从持仓截图中识别到 {len(positions)} 只股票:"]
+    holdings_value = 0.0
+    for p in positions:
+        mv = float(p["quantity"]) * float(p["market_price"] or p["cost_price"])
+        holdings_value += mv
+        lines.append(
+            f"  {p['code']} {p['name']} {p['quantity']}股 "
+            f"成本{p['cost_price']:.3f} 现价{p['market_price']:.3f} 市值{mv:,.2f}"
+        )
+    lines.append(f"持仓市值: {holdings_value:,.2f}")
+    lines.append(f"可用资金: {available_cash:,.2f}")
+    if frozen_cash > 0:
+        lines.append(f"冻结资金: {frozen_cash:,.2f}")
+    if total_assets > 0:
+        lines.append(f"截图总资产: {total_assets:,.2f}")
+
+    result = _apply_position_sync(repo, extracted, as_of)
+    old = result["old_portfolio"]
+    new = result["new_portfolio"]
+    diffs = result["diffs"]
+
+    lines.append(f"\n✅ 持仓已同步:")
+    lines.append(f"  NAV: {old.nav:,.2f} → {new.nav:,.2f}")
+    lines.append(f"  现金: {old.cash:,.2f} → {new.cash:,.2f}")
+    lines.append(f"  持仓数: {len(old.positions)} → {len(new.positions)}")
+    if diffs:
+        lines.append(f"  变更:")
+        for d in diffs[:10]:
+            lines.append(f"    {d}")
+        if len(diffs) > 10:
+            lines.append(f"    ... 共 {len(diffs)} 项变更")
+    return "\n".join(lines)
 
 
 def cmd_apply_manual(args: argparse.Namespace) -> int:
@@ -655,7 +1257,204 @@ def cmd_apply_manual(args: argparse.Namespace) -> int:
     next_state = result["portfolio"]
     print(f"applied manual executions: {int(result['records_count'])}")
     print(f"nav: {next_state.nav:.2f} cash: {next_state.cash:.2f} holdings: {len(next_state.positions)}")
+    ninedb = result.get("ninedb_sync", {}) or {}
+    print(
+        f"9db_sync: {'ok' if ninedb.get('ok') else 'skipped' if not ninedb.get('enabled') else 'failed'} "
+        f"submitted={int(ninedb.get('submitted_count', 0) or 0)} "
+        f"error={str(ninedb.get('error', '') or '-')}"
+    )
     print(f"investor_snapshot: {result['snapshot_path']}")
+    return 0
+
+
+def cmd_rebuild_portfolio(args: argparse.Namespace) -> int:
+    repo = LongTermRepository()
+    repo.init_if_missing()
+    current = repo.load_portfolio()
+    as_of = args.date or datetime.now().strftime("%Y-%m-%d")
+    rebuilt = rebuild_portfolio_from_executions(
+        initial_capital=current.initial_capital,
+        records=repo.load_manual_executions(),
+        as_of=as_of,
+        target_weights=current.target_weights,
+    )
+    repo.save_portfolio(rebuilt)
+    snapshot_path = repo.save_investor_snapshot(_build_investor_snapshot(repo, source="rebuild-portfolio"))
+    print("portfolio rebuilt from execution ledger")
+    print(f"as_of: {rebuilt.as_of}")
+    print(f"nav: {rebuilt.nav:.2f} cash: {rebuilt.cash:.2f} holdings: {len(rebuilt.positions)}")
+    print(
+        f"realized_pnl: {rebuilt.realized_pnl:.2f} "
+        f"unrealized_pnl: {rebuilt.unrealized_pnl:.2f} "
+        f"total_pnl: {rebuilt.total_pnl:.2f} return={rebuilt.total_return_pct:.2%}"
+    )
+    print(f"investor_snapshot: {snapshot_path}")
+    return 0
+
+
+def _format_auto_rebalance_notice(
+    *,
+    trade_date: str,
+    plan_path: Path,
+    records: List[ManualExecutionItem],
+    portfolio: PortfolioState,
+    snapshot_path: Path,
+) -> tuple[str, dict]:
+    buy_records = [item for item in records if item.side == "buy"]
+    sell_records = [item for item in records if item.side == "sell"]
+    buy_amount = sum(float(item.price) * int(item.quantity) for item in buy_records)
+    sell_amount = sum(float(item.price) * int(item.quantity) for item in sell_records)
+
+    def _rows(items: List[ManualExecutionItem]) -> str:
+        if not items:
+            return "（无）"
+        lines = []
+        for item in items[:15]:
+            amount = float(item.price) * int(item.quantity)
+            display = f"{item.name}（{item.code}）" if item.name and item.name != item.code else item.code
+            lines.append(
+                f"- {display}：{int(item.quantity)} 股，模拟价 {float(item.price):.3f} 元，金额 {amount:,.0f} 元"
+            )
+        if len(items) > 15:
+            lines.append(f"... 另 {len(items) - 15} 笔")
+        return "\n".join(lines)
+
+    summary = (
+        f"净值：{portfolio.nav:,.2f} 元\n"
+        f"现金：{portfolio.cash:,.2f} 元｜可用资金：{portfolio.available_cash:,.2f} 元\n"
+        f"持仓：{len(portfolio.positions)} 只\n"
+        f"已实现收益：{portfolio.realized_pnl:,.2f} 元\n"
+        f"浮动收益：{portfolio.unrealized_pnl:,.2f} 元\n"
+        f"总收益：{portfolio.total_pnl:,.2f} 元（{portfolio.total_return_pct:.2%}）"
+    )
+    trade_summary = (
+        f"模拟买入：{len(buy_records)} 笔，合计 {buy_amount:,.0f} 元\n"
+        f"模拟卖出：{len(sell_records)} 笔，合计 {sell_amount:,.0f} 元"
+    )
+    text = (
+        f"【长线模拟组合调仓记录】{trade_date}\n"
+        "本次仅更新模拟组合账本，不代表实盘成交，不会向券商自动下单。\n"
+        f"{summary}\n"
+        f"{trade_summary}\n\n"
+        f"模拟买入明细：\n{_rows(buy_records)}\n\n"
+        f"模拟卖出明细：\n{_rows(sell_records)}"
+    )
+    card = _build_feishu_card(
+        f"长线模拟组合调仓记录 {trade_date}",
+        [
+            {"title": "性质说明", "content": "仅更新模拟组合账本，不代表实盘成交，不会向券商自动下单。"},
+            {"title": "组合状态", "content": summary},
+            {"title": "模拟调仓汇总", "content": trade_summary},
+            {"title": "模拟买入明细", "content": _rows(buy_records)},
+            {"title": "模拟卖出明细", "content": _rows(sell_records)},
+        ],
+        template="green",
+    )
+    return text, card
+
+
+def _format_portfolio_return_summary(portfolio: PortfolioState) -> str:
+    nav = float(portfolio.nav)
+    cash_pct = float(portfolio.cash) / nav * 100 if nav > 0 else 0.0
+    initial = float(portfolio.initial_capital or 0.0)
+    nav_change = nav - initial if initial > 0 else 0.0
+    ledger_pnl = float(portfolio.realized_pnl) + float(portfolio.unrealized_pnl)
+    lines = [
+        f"净值：{nav:,.0f} 元｜现金：{float(portfolio.cash):,.0f} 元（{cash_pct:.1f}%）\n"
+        f"净值较初始：{nav_change:,.0f} 元（{float(portfolio.total_return_pct):.2%}）\n"
+        f"交易损益记录：已实现 {float(portfolio.realized_pnl):,.0f} 元｜"
+        f"浮动 {float(portfolio.unrealized_pnl):,.0f} 元"
+    ]
+    reconciliation_gap = nav_change - ledger_pnl
+    tolerance = max(1.0, abs(initial) * 0.001)
+    if initial > 0 and abs(reconciliation_gap) > tolerance:
+        lines.append(
+            f"口径提示：净值变动与交易损益记录相差 {reconciliation_gap:,.0f} 元；"
+            "可能包含资金调整或历史账本未衔接，收益率以净值口径为准。"
+        )
+    return "\n".join(lines)
+
+
+def cmd_auto_rebalance(args: argparse.Namespace) -> int:
+    trade_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    if not bool(getattr(args, "ignore_trading_calendar", False)):
+        is_open, source = is_cn_trading_day(trade_date)
+        if not is_open:
+            print(f"skip auto-rebalance: {trade_date} non_trading_day source={source}")
+            return 0
+    repo = LongTermRepository()
+    repo.init_if_missing()
+    plan, mtm_portfolio = _build_review_plan(repo, trade_date)
+    plan_path = repo.save_plan(plan)
+    records = build_execution_records_from_plan(plan)
+    print(f"trade_date: {trade_date}")
+    print(f"plan_file: {plan_path}")
+    print(f"planned_actions: {len(plan.actions)} executable_fills: {len(records)}")
+    if getattr(args, "dry_run", False):
+        repo.save_portfolio(mtm_portfolio)
+        snapshot_path = repo.save_investor_snapshot(_build_investor_snapshot(repo, source="auto-rebalance-dry-run"))
+        print(f"dry_run: true")
+        print(f"nav: {mtm_portfolio.nav:.2f} cash: {mtm_portfolio.cash:.2f} holdings: {len(mtm_portfolio.positions)}")
+        print(f"investor_snapshot: {snapshot_path}")
+        return 0
+    if not records:
+        repo.save_portfolio(mtm_portfolio)
+        snapshot_path = repo.save_investor_snapshot(_build_investor_snapshot(repo, source="auto-rebalance-noop"))
+        print("auto_rebalance: no executable actions")
+        print(f"nav: {mtm_portfolio.nav:.2f} cash: {mtm_portfolio.cash:.2f} holdings: {len(mtm_portfolio.positions)}")
+        print(f"investor_snapshot: {snapshot_path}")
+        return 0
+    next_state = apply_manual_executions(mtm_portfolio, records)
+    next_state.as_of = trade_date
+    repo.append_manual_executions(records)
+    repo.save_portfolio(next_state)
+    snapshot_path = repo.save_investor_snapshot(_build_investor_snapshot(repo, source="auto-rebalance"))
+    print("auto_rebalance: applied")
+    print(f"nav: {next_state.nav:.2f} cash: {next_state.cash:.2f} holdings: {len(next_state.positions)}")
+    print(
+        f"realized_pnl: {next_state.realized_pnl:.2f} "
+        f"unrealized_pnl: {next_state.unrealized_pnl:.2f} "
+        f"total_pnl: {next_state.total_pnl:.2f} return={next_state.total_return_pct:.2%}"
+    )
+    for rec in records[:20]:
+        side_text = "buy" if rec.side == "buy" else "sell"
+        print(f"- {side_text} {rec.code} qty={rec.quantity} px={rec.price:.3f} {rec.name}")
+    print(f"investor_snapshot: {snapshot_path}")
+    notice_text, notice_card = _format_auto_rebalance_notice(
+        trade_date=trade_date,
+        plan_path=plan_path,
+        records=records,
+        portfolio=next_state,
+        snapshot_path=snapshot_path,
+    )
+    pushed = False if bool(getattr(args, "no_push", False)) else push_feishu_rich(notice_text, card=notice_card)
+    print(f"feishu_pushed: {pushed}")
+    return 0
+
+
+def cmd_configure_9db(args: argparse.Namespace) -> int:
+    repo = LongTermRepository()
+    repo.init_if_missing()
+    payload = parse_9db_url(str(args.url or "").strip())
+    config_path = save_9db_config(repo.ninedb_config_file, payload)
+    print(f"configured_9db: {config_path}")
+    print(f"order_id: {payload.get('order_id')}")
+    print(f"order_name: {payload.get('order_name')}")
+    print(f"token_prefix: {str(payload.get('token', ''))[:8]}...")
+    return 0
+
+
+def cmd_show_9db(args: argparse.Namespace) -> int:
+    repo = LongTermRepository()
+    repo.init_if_missing()
+    payload = load_9db_config(repo.ninedb_config_file)
+    if not payload:
+        print("9db not configured")
+        return 1
+    masked = dict(payload)
+    token = str(masked.get("token", "") or "")
+    masked["token"] = f"{token[:8]}..." if token else ""
+    print(json.dumps(masked, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -676,12 +1475,18 @@ def cmd_summary(args: argparse.Namespace) -> int:
     print(f"cash: {portfolio.cash:.2f}")
     print(f"available_cash: {portfolio.available_cash:.2f}")
     print(f"frozen_cash: {portfolio.frozen_cash:.2f}")
+    print(f"realized_pnl: {portfolio.realized_pnl:.2f}")
+    print(f"unrealized_pnl: {portfolio.unrealized_pnl:.2f}")
+    print(f"total_pnl: {portfolio.total_pnl:.2f}")
+    print(f"total_return: {portfolio.total_return_pct:.2%}")
+    print(f"total_fees: {portfolio.total_fees:.2f}")
     print(f"holdings: {len(portfolio.positions)}")
     for item in sorted(portfolio.positions, key=lambda x: x.market_value, reverse=True):
         weight = item.market_value / portfolio.nav if portfolio.nav > 0 else 0.0
         print(
             f"- {item.code} {item.name} qty={item.quantity} cost={item.cost_price:.3f} "
-            f"last={item.last_price:.3f} mv={item.market_value:.2f} w={weight:.2%}"
+            f"last={item.last_price:.3f} mv={item.market_value:.2f} w={weight:.2%} "
+            f"upnl={item.unrealized_pnl:.2f} upnl_pct={item.unrealized_pnl_pct:.2%}"
         )
     if latest_plan:
         print(
@@ -1028,6 +1833,9 @@ def _sync_universe_core(
 ) -> dict:
     portfolio = repo.load_portfolio()
     previous_universe = repo.load_universe()
+    settings = repo.load_settings()
+    gem_mode = bool(getattr(settings, "gem_universe", False))
+    gem_prefix = str(getattr(settings, "gem_board_prefix", "30") or "30")
     previous = {
         str(item.code).upper(): normalize_industry_name(str(item.industry or "").strip())
         for item in previous_universe
@@ -1051,53 +1859,89 @@ def _sync_universe_core(
         sector_map=fetched_ths_sectors,
         existing_candidates=previous_universe,
     )
-    # --- 外部选股：板块轮动预判选股（涨停前埋伏） ---
-    rotation_candidates = data_source.fetch_sector_rotation_candidates(
-        top_sectors=8, max_per_sector=5, max_total=30,
-    )
-    rotation_codes = {str(item["code"]).upper() for item in rotation_candidates}
-    rotation_by_code = {str(item["code"]).upper(): item for item in rotation_candidates}
-    # 获取新增股票的行业（仅对不在持仓中的）
-    new_codes_for_industry = [c for c in rotation_codes if c not in codes]
-    rotation_industry = data_source.fetch_industries(new_codes_for_industry) if new_codes_for_industry else {}
-    rotation_sectors = data_source.fetch_ths_sectors(new_codes_for_industry) if new_codes_for_industry else {}
-    # 合并外部候选到candidates列表
-    for rc in rotation_candidates:
-        code = str(rc["code"]).upper()
-        # 已由持仓衍生，跳过
-        if code in {str(c.code).upper() for c in candidates}:
-            continue
-        score = float(rc.get("momentum_score", 0) or 0)
-        industry = str(rc.get("industry") or rotation_industry.get(code, "") or "").strip()
-        if not industry:
-            industry = "UNKNOWN"
-        tags = [str(x).strip() for x in (rotation_sectors.get(code, []) or []) if str(x).strip()]
-        if not tags:
-            matched = str(rc.get("matched_sector") or "")
-            if matched:
-                tags = [matched]
-        score_scale = score / 100.0
-        candidates.append(
-            StockCandidate(
-                code=code,
-                name=str(rc.get("name") or code),
-                status="candidate",
-                value_score=round(50.0 + score_scale * 15.0, 2),
-                quality_score=round(50.0 + score_scale * 10.0, 2),
-                growth_score=round(55.0 + score_scale * 20.0, 2),
-                risk_score=round(60.0 - score_scale * 10.0, 2),
-                industry=normalize_industry_name(industry),
-                thesis=f"sector_rotation_{score:.0f}",
-                tags=tags[:12],
-                updated_at=trade_date,
+
+    def _is_gem_small_cap_candidate(item: StockCandidate) -> bool:
+        code = str(item.code or "").upper()
+        if not code.startswith(gem_prefix):
+            return False
+        thesis = str(item.thesis or "").strip().lower()
+        tags = {str(x).strip() for x in (item.tags or []) if str(x).strip()}
+        return thesis == "gem_small_cap" or {"创业板", "小市值"}.issubset(tags)
+
+    # --- 科技动量模式：固定科技股池替代大范围扫描 ---
+    high_tech_mode = bool(getattr(settings, "high_tech_mode", False))
+    if high_tech_mode:
+        from .high_tech_strategy import STOCK_POOL_NAMES, get_tech_pool_code_set
+        tech_codes = get_tech_pool_code_set()
+        existing_codes = {str(c.code).upper() for c in candidates}
+        new_tech_codes = tech_codes - existing_codes
+        for code in sorted(new_tech_codes):
+            candidates.append(
+                StockCandidate(
+                    code=code,
+                    name=str(STOCK_POOL_NAMES.get(code, code)),
+                    status="candidate",
+                    value_score=50.0,
+                    quality_score=50.0,
+                    growth_score=50.0,
+                    risk_score=50.0,
+                    industry="科技",
+                    thesis="high_tech_pool",
+                    tags=["科技"],
+                    updated_at=trade_date,
+                )
             )
+        print(f"[HT] High-tech pool: {len(tech_codes)} stocks, {len(new_tech_codes)} new to universe")
+        # 跳过板块轮动和GEM选股路径
+    # --- 科技动量模式结束 ---
+    # --- 外部选股：板块轮动预判选股（涨停前埋伏） ---
+    # GEM mode is a separate small-cap universe. Do not leak legacy heat-rotation
+    # names into scans or reports once it is enabled.
+    if not high_tech_mode and not gem_mode:
+        rotation_candidates = data_source.fetch_sector_rotation_candidates(
+            top_sectors=8, max_per_sector=5, max_total=30,
         )
+        rotation_codes = {str(item["code"]).upper() for item in rotation_candidates}
+        # 获取新增股票的行业（仅对不在持仓中的）
+        new_codes_for_industry = [c for c in rotation_codes if c not in codes]
+        rotation_industry = data_source.fetch_industries(new_codes_for_industry) if new_codes_for_industry else {}
+        rotation_sectors = data_source.fetch_ths_sectors(new_codes_for_industry) if new_codes_for_industry else {}
+        # 合并外部候选到candidates列表
+        for rc in rotation_candidates:
+            code = str(rc["code"]).upper()
+            # 已由持仓衍生，跳过
+            if code in {str(c.code).upper() for c in candidates}:
+                continue
+            score = float(rc.get("momentum_score", 0) or 0)
+            industry = str(rc.get("industry") or rotation_industry.get(code, "") or "").strip()
+            if not industry:
+                industry = "UNKNOWN"
+            tags = [str(x).strip() for x in (rotation_sectors.get(code, []) or []) if str(x).strip()]
+            if not tags:
+                matched = str(rc.get("matched_sector") or "")
+                if matched:
+                    tags = [matched]
+            score_scale = score / 100.0
+            candidates.append(
+                StockCandidate(
+                    code=code,
+                    name=str(rc.get("name") or code),
+                    status="candidate",
+                    value_score=round(50.0 + score_scale * 15.0, 2),
+                    quality_score=round(50.0 + score_scale * 10.0, 2),
+                    growth_score=round(55.0 + score_scale * 20.0, 2),
+                    risk_score=round(60.0 - score_scale * 10.0, 2),
+                    industry=normalize_industry_name(industry),
+                    thesis=f"sector_rotation_{score:.0f}",
+                    tags=tags[:12],
+                    updated_at=trade_date,
+                )
+            )
     # --- 外部选股结束 ---
     # --- GEM小市值选股（创业板基本面筛选） ---
-    settings_gem = repo.load_settings()
-    if getattr(settings_gem, "gem_universe", False):
+    if not high_tech_mode and gem_mode:
         try:
-            gem_candidates = data_source.fetch_gem_candidates(settings_gem)
+            gem_candidates = data_source.fetch_gem_candidates(settings)
             if gem_candidates:
                 for gc in gem_candidates:
                     gcode = str(gc["code"]).upper()
@@ -1129,6 +1973,8 @@ def _sync_universe_core(
     for item in previous_universe:
         code = str(item.code).upper()
         if code in merged_candidates:
+            continue
+        if gem_mode and code not in current_codes and not _is_gem_small_cap_candidate(item):
             continue
         retained_count += 1
         status = str(item.status or "candidate").strip() or "candidate"
@@ -1566,8 +2412,50 @@ def _format_decision_adjustments(llm_decision: dict, *, max_items: int = 4) -> s
     return _compact_join(rows, max_items=max_items, empty_text="无")
 
 
+def _strategy_profile(settings: LongTermSettings) -> dict:
+    gradual = bool(getattr(settings, "gradual_rotation", True))
+    high_tech_mode = bool(getattr(settings, "high_tech_mode", False))
+    gem_mode = bool(getattr(settings, "gem_universe", False))
+    if high_tech_mode:
+        ht_n = int(getattr(settings, "ht_holdings_num", 5) or 5)
+        name = "科技动量策略"
+        focus = (
+            "固定科技股池（光模块/CPO/存储芯片/航天等32只），"
+            f"动量评分（年化收益率×R²×加速度×量比），选Top{ht_n}等权分配；"
+            "建议尾盘14:50-15:00通过飞书命令手动执行调仓"
+        )
+        return {
+            "name": name,
+            "report_title": "科技动量盘后建议",
+            "focus": focus,
+        }
+    if gem_mode:
+        name = "创业板小市值组合管理" if gradual else "创业板小市值策略"
+        focus = (
+            "组合管理模式：综合评估每只持仓质量（PnL/主题/热度/趋势），"
+            "按去留优先级渐进换仓（非一键清仓），"
+            "卖出释放资金后再规划新买入（单次最多3只），"
+            "非核心持仓分2-3周期逐步退出。"
+            if gradual
+            else (
+                "仅以创业板30开头股票为新买入池，优先小市值、基本面增长和可交易性；"
+                "当前非创业板持仓只作为退出/过渡仓位处理"
+            )
+        )
+        return {
+            "name": name,
+            "report_title": "创业板小市值盘后建议",
+            "focus": focus,
+        }
+    return {
+        "name": "长线组合",
+        "report_title": "长线盘后建议",
+        "focus": "中长期组合质量、行业/主题集中度、交易闭环和风险预算",
+    }
+
+
 def _format_plan_action_details(latest_plan: dict, *, max_items: int = 0) -> str:
-    """格式化为飞书 Markdown 表格。max_items=0 表示全部输出。"""
+    """格式化为飞书可读的调仓明细。max_items=0 表示全部输出。"""
     actions = latest_plan.get("actions", []) or []
     rejected = latest_plan.get("rejected_actions", []) or []
     limit = int(max_items) if max_items and max_items > 0 else max(len(actions), 1)
@@ -1585,12 +2473,13 @@ def _format_plan_action_details(latest_plan: dict, *, max_items: int = 0) -> str
         qty = abs(int(item.get("delta_shares", 0) or 0))
         px = float(item.get("reference_price", 0) or 0)
         amt = float(item.get("estimated_amount", 0) or 0)
-        score = float(item.get("score", 0) or 0)
         total_buy += amt
         weight = float(item.get("target_weight", 0) or 0)
         concepts = _extract_item_concepts(code, latest_plan)
         tag = _concept_tag(concepts)
-        lines.append(f"{code} | {name} | {qty}股@{px:.2f} | {amt:,.0f} | {weight:.1%} | {tag}")
+        display = f"{name}（{code}）" if name and name != code else code
+        theme_note = f"；主题：{tag}" if tag != "-" else ""
+        lines.append(f"- {display}：买入 {qty} 股，参考 {px:.2f} 元，预计 {amt:,.0f} 元，目标权重 {weight:.1%}{theme_note}")
     if buy_count == 0:
         lines.append("（无）")
     lines.append(f"　买入合计: **{buy_count} 笔 / {total_buy:,.0f} 元**")
@@ -1610,8 +2499,9 @@ def _format_plan_action_details(latest_plan: dict, *, max_items: int = 0) -> str
         px = float(item.get("reference_price", 0) or 0)
         amt = float(item.get("estimated_amount", 0) or 0)
         total_sell += amt
-        reason = str(item.get("reason", "") or "").strip().replace("not_in_target_universe", "调出候选池").replace("target_weight=", "").replace("current_weight=", "")
-        lines.append(f"{code} | {name} | {qty}股@{px:.2f} | {amt:,.0f} | {reason[:20]}")
+        reason = _human_action_reason(item.get("reason"))
+        display = f"{name}（{code}）" if name and name != code else code
+        lines.append(f"- {display}：卖出 {qty} 股，参考 {px:.2f} 元，预计 {amt:,.0f} 元；原因：{reason}")
     if sell_count == 0:
         lines.append("（无）")
     lines.append(f"　卖出合计: **{sell_count} 笔 / {total_sell:,.0f} 元**")
@@ -1621,10 +2511,58 @@ def _format_plan_action_details(latest_plan: dict, *, max_items: int = 0) -> str
         for r in rejected[:6]:
             code = str(r.get("code", "") or "").strip().upper()
             name = str(r.get("name", "") or "").strip()
-            reason = str(r.get("reason", "") or "").strip().replace("_", " ")[:30]
-            lines.append(f"{code} | {name} | {reason}")
+            reason = _human_action_reason(r.get("reason"))
+            display = f"{name}（{code}）" if name and name != code else code
+            lines.append(f"- {display}：{reason}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _decision_label(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    return {
+        "pause": "暂停执行",
+        "hold": "持有观察",
+        "proceed": "按计划观察",
+        "execute": "可进入人工执行核验",
+        "adjust": "调整计划",
+        "buy": "买入候选",
+        "sell": "卖出候选",
+    }.get(raw, str(value or "待人工确认"))
+
+
+def _market_regime_label(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    return {
+        "risk_on": "偏进攻",
+        "risk_off": "偏防守",
+        "neutral": "中性",
+    }.get(raw, "状态待确认")
+
+
+def _confidence_pct(value: object) -> float:
+    number = _float(value)
+    return max(0.0, min(100.0, number * 100 if number <= 1 else number))
+
+
+def _human_action_reason(value: object) -> str:
+    reason = str(value or "").strip()
+    lowered = reason.lower()
+    matched = re.search(r"stop_loss\(px=([0-9.]+)", lowered)
+    if matched:
+        return f"跌破止损位 {float(matched.group(1)):.2f} 元"
+    if "not_in_target_universe" in lowered:
+        return "已调出当前候选池"
+    if "theme_cap_violation" in lowered:
+        return "主题集中度超过上限"
+    if "industry_cap" in lowered:
+        return "行业集中度超过上限"
+    if "min_trade" in lowered:
+        return "交易金额低于最小执行标准"
+    if "target_weight" in lowered or "current_weight" in lowered:
+        return "按目标权重调整"
+    cleaned = reason.replace("_", " ").strip()
+    return cleaned[:60] if cleaned else "策略风险控制"
 
 
 def _extract_item_concepts(code: str, latest_plan: dict) -> List[str]:
@@ -1665,33 +2603,69 @@ def _format_heat_candidate_details(scan_heat_summary: dict, *, max_items: int = 
     limit = int(max_items) if max_items and max_items > 0 else len(rows)
     lines = [""]
     for code, heat, score, tag in rows[:limit]:
-        lines.append(f"{code} | heat={heat:.1f} | score={score:.0f} | {tag}")
+        lines.append(f"- {code}：市场热度 {heat:.1f}，综合评分 {score:.0f}，主题 {tag}")
     lines.append("")
     return "\n".join(lines)
 
 
 def _build_feishu_card(title: str, sections: List[dict], *, template: str = "blue") -> dict:
-    elements = []
-    for idx, sec in enumerate(sections):
-        sec_title = str((sec or {}).get("title", "") or "").strip()
-        sec_content = str((sec or {}).get("content", "") or "").strip()
-        if not sec_title and not sec_content:
+    return build_feishu_report_card(title=title or "长线决策", sections=sections, template=template)
+
+
+def _compute_sl_tp_levels(
+    portfolio: PortfolioState,
+    history_by_code: Dict[str, Dict[str, List[float]]],
+    settings: LongTermSettings,
+) -> Dict[str, Dict]:
+    """计算每只持仓的止损价和止盈价。
+
+    基于 ATR（平均真实波幅）计算动态止损/止盈。
+    """
+    import math
+    levels: Dict[str, Dict] = {}
+    for pos in portfolio.positions:
+        if pos.quantity <= 0:
             continue
-        if sec_title:
-            body = f"**{sec_title}**\n{sec_content or '-'}"
-        else:
-            body = sec_content or "-"
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body}})
-        if idx < len(sections) - 1:
-            elements.append({"tag": "hr"})
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": template,
-            "title": {"tag": "plain_text", "content": str(title or "长线决策")},
-        },
-        "elements": elements,
-    }
+        code = str(pos.code).upper()
+        code_key = code.split(".")[0]
+        history = history_by_code.get(code, history_by_code.get(code_key, {})) or {}
+        closes = [x for x in history.get("close", []) if _float(x) > 0]
+        highs = [x for x in history.get("high", []) if _float(x) > 0]
+        lows = [x for x in history.get("low", []) if _float(x) > 0]
+        px = float(pos.last_price or pos.cost_price)
+        if px <= 0:
+            px = closes[-1] if closes else 0.0
+        if px <= 0:
+            continue
+
+        # 计算 ATR% (14日)
+        atr_pct = 0.03  # 默认3%
+        n = min(len(closes), len(highs), len(lows))
+        if n >= 15:
+            tr_list = []
+            for i in range(1, n):
+                h, l, pc = highs[i], lows[i], closes[i - 1]
+                tr = max(h - l, abs(h - pc), abs(l - pc)) if pc > 0 else h - l
+                if math.isfinite(tr) and tr > 0:
+                    tr_list.append(tr / max(closes[i], 1.0))
+            if len(tr_list) >= 14:
+                atr_pct = sum(sorted(tr_list)[-14:]) / 14
+
+        # 动态止损：ATR × 2.5，至少 5%，最多 12%
+        stop_loss_pct = max(0.05, min(0.12, atr_pct * 2.5))
+        take_profit_pct = max(0.08, min(0.25, atr_pct * 5.0))
+
+        cost = float(pos.cost_price)
+        levels[code] = {
+            "close": round(px, 2),
+            "atr_pct": round(atr_pct * 100, 2),
+            "stop_loss_price": round(px * (1 - stop_loss_pct), 2),
+            "stop_loss_pct": round(-stop_loss_pct * 100, 1),
+            "take_profit_price": round(px * (1 + take_profit_pct), 2),
+            "take_profit_pct": round(take_profit_pct * 100, 1),
+            "cost_stop_loss": round(cost * 0.92, 2) if cost > 0 else 0.0,
+        }
+    return levels
 
 
 def cmd_evening_decision(args: argparse.Namespace) -> int:
@@ -1711,6 +2685,161 @@ def cmd_evening_decision(args: argparse.Namespace) -> int:
                 trade_date = resolved
     repo = LongTermRepository()
     repo.init_if_missing()
+    settings_for_review = repo.load_settings()
+
+    # --- 科技动量模式：复盘午后计划 → 止损止盈建议 ---
+    if bool(getattr(settings_for_review, "high_tech_mode", False)):
+        latest_plan = repo.load_latest_plan() or {}
+        portfolio = repo.load_portfolio()
+        need_refresh_plan = (
+            not latest_plan.get("actions")
+            or str(latest_plan.get("trade_date", "") or "").strip() != trade_date
+            or str(latest_plan.get("source", "") or "").strip() != "high-tech-momentum"
+        )
+        if need_refresh_plan:
+            print("[HT evening] stale/missing plan, rebuilding high-tech plan before review")
+            sync_result = _sync_universe_core(
+                repo=repo,
+                trade_date=trade_date,
+                refresh_industry=False,
+                refresh_ths_sector=False,
+            )
+            print(f"[HT evening] universe synced: {int(sync_result.get('candidates_count', 0) or 0)}")
+            universe = repo.load_universe()
+            data_source = OpenClawChinaStockDataSource()
+            codes = sorted({item.code.upper() for item in universe} | {item.code.upper() for item in portfolio.positions})
+            quotes = data_source.fetch_quotes(codes)
+            history_by_code = data_source.fetch_batch_daily_history(
+                codes,
+                lookback_days=int(getattr(settings_for_review, "ht_lookback_days", 20) or 20) + 10,
+            )
+            plan, mtm_portfolio = build_rebalance_plan(
+                trade_date=trade_date,
+                candidates=universe,
+                portfolio=portfolio,
+                quotes=quotes,
+                settings=settings_for_review,
+                history_by_code=history_by_code,
+            )
+            repo.save_plan(plan)
+            repo.save_portfolio(mtm_portfolio)
+            latest_plan = repo.load_latest_plan() or {}
+            portfolio = repo.load_portfolio()
+        if not latest_plan.get("actions"):
+            print("[HT evening] no valid high-tech plan generated")
+            return 0
+
+        # 获取盘后行情数据
+        data_source = OpenClawChinaStockDataSource()
+        codes = sorted({item.code.upper() for item in portfolio.positions})
+        quotes = data_source.fetch_quotes(codes)
+
+        # 获取历史数据用于 ATR 计算
+        history_by_code = data_source.fetch_batch_daily_history(codes, lookback_days=30)
+
+        # 计算止损止盈
+        sl_tp_levels = _compute_sl_tp_levels(portfolio, history_by_code, settings_for_review)
+
+        # LLM 复盘
+        execution_monitor = _build_execution_monitor(repo, latest_plan)
+        execution_note = _execution_monitor_note(execution_monitor)
+        strategy = _strategy_profile(settings_for_review)
+        decision_payload = {
+            "trade_date": trade_date,
+            "stage": "evening_review",
+            "strategy": {"name": strategy["name"], "focus": "盘后复盘：回顾午后调仓计划，提供次日止损止盈建议"},
+            "portfolio": {
+                "nav": portfolio.nav,
+                "cash": portfolio.cash,
+                "available_cash": portfolio.available_cash,
+                "realized_pnl": portfolio.realized_pnl,
+                "unrealized_pnl": portfolio.unrealized_pnl,
+                "total_pnl": portfolio.total_pnl,
+                "total_return_pct": portfolio.total_return_pct,
+                "holdings_count": len(portfolio.positions),
+            },
+            "afternoon_plan": {
+                "actions": latest_plan.get("actions", []) or [],
+                "rejected_actions": latest_plan.get("rejected_actions", []) or [],
+            },
+            "sl_tp_levels": sl_tp_levels,
+            "execution_monitor": execution_monitor,
+        }
+        llm_decision = build_evening_decision(decision_payload)
+        key_risks = [str(x).strip() for x in (llm_decision.get("key_risks", []) or []) if str(x).strip()]
+        llm_decision["key_risks"] = key_risks
+
+        # 保存决策记录
+        record = {
+            "stage": "evening_review",
+            "trade_date": trade_date,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "llm_decision": llm_decision,
+            "plan_id": latest_plan.get("plan_id", ""),
+            "sl_tp_levels": sl_tp_levels,
+            "execution_monitor": execution_monitor,
+        }
+        repo.save_decision("evening", record)
+        snapshot_path = repo.save_investor_snapshot(
+            _build_investor_snapshot(repo, source="evening-review-ht")
+        )
+
+        # 格式化输出
+        decision_risks_compact = _compact_join(
+            [str(x).strip() for x in (llm_decision.get("key_risks", []) or []) if str(x).strip()],
+            max_items=6, empty_text="无",
+        )
+        plan_action_table = _format_plan_action_details(latest_plan)
+        portfolio_return_summary = _format_portfolio_return_summary(portfolio)
+
+        # 止损止盈表格
+        sl_tp_lines = []
+        for code, info in sorted(sl_tp_levels.items()):
+            sl_tp_lines.append(
+                f"- {code}：收盘 {info['close']:.2f} 元；"
+                f"止损 {info['stop_loss_price']:.2f} 元（{info['stop_loss_pct']}%）；"
+                f"止盈 {info['take_profit_price']:.2f} 元（{info['take_profit_pct']}%）；"
+                f"近期波动 {info['atr_pct']:.1f}%"
+            )
+        sl_tp_table = "\n".join(sl_tp_lines) if sl_tp_lines else "- 当前空仓，无需设置止损止盈。"
+
+        text = (
+            f"【长线科技动量收盘复盘】{trade_date}\n"
+            f"{portfolio_return_summary}\n"
+            f"核心结论：{llm_decision.get('summary', '')}\n"
+            f"关键风险：{decision_risks_compact}\n"
+            f"执行核验：{execution_note}\n"
+            f"调仓建议：\n{plan_action_table}"
+            f"次日止损止盈参考：\n{sl_tp_table}\n"
+            "风险边界：这是模拟组合的人工决策建议，不代表券商委托或成交；不会自动下单。\n"
+        )
+        card = _build_feishu_card(
+            f"长线科技动量收盘复盘 {trade_date}",
+            [
+                {"title": "组合收益", "content": portfolio_return_summary},
+                {"title": "核心结论", "content": llm_decision.get("summary", "")},
+                {"title": "关键风险", "content": decision_risks_compact},
+                {"title": "执行核验", "content": execution_note},
+                {"title": "调仓建议", "content": plan_action_table},
+                {"title": "次日止损止盈参考", "content": sl_tp_table},
+                {
+                    "title": "风险边界",
+                    "content": (
+                        "🔴 跌破止损价 → 进入人工卖出核验\n"
+                        "🟢 触及止盈价 → 进入人工分批止盈核验\n"
+                        "这是模拟组合建议，不代表券商委托或成交；不会自动下单。"
+                    ),
+                },
+            ],
+            template="purple",
+        )
+        print(text)
+        pushed = False if bool(args.no_push) else push_feishu_rich(text, card=card)
+        print(f"[HT evening] Feishu pushed: {pushed}")
+        print(f"  snapshot: {snapshot_path}")
+        return 0
+    # --- 科技动量模式结束 ---
+
     if not bool(args.skip_sync_universe):
         sync_result = _sync_universe_core(repo=repo, trade_date=trade_date, refresh_industry=False, refresh_ths_sector=False)
         print(f"synced universe from portfolio: {int(sync_result.get('candidates_count', 0) or 0)}")
@@ -1768,16 +2897,34 @@ def cmd_evening_decision(args: argparse.Namespace) -> int:
     latest_scan = repo.load_latest_post_market_scan() or {}
     latest_plan = repo.load_latest_plan() or {}
     portfolio = repo.load_portfolio()
+    strategy = _strategy_profile(settings_for_review)
     execution_monitor = _build_execution_monitor(repo, latest_plan)
     execution_note = _execution_monitor_note(execution_monitor)
     scan_heat_summary = _build_scan_heat_summary(latest_scan)
+    # Determine decision mode: --final overrides default "draft"
+    decision_mode = "final" if bool(getattr(args, "final", False)) else str(
+        getattr(settings_for_review, "evening_decision_mode", "draft") or "draft"
+    ).strip().lower()
+    if decision_mode not in ("draft", "final"):
+        decision_mode = "draft"
+
     decision_payload = {
         "trade_date": trade_date,
+        "strategy": {
+            "name": strategy["name"],
+            "focus": strategy["focus"],
+            "gem_universe": bool(getattr(settings_for_review, "gem_universe", False)),
+            "gem_board_prefix": str(getattr(settings_for_review, "gem_board_prefix", "30") or "30"),
+        },
         "portfolio": {
             "nav": portfolio.nav,
             "cash": portfolio.cash,
             "available_cash": portfolio.available_cash,
             "frozen_cash": portfolio.frozen_cash,
+            "realized_pnl": portfolio.realized_pnl,
+            "unrealized_pnl": portfolio.unrealized_pnl,
+            "total_pnl": portfolio.total_pnl,
+            "total_return_pct": portfolio.total_return_pct,
             "holdings_count": len(portfolio.positions),
         },
         "scan": {
@@ -1805,6 +2952,7 @@ def cmd_evening_decision(args: argparse.Namespace) -> int:
         "llm_decision": llm_decision,
         "plan_id": latest_plan.get("plan_id", ""),
         "execution_monitor": execution_monitor,
+        "decision_mode": decision_mode,
     }
     target = repo.save_decision("evening", record)
     snapshot_payload = _build_investor_snapshot(repo, source="evening-decision")
@@ -1821,46 +2969,87 @@ def cmd_evening_decision(args: argparse.Namespace) -> int:
     decision_adjustments = _format_decision_adjustments(llm_decision, max_items=6)
     plan_action_table = _format_plan_action_details(latest_plan)
     heat_table = _format_heat_candidate_details(scan_heat_summary)
-    nav = float(portfolio.nav)
-    total_mkt = sum(p.last_price * p.quantity for p in portfolio.positions)
-    cash_pct = portfolio.cash / nav * 100 if nav > 0 else 0
-    pnl_total = total_mkt - sum(p.cost_price * p.quantity for p in portfolio.positions)
-    pnl_pct = pnl_total / (nav - pnl_total) * 100 if (nav - pnl_total) > 0 else 0
+    portfolio_return_summary = _format_portfolio_return_summary(portfolio)
+    decision_text = _decision_label(llm_decision.get("decision"))
+    confidence_pct = _confidence_pct(llm_decision.get("confidence"))
+    mode_text = "草稿" if decision_mode == "draft" else "定稿"
+    draft_note = ""
+    if decision_mode == "draft":
+        draft_note = "⚠️ 未确认今日交割，此为草稿 — 明早确认交割单后定稿\n"
+    timing_note = ""
+    if bool(getattr(settings_for_review, "high_tech_mode", False)):
+        timing_note = "⏰ 建议尾盘14:50-15:00执行调仓\n"
     text = (
-        f"【长线盘后建议】{trade_date}\n"
-        f"决策: {llm_decision.get('decision', 'n/a')} | 置信度: {float(llm_decision.get('confidence', 0) or 0):.2f}\n"
-        f"净值: {nav:,.0f} | 现金: {portfolio.cash:,.0f}({cash_pct:.1f}%) | 浮亏: {pnl_total:,.0f}({pnl_pct:.1f}%)\n"
-        f"摘要: {llm_decision.get('summary', '')}\n"
-        f"风险: {decision_risks_compact}\n"
-        f"LLM调整: {decision_adjustments}\n"
-        f"执行闭环: {execution_note}\n"
-        f"计划: {len((latest_plan.get('actions', []) or []))}笔 / 被拒{len((latest_plan.get('rejected_actions', []) or []))}笔\n"
+        f"【{strategy['report_title']}】{trade_date}\n"
+        f"{draft_note}"
+        f"{timing_note}"
+        f"决策：{decision_text}｜置信度：{confidence_pct:.0f}%｜版本：{mode_text}\n"
+        f"{portfolio_return_summary}\n"
+        f"核心结论：{llm_decision.get('summary', '')}\n"
+        f"关键风险：{decision_risks_compact}\n"
+        f"复核建议：{decision_adjustments}\n"
+        f"执行闭环：{execution_note}\n"
+        f"调整计划：{len((latest_plan.get('actions', []) or []))} 笔，被风控拒绝 {len((latest_plan.get('rejected_actions', []) or []))} 笔\n"
         f"{plan_action_table}"
+        "说明：仅供人工核验，不会自动向券商下单。"
     )
+    card_title = f"{strategy['report_title']} {trade_date}"
+    if decision_mode == "draft":
+        card_title += " [草稿]"
     card = _build_feishu_card(
-        f"长线盘后建议 {trade_date}",
+        card_title,
         [
             {
                 "title": "决策结论",
                 "content": (
-                    f"**{llm_decision.get('decision', 'n/a')}**  置信度 {float(llm_decision.get('confidence', 0) or 0):.2f}\n"
-                    f"净值 {nav:,.0f} | 现金 {portfolio.cash:,.0f}({cash_pct:.1f}%) | 浮亏 {pnl_total:,.0f}({pnl_pct:.1f}%)\n"
+                    f"**{decision_text}**｜置信度 {confidence_pct:.0f}%｜{mode_text}\n"
+                    + ("⚠️ 未确认今日交割，此为草稿\n" if decision_mode == "draft" else "")
+                    + f"{portfolio_return_summary}\n"
                     f"{llm_decision.get('summary', '')}"
                 ),
             },
             {"title": "关键风险", "content": decision_risks_compact},
-            {"title": "LLM调整建议", "content": decision_adjustments if decision_adjustments != "无" else "无调整"},
+            {"title": "复核建议", "content": decision_adjustments if decision_adjustments != "无" else "无调整"},
             {"title": "执行闭环", "content": execution_note},
             {"title": "调仓计划", "content": plan_action_table},
-            {"title": "热点候选 Top5", "content": heat_table},
+            {"title": "热点候选（前5）", "content": heat_table},
+            {"title": "执行边界", "content": "仅供人工核验，不会自动向券商下单。"},
         ],
-        template="red" if str(llm_decision.get("decision", "")).strip().lower() == "pause" else "blue",
+        template="red" if str(llm_decision.get("decision", "")).strip().lower() == "pause" else "purple",
     )
     pushed = False if bool(args.no_push) else push_feishu_rich(text, card=card)
     print(text)
     print(f"feishu_pushed: {pushed}")
     print(f"investor_snapshot: {snapshot_path}")
     return 0
+
+
+def _opening_gap_from_quote(quote: dict, trade_date: str) -> dict:
+    q = quote or {}
+    open_price = _float(q.get("open", 0) or 0)
+    prev_close = _float(q.get("pre_close", 0) or 0)
+    as_of = str(q.get("as_of") or "").strip()
+    source = str(q.get("source") or "").strip()
+    active = _float(q.get("volume", 0) or 0) > 0 or _float(q.get("amount", 0) or 0) > 0
+    if not as_of.startswith(str(trade_date or "")):
+        reason = "行情日期与交易日不一致"
+    elif not active:
+        reason = "尚无可验证成交量或成交额"
+    elif open_price <= 0 or prev_close <= 0:
+        reason = "开盘价或昨收价缺失"
+    else:
+        reason = ""
+    available = not reason
+    gap_pct = ((open_price - prev_close) / prev_close * 100.0) if available else 0.0
+    return {
+        "available": available,
+        "reason": reason,
+        "open_price": open_price if available else 0.0,
+        "prev_close": prev_close if available else 0.0,
+        "gap_pct": round(gap_pct, 2),
+        "as_of": as_of,
+        "source": source,
+    }
 
 
 def cmd_morning_decision(args: argparse.Namespace) -> int:
@@ -1878,6 +3067,142 @@ def cmd_morning_decision(args: argparse.Namespace) -> int:
     latest_plan = repo.load_latest_plan() or {}
     execution_monitor = _build_execution_monitor(repo, latest_plan)
     execution_note = _execution_monitor_note(execution_monitor)
+    settings = repo.load_settings()
+
+    # --- 科技动量模式：开盘修正午后计划 ---
+    if bool(getattr(settings, "high_tech_mode", False)):
+        data_source = OpenClawChinaStockDataSource()
+        codes = sorted({item.code.upper() for item in portfolio.positions})
+        for action in (latest_plan.get("actions", []) or []):
+            c = str(action.get("code", "")).upper()
+            if c not in codes:
+                codes.append(c)
+        # 获取开盘行情
+        quotes = data_source.fetch_quotes(codes)
+        # 计算开盘相对昨收的跳空幅度
+        gaps: Dict[str, Dict] = {}
+        for code in codes:
+            q = quotes.get(code, quotes.get(code.split(".")[0], {})) or {}
+            gaps[code] = _opening_gap_from_quote(q, trade_date)
+
+        valid_gaps = [item for item in gaps.values() if item.get("available")]
+
+        # 加载晚间复盘中的止损止盈
+        sl_tp_info = latest_evening.get("sl_tp_levels", {}) if latest_evening else {}
+        # 构建开盘修正 payload
+        llm_payload = {
+            "trade_date": trade_date,
+            "stage": "morning_adjust",
+            "portfolio": {
+                "nav": portfolio.nav,
+                "cash": portfolio.cash,
+                "holdings_count": len(portfolio.positions),
+            },
+            "afternoon_plan": {
+                "actions": latest_plan.get("actions", []) or [],
+            },
+            "evening_review": {
+                "summary": (latest_evening.get("llm_decision", {}) or {}).get("summary", ""),
+                "key_risks": (latest_evening.get("llm_decision", {}) or {}).get("key_risks", []),
+                "sl_tp_levels": sl_tp_info,
+            },
+            "opening_gaps": gaps,
+            "execution_monitor": {
+                "status": execution_monitor.get("status", "?"),
+                "note": execution_note,
+            },
+        }
+        if valid_gaps:
+            llm_decision = build_morning_decision(llm_payload)
+        else:
+            llm_decision = {
+                "decision": "pause",
+                "confidence": 0,
+                "summary": "开盘行情未通过新鲜度与成交活跃度检查，本次不修正调仓计划。",
+                "adjustments": [],
+                "execution_notes": ["数据不可用时不以 0 值代替开盘行情。"],
+            }
+        execution_notes = [str(x).strip() for x in (llm_decision.get("execution_notes", []) or []) if str(x).strip()]
+        if execution_monitor.get("status") != "ok" and execution_note not in execution_notes:
+            execution_notes.append(execution_note)
+        llm_decision["execution_notes"] = execution_notes
+
+        record = {
+            "stage": "morning_adjust",
+            "trade_date": trade_date,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "llm_decision": llm_decision,
+            "opening_gaps": gaps,
+            "execution_monitor": execution_monitor,
+        }
+        repo.save_decision("morning", record)
+        snapshot_path = repo.save_investor_snapshot(
+            _build_investor_snapshot(repo, source="morning-adjust-ht")
+        )
+
+        plan_action_table = _format_plan_action_details(latest_plan)
+        sources = sorted({str(item.get("source") or "") for item in valid_gaps if item.get("source")})
+        as_of_values = sorted({str(item.get("as_of") or "") for item in valid_gaps if item.get("as_of")})
+        gap_lines = [
+            f"数据来源：{'、'.join(sources) or '不可用'}"
+            + (f"｜采集时间：{as_of_values[-1]}" if as_of_values else "")
+        ]
+        for code, info in sorted(gaps.items()):
+            if not info.get("available"):
+                gap_lines.append(f"⚠️ {code}：开盘行情不可用（{info.get('reason') or '未知原因'}）")
+                continue
+            arrow = "🔺" if info["gap_pct"] > 1.5 else ("🔻" if info["gap_pct"] < -1.5 else "➡️")
+            gap_lines.append(f"{arrow} {code}: 开盘{info['open_price']:.2f} 昨收{info['prev_close']:.2f} 跳空{info['gap_pct']:+.2f}%")
+        gap_table = "\n".join(gap_lines)
+
+        decision_adjustments = _format_decision_adjustments(llm_decision, max_items=6)
+        execution_notes_str = _compact_join(
+            [str(x).strip() for x in (llm_decision.get("execution_notes", []) or []) if str(x).strip()],
+            max_items=6, empty_text="无",
+        )
+        nav = float(portfolio.nav)
+        text = (
+            f"【科技动量开盘修正】{trade_date}\n"
+            f"净值：{nav:,.0f} 元｜持仓：{len(portfolio.positions)} 只｜现金：{portfolio.cash:,.0f} 元\n"
+            f"开盘行情：\n{gap_table}\n"
+            f"策略修正：{decision_adjustments}\n"
+            f"执行备注：{execution_notes_str}\n"
+            f"人工复核计划：\n{plan_action_table}"
+            "风险边界：这是模拟组合的人工决策建议，不代表券商委托或成交；不会自动下单。"
+        )
+        card = _build_feishu_card(
+            f"科技动量开盘修正 {trade_date}",
+            [
+                {"title": "开盘行情", "content": gap_table},
+                {"title": "策略修正建议", "content": decision_adjustments if decision_adjustments != "无" else "无修正，按原计划执行"},
+                {"title": "执行备注", "content": execution_notes_str},
+                {"title": "人工复核计划", "content": plan_action_table},
+                {
+                    "title": "风险边界",
+                    "content": "这是模拟组合的人工决策建议，不代表券商委托或成交；不会自动下单。",
+                },
+            ],
+            template="orange",
+        )
+        print(text)
+        pushed = False if bool(args.no_push) else push_feishu_rich(text, card=card)
+        print(f"[HT morning] Feishu pushed: {pushed}")
+        print(f"  snapshot: {snapshot_path}")
+        return 0
+    # --- 科技动量开盘修正结束 ---
+
+    # Check settlement / draft status
+    require_confirmed = bool(getattr(settings, "require_trades_confirmed", True))
+    evening_was_draft = str(latest_evening.get("decision_mode", "") or "").strip().lower() == "draft"
+    trades_confirmed = execution_monitor.get("status", "") == "ok"
+    settlement_note = ""
+    if require_confirmed:
+        if trades_confirmed:
+            settlement_note = "已确认交割 — 调仓建议可执行"
+        elif evening_was_draft:
+            settlement_note = "⚠️ 交割待确认 — 请先更新今日交割单再定稿"
+        else:
+            settlement_note = "⚠️ 交割状态待核查"
 
     data_source = OpenClawChinaStockDataSource()
     codes = sorted({item.code.upper() for item in universe} | {item.code.upper() for item in portfolio.positions})
@@ -1896,6 +3221,12 @@ def cmd_morning_decision(args: argparse.Namespace) -> int:
     llm_payload = {
         "trade_date": trade_date,
         "latest_evening_decision": latest_evening,
+        "settlement": {
+            "confirmed": trades_confirmed,
+            "require_confirmed": require_confirmed,
+            "evening_was_draft": evening_was_draft,
+            "note": settlement_note,
+        },
         "latest_plan": {
             "actions": latest_plan.get("actions", []) or [],
             "rejected_actions": latest_plan.get("rejected_actions", []) or [],
@@ -1923,6 +3254,11 @@ def cmd_morning_decision(args: argparse.Namespace) -> int:
         "market_structure": market_structure,
         "execution_monitor": execution_monitor,
         "linked_evening_trade_date": (latest_evening or {}).get("trade_date", ""),
+        "settlement": {
+            "confirmed": trades_confirmed,
+            "evening_was_draft": evening_was_draft,
+            "note": settlement_note,
+        },
     }
     target = repo.save_decision("morning", record)
     snapshot_payload = _build_investor_snapshot(repo, source="morning-decision")
@@ -1936,29 +3272,36 @@ def cmd_morning_decision(args: argparse.Namespace) -> int:
         empty_text="无",
     )
     plan_action_table = _format_plan_action_details(latest_plan)
-    regime = market_structure.get("regime_hint", "-")
-    risk_on = market_structure.get("risk_on_score", 0)
+    regime = _market_regime_label(market_structure.get("regime_hint"))
     adv_dec = market_structure.get("adv_dec_ratio", 0)
     nav = float(portfolio.nav)
     total_mkt = sum(p.last_price * p.quantity for p in portfolio.positions)
+    decision_text = _decision_label(llm_decision.get("decision"))
+    confidence_pct = _confidence_pct(llm_decision.get("confidence"))
     text = (
-        f"【长线09:35复核】{trade_date}\n"
-        f"决策: {llm_decision.get('decision', 'n/a')} | 置信度: {float(llm_decision.get('confidence', 0) or 0):.2f}\n"
-        f"市场: {regime} risk_on={risk_on} adv_dec={adv_dec}\n"
-        f"摘要: {llm_decision.get('summary', '')}\n"
-        f"备注: {execution_notes}\n"
-        f"闭环: {execution_note}\n"
-        f"修正: {decision_adjustments}\n"
+        f"【长线组合 09:35 复核】{trade_date}\n"
+        f"交割：{settlement_note}\n"
+        f"决策：{decision_text}｜置信度：{confidence_pct:.0f}%\n"
+        f"市场状态：{regime}｜上涨/下跌比 {adv_dec}\n"
+        f"核心结论：{llm_decision.get('summary', '')}\n"
+        f"执行备注：{execution_notes}\n"
+        f"执行闭环：{execution_note}\n"
+        f"修正建议：{decision_adjustments}\n"
         f"{plan_action_table}"
+        "说明：仅供人工核验，不会自动向券商下单。"
     )
     card = _build_feishu_card(
-        f"长线09:35复核 {trade_date}",
+        f"长线组合 09:35 复核 {trade_date}",
         [
+            {
+                "title": "交割确认",
+                "content": settlement_note if settlement_note else "无需确认",
+            },
             {
                 "title": "复核结论",
                 "content": (
-                    f"**{llm_decision.get('decision', 'n/a')}**  置信度 {float(llm_decision.get('confidence', 0) or 0):.2f}\n"
-                    f"市场: {regime} | risk_on={risk_on} | adv_dec={adv_dec}\n"
+                    f"**{decision_text}**｜置信度 {confidence_pct:.0f}%\n"
+                    f"市场状态：{regime}｜上涨/下跌比 {adv_dec}\n"
                     f"{llm_decision.get('summary', '')}"
                 ),
             },
@@ -1966,8 +3309,9 @@ def cmd_morning_decision(args: argparse.Namespace) -> int:
             {"title": "执行闭环", "content": execution_note},
             {"title": "修正建议", "content": decision_adjustments if decision_adjustments != "无" else "无修正"},
             {"title": "待执行计划", "content": plan_action_table},
+            {"title": "执行边界", "content": "仅供人工核验，不会自动向券商下单。"},
         ],
-        template="red" if str(llm_decision.get("decision", "")).strip().lower() == "pause" else "wathet",
+        template="red" if str(llm_decision.get("decision", "")).strip().lower() == "pause" else "orange",
     )
     pushed = False if bool(args.no_push) else push_feishu_rich(text, card=card)
     print(text)
@@ -2024,6 +3368,7 @@ def _run_rotation_scan_core(
         quotes=quotes,
         settings=settings,
         rotation_scan=scan_payload,
+        history_by_code=history_by_code,
     )
     scan_path = repo.save_post_market_scan(scan_payload)
     plan_path = repo.save_plan(plan)
@@ -2182,6 +3527,178 @@ def _summarize_theme_allocation(scan_rows: list) -> dict:
     return dict(sorted(theme_info.items(), key=lambda x: x[1]["strength"], reverse=True))
 
 
+# ---------------------------------------------------------------------------
+# Intraday monitor command
+# ---------------------------------------------------------------------------
+
+
+def cmd_intraday_monitor(args: argparse.Namespace) -> int:
+    """Run intraday real-time monitoring: once or as daemon.
+
+    Fetches index / sector / holdings quotes every N minutes, sends to LLM
+    for action recommendations (add/reduce/clear), and pushes Feishu alerts.
+    """
+    trade_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    interval = max(30, int(args.interval or 300))
+    no_push = bool(args.no_push)
+
+    if bool(args.once):
+        # Single check
+        if not bool(args.ignore_trading_calendar):
+            is_open, source = is_cn_trading_day(trade_date)
+            if not is_open:
+                print(f"skip intraday-monitor: {trade_date} non_trading_day source={source}")
+                return 0
+        config = MonitorConfig(interval_seconds=interval)
+        monitor = IntradayMonitor(config)
+        print(f"intraday check: {trade_date} interval={interval}s")
+        decision = monitor.run_check(trade_date, force_push=not no_push)
+        print(f"alert_level: {decision.get('alert_level', '?')}")
+        print(f"market_risk: {decision.get('market_risk', '?')}")
+        print(f"summary: {decision.get('summary', '')}")
+        holdings_actions = decision.get("holdings_actions", []) or []
+        for ha in holdings_actions:
+            print(
+                f"  {ha.get('code','?')}: {ha.get('action','?')} "
+                f"urgency={ha.get('urgency','?')} reason={ha.get('reason','?')}"
+            )
+        opportunities = decision.get("new_opportunities", []) or []
+        for opp in opportunities:
+            print(f"  opportunity: {opp.get('code','?')} {opp.get('reason','?')}")
+        signals = decision.get("key_signals", []) or []
+        for sig in signals:
+            print(f"  signal: {sig}")
+        return 0
+
+    # Daemon mode
+    print(f"starting intraday daemon: interval={interval}s")
+    if bool(args.no_push):
+        print("push disabled")
+    monitor = IntradayMonitor(MonitorConfig(interval_seconds=interval))
+    monitor.run_daemon()
+    return 0
+
+
+def cmd_ht_afternoon_check(args: argparse.Namespace) -> int:
+    """14:50 盘中再平衡 — 科技动量策略专用。
+
+    使用实时行情计算动量评分 → 生成目标权重 → 对比当前持仓 → 飞书推送买卖清单。
+    用户收到后可在尾盘(14:50-15:00)通过飞书命令 /长线成交 手动执行。
+    """
+    trade_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    if not bool(args.ignore_trading_calendar):
+        is_open, source = is_cn_trading_day(trade_date)
+        if not is_open:
+            print(f"skip ht-afternoon-check: {trade_date} non_trading_day source={source}")
+            return 0
+
+    repo = LongTermRepository()
+    repo.init_if_missing()
+    settings = repo.load_settings()
+
+    if not bool(getattr(settings, "high_tech_mode", False)):
+        print("[HT] high_tech_mode is disabled in settings, skipping")
+        return 0
+
+    # 1. Sync universe (inject tech pool)
+    print(f"[HT] syncing tech universe for {trade_date}...")
+    sync_result = _sync_universe_core(repo=repo, trade_date=trade_date, refresh_industry=False, refresh_ths_sector=False)
+    print(f"  universe: {int(sync_result.get('candidates_count', 0) or 0)} stocks")
+    universe = repo.load_universe()
+    portfolio = repo.load_portfolio()
+
+    if not universe:
+        print("[HT] empty universe, aborting")
+        return 1
+
+    # 2. Fetch real-time quotes + history (14:50 盘中数据)
+    data_source = OpenClawChinaStockDataSource()
+    codes = sorted({item.code.upper() for item in universe} | {item.code.upper() for item in portfolio.positions})
+    print(f"[HT] fetching real-time data for {len(codes)} codes...")
+    quotes = data_source.fetch_quotes(codes)
+    lookback = int(getattr(settings, "ht_lookback_days", 20) or 20) + 10
+    # 14:50 实时检查：不传 end_date，用最新数据
+    # 实时行情 + 历史日线拼接成完整价格序列用于动量计算
+    history_by_code = data_source.fetch_batch_daily_history(codes, lookback_days=lookback)
+    print(f"  quotes: {len(quotes)} codes")
+    print(f"  history: {len(history_by_code)} codes")
+
+    # 3. Build rebalance plan using high-tech momentum strategy
+    rotation_scan = getattr(args, "rotation_scan", None)
+    plan, mtm_portfolio = build_rebalance_plan(
+        trade_date=trade_date,
+        candidates=universe,
+        portfolio=portfolio,
+        quotes=quotes,
+        settings=settings,
+        rotation_scan=rotation_scan,
+        history_by_code=history_by_code,
+    )
+    repo.save_plan(plan)
+    repo.save_portfolio(mtm_portfolio)
+    snapshot_path = repo.save_investor_snapshot(_build_investor_snapshot(repo, source="ht-afternoon-check"))
+
+    # 4. Print summary
+    print(f"\n[HT] === 科技动量盘中再平衡 — {trade_date} ===")
+    print(f"  NAV: {mtm_portfolio.nav:,.0f} | 持仓: {len(mtm_portfolio.positions)} | 现金: {mtm_portfolio.cash:,.0f}")
+    print(f"  操作: {len(plan.actions)} 笔 | 被拒: {len(plan.rejected_actions)} 笔")
+    for item in plan.actions:
+        tag = "BUY" if item.action == "buy" else "SELL"
+        print(f"  [{tag}] {item.code} {item.name}: {abs(item.delta_shares)}股 @{item.reference_price:.2f} "
+              f"金额={item.estimated_amount:,.0f} →{item.target_weight:.1%}")
+
+    # 5. Push Feishu card
+    no_push = bool(args.no_push)
+    if no_push:
+        print("[HT] Feishu push disabled (--no-push)")
+        return 0
+
+    # Format plan for display
+    plan_table = _format_plan_action_details(
+        {
+            "actions": [asdict(a) for a in plan.actions],
+            "rejected_actions": [asdict(r) for r in plan.rejected_actions],
+            "constraints": {},
+        }
+    )
+    buy_count = sum(1 for a in plan.actions if a.action == "buy")
+    sell_count = sum(1 for a in plan.actions if a.action == "sell")
+    total_buy = sum(a.estimated_amount for a in plan.actions if a.action == "buy")
+    total_sell = sum(a.estimated_amount for a in plan.actions if a.action == "sell")
+
+    nav = mtm_portfolio.nav
+    cash = mtm_portfolio.cash
+    holdings_cnt = len(mtm_portfolio.positions)
+
+    text = (
+        f"【科技动量尾盘再平衡】{trade_date}\n"
+        f"⏰ 仅在尾盘14:50-15:00窗口内人工核验调仓，错过窗口不追单\n"
+        f"净值 {nav:,.0f} 元｜现金 {cash:,.0f} 元｜持仓 {holdings_cnt} 只\n"
+        f"买入候选 {buy_count} 笔，预计 {total_buy:,.0f} 元｜卖出候选 {sell_count} 笔，预计 {total_sell:,.0f} 元\n"
+        f"{plan_table}"
+    )
+    card = _build_feishu_card(
+        f"科技动量尾盘调仓建议 {trade_date}",
+        [
+            {
+                "title": "人工调仓建议",
+                "content": (
+                    f"⏰ 仅在尾盘 **14:50-15:00** 窗口内人工核验执行，错过不追单\n"
+                    f"净值 {nav:,.0f} 元｜现金 {cash:,.0f} 元｜持仓 {holdings_cnt} 只\n"
+                    f"买入候选 {buy_count} 笔，预计 {total_buy:,.0f} 元｜卖出候选 {sell_count} 笔，预计 {total_sell:,.0f} 元"
+                ),
+            },
+            {"title": "调仓明细", "content": plan_table},
+            {"title": "操作方式", "content": "通过飞书命令 `/长线成交` 手动执行调仓"},
+        ],
+        template="orange",
+    )
+    pushed = push_feishu_rich(text, card=card)
+    print(f"[HT] Feishu pushed: {pushed}")
+    print(f"  snapshot: {snapshot_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Long-term portfolio simulation CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2220,6 +3737,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--date", type=str, default="")
     p_apply.set_defaults(func=cmd_apply_manual)
 
+    p_auto = sub.add_parser("auto-rebalance", help="generate and apply strategy rebalance internally")
+    p_auto.add_argument("--date", type=str, default="")
+    p_auto.add_argument("--dry-run", action="store_true", help="save plan and mark-to-market only, do not apply fills")
+    p_auto.add_argument("--no-push", action="store_true", help="do not push Feishu notification after applying fills")
+    p_auto.add_argument("--ignore-trading-calendar", action="store_true")
+    p_auto.set_defaults(func=cmd_auto_rebalance)
+
+    p_rebuild = sub.add_parser("rebuild-portfolio", help="rebuild portfolio from execution ledger")
+    p_rebuild.add_argument("--date", type=str, default="")
+    p_rebuild.set_defaults(func=cmd_rebuild_portfolio)
+
     p_apply_cmd = sub.add_parser("apply-manual-command", help="apply manual fills from feishu command text")
     p_apply_cmd.add_argument("--text", type=str, required=True)
     p_apply_cmd.set_defaults(func=cmd_apply_manual_command)
@@ -2229,6 +3757,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_image.add_argument("--date", type=str, default="", help="trade date (default: today)")
     p_image.add_argument("--dry-run", action="store_true", help="extract only, do not apply")
     p_image.set_defaults(func=cmd_apply_manual_from_image)
+
+    p_pos_sync = sub.add_parser("sync-positions-from-image", help="sync portfolio positions/cash from brokerage position screenshot")
+    p_pos_sync.add_argument("--image", type=str, required=True, help="path to position screenshot (png/jpg)")
+    p_pos_sync.add_argument("--date", type=str, default="", help="sync date (default: today)")
+    p_pos_sync.add_argument("--dry-run", action="store_true", help="extract only, do not sync")
+    p_pos_sync.set_defaults(func=cmd_sync_positions_from_image)
+
+    p_9db_cfg = sub.add_parser("configure-9db", help="configure 9db arena credentials from markdown URL")
+    p_9db_cfg.add_argument("--url", type=str, required=True, help="9db markdown URL with token/order_id/order_name")
+    p_9db_cfg.set_defaults(func=cmd_configure_9db)
+
+    p_9db_show = sub.add_parser("show-9db", help="show current 9db arena configuration")
+    p_9db_show.set_defaults(func=cmd_show_9db)
 
     p_summary = sub.add_parser("summary", help="show portfolio summary")
     p_summary.set_defaults(func=cmd_summary)
@@ -2300,6 +3841,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_evening.add_argument("--skip-sync-universe", action="store_true")
     p_evening.add_argument("--ignore-trading-calendar", action="store_true")
     p_evening.add_argument("--no-push", action="store_true")
+    p_evening.add_argument("--final", action="store_true", help="generate final decision instead of draft")
     p_evening.set_defaults(func=cmd_evening_decision)
 
     p_morning = sub.add_parser("morning-decision", help="09:35 decision review with LLM and Feishu push")
@@ -2307,6 +3849,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_morning.add_argument("--ignore-trading-calendar", action="store_true")
     p_morning.add_argument("--no-push", action="store_true")
     p_morning.set_defaults(func=cmd_morning_decision)
+
+    p_intraday = sub.add_parser("intraday-monitor", help="real-time intraday market monitoring with LLM alerts")
+    p_intraday.add_argument("--date", type=str, default="")
+    p_intraday.add_argument("--interval", type=int, default=300, help="polling interval in seconds (default 300)")
+    p_intraday.add_argument("--once", action="store_true", help="run a single check (default: daemon mode)")
+    p_intraday.add_argument("--no-push", action="store_true", help="suppress Feishu push")
+    p_intraday.add_argument("--ignore-trading-calendar", action="store_true")
+    p_intraday.set_defaults(func=cmd_intraday_monitor)
+
+    p_ht = sub.add_parser("ht-afternoon-check", help="14:50 intraday rebalance check for high-tech momentum strategy")
+    p_ht.add_argument("--date", type=str, default="")
+    p_ht.add_argument("--ignore-trading-calendar", action="store_true")
+    p_ht.add_argument("--no-push", action="store_true")
+    p_ht.set_defaults(func=cmd_ht_afternoon_check)
 
     p_cleanup = sub.add_parser("cleanup-data", help="cleanup longterm data files by retention policy")
     p_cleanup.add_argument("--keep-days-plan", type=int, default=None)

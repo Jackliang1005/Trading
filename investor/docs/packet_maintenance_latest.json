@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-07-20T18:31:01",
+  "run_at": "2026-08-07T18:31:01",
   "dry_run": false,
   "force": false,
   "limits": {
@@ -7,24 +7,24 @@
     "intraday": 200
   },
   "daily_close": {
-    "total_candidates": 97,
-    "processed": 97,
+    "total_candidates": 117,
+    "processed": 117,
     "skipped_unsupported_type": 0,
-    "skipped_already_backfilled": 97,
+    "skipped_already_backfilled": 117,
     "success": 0,
     "failed": 0,
     "dry_run": false,
     "coverage_before": {
-      "research_packets_total": 404,
-      "portfolio_snapshots_total": 106,
-      "research_packet_dates": 85,
-      "portfolio_snapshot_dates": 85
+      "research_packets_total": 484,
+      "portfolio_snapshots_total": 126,
+      "research_packet_dates": 100,
+      "portfolio_snapshot_dates": 100
     },
     "coverage_after": {
-      "research_packets_total": 404,
-      "portfolio_snapshots_total": 106,
-      "research_packet_dates": 85,
-      "portfolio_snapshot_dates": 85
+      "research_packets_total": 484,
+      "portfolio_snapshots_total": 126,
+      "research_packet_dates": 100,
+      "portfolio_snapshot_dates": 100
     }
   },
   "intraday": {
@@ -36,36 +36,36 @@
     "failed": 0,
     "dry_run": false,
     "coverage_before": {
-      "research_packets_total": 404,
-      "portfolio_snapshots_total": 106,
-      "research_packet_dates": 85,
-      "portfolio_snapshot_dates": 85
+      "research_packets_total": 484,
+      "portfolio_snapshots_total": 126,
+      "research_packet_dates": 100,
+      "portfolio_snapshot_dates": 100
     },
     "coverage_after": {
-      "research_packets_total": 404,
-      "portfolio_snapshots_total": 106,
-      "research_packet_dates": 85,
-      "portfolio_snapshot_dates": 85
+      "research_packets_total": 484,
+      "portfolio_snapshots_total": 126,
+      "research_packet_dates": 100,
+      "portfolio_snapshot_dates": 100
     }
   },
   "merged": {
-    "total_candidates": 97,
-    "processed": 97,
+    "total_candidates": 117,
+    "processed": 117,
     "skipped_unsupported_type": 0,
-    "skipped_already_backfilled": 97,
+    "skipped_already_backfilled": 117,
     "success": 0,
     "failed": 0
   },
   "coverage_before": {
-    "research_packets_total": 404,
-    "portfolio_snapshots_total": 106,
-    "research_packet_dates": 85,
-    "portfolio_snapshot_dates": 85
+    "research_packets_total": 484,
+    "portfolio_snapshots_total": 126,
+    "research_packet_dates": 100,
+    "portfolio_snapshot_dates": 100
   },
   "coverage_after": {
-    "research_packets_total": 404,
-    "portfolio_snapshots_total": 106,
-    "research_packet_dates": 85,
-    "portfolio_snapshot_dates": 85
+    "research_packets_total": 484,
+    "portfolio_snapshots_total": 126,
+    "research_packet_dates": 100,
+    "portfolio_snapshot_dates": 100
   }
 }

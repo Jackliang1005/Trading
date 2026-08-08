@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import import_module
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 
@@ -30,7 +30,7 @@ class OpenClawChinaStockDataSource:
         self.ths_sector_cache_file = (
             Path(__file__).resolve().parents[2] / "trading_data" / "longterm" / "ths_sector_cache.json"
         )
-        self.concept_db_path = Path("/root/qmttrader/concept_db/concepts.db")
+        self.concept_db_path = Path("/root/qmttrader_v2/concept_db/concepts.db")
         self._lock = threading.RLock()
         self._last_concept_request = 0.0
 
@@ -859,6 +859,7 @@ class OpenClawChinaStockDataSource:
             result = tool(stock_code=",".join(codes), mode="test", include_depth=False)
         except Exception:
             return {}
+        source = str((result or {}).get("source") or "unknown") if isinstance(result, dict) else "unknown"
         data = (result or {}).get("data") if isinstance(result, dict) else None
         items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
         quotes: Dict[str, Dict] = {}
@@ -880,12 +881,15 @@ class OpenClawChinaStockDataSource:
                 "name": str(item.get("name") or code),
                 "price": round(price, 3),
                 "pre_close": round(pre_close, 3),
+                "open": float(item.get("open", 0) or 0),
                 "change_percent": round(change_pct, 3),
                 "volume": float(item.get("volume", 0) or 0),
                 "amount": float(item.get("amount", 0) or 0),
                 "turnover_rate": float(item.get("turnover_rate", item.get("turnover", 0)) or 0),
                 "high": float(item.get("high", 0) or 0),
                 "low": float(item.get("low", 0) or 0),
+                "as_of": str(item.get("timestamp") or time.strftime("%Y-%m-%d %H:%M:%S")),
+                "source": source,
             }
         return quotes
 
@@ -929,11 +933,19 @@ class OpenClawChinaStockDataSource:
             out["low"].append(low)
             out["volume"].append(volume)
             out["amount"].append(amount)
-        if len(out["close"]) < 20:
+        if len(out["close"]) < 5:
             return {}
         return out
 
-    def fetch_batch_daily_history(self, codes: List[str], lookback_days: int = 60, end_date: str = "") -> Dict[str, Dict[str, List[float]]]:
+    def fetch_batch_daily_history(
+        self,
+        codes: List[str],
+        lookback_days: int = 60,
+        end_date: str = "",
+        count: Optional[int] = None,
+    ) -> Dict[str, Dict[str, List[float]]]:
+        if count is not None:
+            lookback_days = int(count)
         result: Dict[str, Dict[str, List[float]]] = {}
         normalized_codes = []
         for code in codes:
@@ -945,7 +957,9 @@ class OpenClawChinaStockDataSource:
         max_workers = max(1, min(8, len(normalized_codes)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
-                executor.submit(self.fetch_daily_history, code, lookback_days, end_date): code
+                executor.submit(self.fetch_daily_history, code, lookback_days, end_date)
+                if end_date
+                else executor.submit(self.fetch_daily_history, code, lookback_days): code
                 for code in normalized_codes
             }
             for fut in as_completed(future_map):

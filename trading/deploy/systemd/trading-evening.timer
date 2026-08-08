@@ -2,7 +2,7 @@
 Description=Timer for Trading LongTerm Evening Decision
 
 [Timer]
-OnCalendar=Mon..Fri 15:35:00
+OnCalendar=Mon..Fri 20:30:00
 Persistent=true
 RandomizedDelaySec=15
 Unit=trading-evening.service

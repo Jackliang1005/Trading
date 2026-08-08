@@ -21,3 +21,6 @@ trading_data/trades_*.csv
 .DS_Store
 
 local_secrets.json
+
+.env.*
+trading_data/longterm/

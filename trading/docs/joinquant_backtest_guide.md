@@ -63,6 +63,9 @@ node jq_automation_worker.mjs <策略文件.py> --cookie-file .joinquant_cookie
 # 运行热度轮动策略回测
 node jq_automation_worker.mjs joinquant_heat_rotation.py --cookie-file .joinquant_cookie
 
+# 运行高科技动量策略回测（仓库内封装命令）
+./run_high_tech_jq_backtest.sh
+
 # 使用命令行传入 cookie
 node jq_automation_worker.mjs joinquant_heat_rotation.py \
   --cookie "sessionid=abc; csrftoken=xyz"
@@ -76,6 +79,21 @@ JQ_CAPITAL_BASE="500000" \
 # 使用已有的策略 ID (不创建新策略)
 JOINQUANT_ALGORITHM_ID="12345" \
   node jq_automation_worker.mjs joinquant_heat_rotation.py --cookie-file .joinquant_cookie
+```
+
+高科技动量脚本默认读取：
+
+- `high_tech_jq.py`
+- `.joinquant_cookie`
+- `JQ_START_TIME` / `JQ_END_TIME` / `JQ_CAPITAL_BASE` / `JQ_TIMEOUT_SEC`
+
+例如：
+
+```bash
+JQ_START_TIME="2023-01-01 00:00:00" \
+JQ_END_TIME="2025-12-31 23:59:59" \
+JQ_CAPITAL_BASE="300000" \
+./run_high_tech_jq_backtest.sh
 ```
 
 ### 3.3 工作流程

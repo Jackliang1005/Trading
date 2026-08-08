@@ -40,10 +40,28 @@ class SimPosition:
     quantity: int
     cost_price: float
     last_price: float = 0.0
+    realized_pnl: float = 0.0
+    entry_date: str = ""
+    highest_price: float = 0.0
 
     @property
     def market_value(self) -> float:
         return max(0.0, float(self.quantity) * float(self.last_price or self.cost_price))
+
+    @property
+    def cost_value(self) -> float:
+        return max(0.0, float(self.quantity) * float(self.cost_price))
+
+    @property
+    def unrealized_pnl(self) -> float:
+        return float(self.market_value) - float(self.cost_value)
+
+    @property
+    def unrealized_pnl_pct(self) -> float:
+        cost = float(self.cost_value)
+        if cost <= 0:
+            return 0.0
+        return float(self.unrealized_pnl) / cost
 
 
 @dataclass
@@ -55,6 +73,8 @@ class PortfolioState:
     frozen_cash: float = 0.0
     positions: List[SimPosition] = field(default_factory=list)
     target_weights: Dict[str, float] = field(default_factory=dict)
+    realized_pnl: float = 0.0
+    total_fees: float = 0.0
 
     def __post_init__(self) -> None:
         self.cash = float(self.cash or 0.0)
@@ -87,6 +107,21 @@ class PortfolioState:
     @property
     def nav(self) -> float:
         return self.cash + self.holdings_value
+
+    @property
+    def unrealized_pnl(self) -> float:
+        return sum(item.unrealized_pnl for item in self.positions)
+
+    @property
+    def total_pnl(self) -> float:
+        return float(self.realized_pnl) + float(self.unrealized_pnl)
+
+    @property
+    def total_return_pct(self) -> float:
+        initial = float(self.initial_capital or 0.0)
+        if initial <= 0:
+            return 0.0
+        return (float(self.nav) - initial) / initial
 
 
 @dataclass
@@ -133,8 +168,45 @@ class ManualExecutionItem:
     side: Literal["buy", "sell"]
     price: float
     quantity: int
+    trade_time: str = ""
     fee: float = 0.0
     note: str = ""
+
+
+@dataclass
+class HoldingAssessment:
+    """Per-holding quality assessment for portfolio-aware rebalancing."""
+    code: str
+    name: str
+    performance_score: float = 50.0   # 0-100  PnL% and holding period
+    theme_alignment: float = 50.0     # 0-100  still in hot themes?
+    heat_status: float = 50.0         # 0-100  THS heat / RSI health
+    trend_quality: float = 50.0       # 0-100  MA alignment and price trend
+    composite_score: float = 50.0     # 0-100  weighted combination
+    recommendation: str = "keep"      # keep / trim / exit / gradual_reduce
+    trim_ratio: float = 0.0           # suggested trim ratio (0.0-1.0)
+    reason: str = ""
+
+
+@dataclass
+class CapitalDeploymentPlan:
+    """Capital planning: sell first → reserve buffer → allocate to new buys."""
+    planned_sells: List[RebalanceActionItem] = field(default_factory=list)
+    planned_buys: List[RebalanceActionItem] = field(default_factory=list)
+    freed_capital: float = 0.0
+    deployable_capital: float = 0.0
+    cash_buffer: float = 0.0
+    sequence: List[str] = field(default_factory=list)
+
+
+@dataclass
+class GradualRotationSchedule:
+    """Gradual rotation: non-target holdings exit over 2-3 cycles."""
+    holdings_to_exit: List[str] = field(default_factory=list)
+    current_cycle: int = 1
+    remaining_cycles: int = 2
+    sell_ratio_this_cycle: float = 0.0  # fraction of non-target positions to sell
+    actions: List[RebalanceActionItem] = field(default_factory=list)
 
 
 @dataclass
@@ -222,6 +294,22 @@ class LongTermSettings:
     gem_universe_limit: int = 200            # 候选池上限
     gem_rank_start: int = 10                 # 跳过前N只 (最小市值可能有问题)
     gem_final_pool_size: int = 20            # 最终候选池大小
+    # Portfolio-aware gradual rotation (portfolio management mode)
+    gradual_rotation: bool = True             # enable portfolio-aware gradual rotation
+    max_rotation_ratio: float = 0.30          # max single-cycle rotation ratio (relative to NAV)
+    min_holding_score_keep: float = 55.0      # composite score >= this → keep
+    max_new_buy_count: int = 3                # max new buys per cycle
+    min_cash_after_sells: float = 0.05        # min cash ratio after sells
+    # High-tech momentum strategy (固定科技股池 + 动量评分 + TopN等权)
+    high_tech_mode: bool = False              # enable high-tech momentum strategy
+    ht_holdings_num: int = 2                  # 小资金高集中：默认持有2只核心科技股
+    ht_lookback_days: int = 20                # momentum lookback days
+    ht_stop_loss: float = 0.92                # -8% stop loss threshold (relative to cost)
+    ht_max_hold_days: int = 40                # max hold days before forced re-evaluation
+    ht_min_lookback: int = 5                  # minimum lookback for fallback scoring
+    # Decision timing
+    evening_decision_mode: str = "draft"      # draft / final
+    require_trades_confirmed: bool = True     # morning decision checks settlement updated
     # Data lifecycle retention
     retention_plan_days: int = 180
     retention_scan_days: int = 120
