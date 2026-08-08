@@ -325,7 +325,20 @@ def _position_decisions(risk: Dict[str, Any], payload: Dict[str, Any], policy: D
         elif str(item.get("source") or "") == "trade":
             advice = "按交易仓处理；高开不追，低开无承接先降风险，强于板块才继续观察。"
         elif pnl < 0:
-            advice = "先等止跌确认，不用摊低成本替代风控。"
+            drawdown = loss_evidence.get("drawdown_ratio")
+            drawdown_text = f"{float(drawdown) * 100:.1f}%" if drawdown is not None else "待核验"
+            if loss_evidence.get("severity") == "material":
+                advice = (
+                    f"当前权重低于组合级亏损复核门槛，但累计回撤 {drawdown_text} 已有实质影响；"
+                    "不因亏损机械补仓，等待相对强弱和基本面证据改善。"
+                )
+            elif loss_evidence.get("severity") == "noise":
+                advice = (
+                    f"累计收益接近成本线（回撤 {drawdown_text}），不把微小浮亏当作止损或加仓信号；"
+                    "继续按相对强弱与主题趋势观察。"
+                )
+            else:
+                advice = "累计收益率证据不足，不根据浮亏金额单独行动；先核验成本口径，再判断是否需要调整。"
         else:
             advice = "维持观察，除非出现明确板块催化和量能确认。"
         if cash_complete and cash_ratio < float(policy["minimum_cash_ratio"]):

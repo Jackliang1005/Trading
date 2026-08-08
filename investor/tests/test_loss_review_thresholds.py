@@ -33,7 +33,10 @@ def test_material_loss_requires_weight_and_drawdown_thresholds_together():
     policy = load_advisor_policy()
 
     assert loss_review_evidence(_position(0.19, -0.06), policy)["required"] is True
-    assert loss_review_evidence(_position(0.10, -0.06), policy)["required"] is False
+    low_weight = loss_review_evidence(_position(0.10, -0.06), policy)
+    assert low_weight["required"] is False
+    assert low_weight["severity"] == "material"
+    assert low_weight["trigger"] == "below_weight_threshold"
 
 
 def test_severe_drawdown_requires_review_even_when_position_weight_is_small():
@@ -95,6 +98,49 @@ def test_closing_plan_marks_severe_small_position_for_verification_but_not_fake_
     assert decisions[0]["loss_review"]["severity"] == "severe"
     assert decisions[0]["quantity_actionable"] is False
     assert "\u7d2f\u8ba1\u56de\u64a4 30.0%" in decisions[0]["advice"]
+
+
+def test_closing_plan_describes_tiny_loss_as_cost_noise_not_trend_failure():
+    policy = load_advisor_policy()
+    position = _position(0.19, -0.0001)
+    position["source"] = "historical"
+    position["sources"] = ["historical"]
+    payload = {"events": {}, "global_impact": {}, "market_review": {}}
+    risk = {
+        "available": True,
+        "positions": [position],
+        "top_positions": [position],
+        "effective_total_asset": 500000,
+    }
+
+    decision = closing_brief_service._position_decisions(risk, payload, policy)[0]
+
+    assert decision["action_level"] == "observe"
+    assert decision["loss_review"]["trigger"] == "below_drawdown_threshold"
+    assert "\u5fae\u5c0f\u6d6e\u4e8f" in decision["advice"]
+    assert "\u6b62\u8dcc" not in decision["advice"]
+
+
+def test_closing_plan_keeps_material_low_weight_drawdown_visible_without_escalation():
+    policy = load_advisor_policy()
+    position = _position(0.10, -0.06)
+    position["source"] = "historical"
+    position["sources"] = ["historical"]
+    payload = {"events": {}, "global_impact": {}, "market_review": {}}
+    risk = {
+        "available": True,
+        "positions": [position],
+        "top_positions": [position],
+        "effective_total_asset": 1000000,
+    }
+
+    decision = closing_brief_service._position_decisions(risk, payload, policy)[0]
+
+    assert decision["action_level"] == "observe"
+    assert decision["loss_review"]["severity"] == "material"
+    assert decision["loss_review"]["trigger"] == "below_weight_threshold"
+    assert "\u5f53\u524d\u6743\u91cd\u4f4e\u4e8e" in decision["advice"]
+    assert "6.0%" in decision["advice"]
 
 
 def test_profile_view_explains_weight_and_drawdown_are_different_thresholds():

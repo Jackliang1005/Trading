@@ -147,21 +147,31 @@ def loss_review_evidence(position: Dict[str, Any], policy: Dict[str, Any] | None
     review_drawdown = float(active["loss_review_drawdown_ratio"])
     severe_drawdown = float(active["severe_loss_drawdown_ratio"])
     drawdown = abs(min(0.0, pnl_ratio)) if pnl_ratio is not None else None
+    weight_review = float(active["loss_position_review_ratio"])
     severe = bool(drawdown is not None and drawdown >= severe_drawdown)
-    material_weighted = bool(
-        drawdown is not None
-        and drawdown >= review_drawdown
-        and weight >= float(active["loss_position_review_ratio"])
-    )
-    required = bool(pnl < 0 and (severe or material_weighted))
+    material = bool(drawdown is not None and drawdown >= review_drawdown)
+    weight_relevant = weight >= weight_review
+    required = bool(pnl < 0 and (severe or (material and weight_relevant)))
+    if severe:
+        trigger = "severe_drawdown"
+    elif material and weight_relevant:
+        trigger = "weighted_drawdown"
+    elif material:
+        trigger = "below_weight_threshold"
+    elif drawdown is not None:
+        trigger = "below_drawdown_threshold"
+    else:
+        trigger = "evidence_unavailable"
     return {
         "required": required,
-        "severity": "severe" if severe else "material" if material_weighted else "noise" if drawdown is not None else "unavailable",
+        "severity": "severe" if severe else "material" if material else "noise" if drawdown is not None else "unavailable",
+        "trigger": trigger,
+        "weight_relevant": weight_relevant,
         "pnl_ratio": pnl_ratio,
         "drawdown_ratio": drawdown,
         "review_drawdown_ratio": review_drawdown,
         "severe_drawdown_ratio": severe_drawdown,
-        "weight_review_ratio": float(active["loss_position_review_ratio"]),
+        "weight_review_ratio": weight_review,
     }
 
 
