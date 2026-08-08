@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from domain.services.risk_report_service import build_risk_report
+from domain.policies.advisor_policy import load_advisor_policy
 from live_monitor.collectors.qmt_auth import build_qmt_auth_headers
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -252,7 +253,9 @@ def _action_for_position(
     benchmark: Dict[str, Any],
     trading_session: bool,
     quote_fresh: bool,
+    policy: Dict[str, Any] | None = None,
 ) -> Tuple[str, str]:
+    active_policy = policy or load_advisor_policy()
     weight = _safe_float(position.get("weight"))
     pnl = _safe_float(position.get("pnl"))
     source = str(position.get("source") or "")
@@ -266,10 +269,10 @@ def _action_for_position(
         action = "行情时间戳不是当前交易日：不按旧行情触发交易，等待数据刷新后再判断。"
         state = "quote_stale"
     elif not quote.get("change_available"):
-        if weight >= 0.28:
+        if weight >= float(active_policy["single_position_prepare_ratio"]):
             action = "交易建议: 减仓候选。已取得实时持仓价，但读口未提供日内涨跌；高集中度仓位按 09:35/10:30 的复盘纪律优先降风险。"
             state = "reduce_candidate_no_intraday_change"
-        elif weight >= 0.18 and pnl < 0:
+        elif weight >= float(active_policy["loss_position_review_ratio"]) and pnl < 0:
             action = "交易建议: 不补仓。实时价格已核验，但缺少日内涨跌证据；反弹无量仍以减仓修复组合为先。"
             state = "hold_or_reduce_no_intraday_change"
         else:
@@ -281,13 +284,16 @@ def _action_for_position(
         if change_pct <= -3 or relative_change <= -2:
             action = "交易建议: 减仓优先。日内表现明显偏弱（跌幅超过 3% 或较市场低 2pct），不补仓，先降风险。"
             state = "reduce_priority"
-        elif weight >= 0.28 and (change_pct < -1 or relative_change < -1):
-            action = "交易建议: 减仓候选。高集中持仓弱于昨收或弱于市场，若 30 分钟内不能修复，优先降权到 25% 以下。"
+        elif weight >= float(active_policy["single_position_prepare_ratio"]) and (change_pct < -1 or relative_change < -1):
+            action = (
+                "交易建议: 减仓候选。高集中持仓弱于昨收或弱于市场，若 30 分钟内不能修复，"
+                f"优先降权到 {float(active_policy['single_position_reduce_target_ratio']):.0%} 以下。"
+            )
             state = "reduce_candidate"
         elif change_pct >= 3:
             action = "交易建议: 不追涨。等待回踩承接或量价继续确认，已有仓位可分批锁定部分浮盈。"
             state = "no_chasing"
-        elif weight >= 0.18 and pnl < 0:
+        elif weight >= float(active_policy["loss_position_review_ratio"]) and pnl < 0:
             action = "交易建议: 不补仓。只有价格转强且承接稳定时才保留，反弹无量仍以减仓修复组合为先。"
             state = "hold_or_reduce"
         elif source == "trade":
@@ -296,19 +302,20 @@ def _action_for_position(
         else:
             action = "交易建议: 继续观察。价格未触发风险阈值，等待走势与市场方向进一步确认。"
             state = "observe"
-    if cash_ratio is not None and cash_ratio < 0.03:
+    if cash_ratio is not None and cash_ratio < float(active_policy["minimum_cash_ratio"]):
         action += " 当前现金不足，新机会只能通过减仓腾挪资金。"
     return state, action
 
 
-def _reduce_execution_hint(position: Dict[str, Any], state: str) -> Dict[str, Any]:
+def _reduce_execution_hint(position: Dict[str, Any], state: str, policy: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Convert a risk-reduction state into a board-lot-aware execution hint."""
+    active_policy = policy or load_advisor_policy()
     weight = _safe_float(position.get("weight"))
     volume = int(_safe_float(position.get("volume")))
     if state in {"reduce_priority", "reduce_candidate", "reduce_candidate_no_intraday_change"}:
-        target_weight = 0.25
+        target_weight = float(active_policy["single_position_reduce_target_ratio"])
     elif state in {"hold_or_reduce", "hold_or_reduce_no_intraday_change"}:
-        target_weight = 0.15
+        target_weight = float(active_policy["loss_position_reduce_target_ratio"])
     else:
         return {"actionable": False, "target_weight": None, "suggested_qty": 0, "note": ""}
     if weight <= target_weight:
@@ -361,6 +368,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
     closing = _load_latest_closing_payload()
     decision_plan = closing.get("decision_plan") or {}
     risk = build_risk_report()
+    policy = load_advisor_policy()
     current_positions = _current_position_map(risk if risk.get("available") else {})
     trading_session = _is_trading_session(now)
     if trading_session:
@@ -400,8 +408,8 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         benchmark = quotes.get(_code_key(benchmark_code), {})
         quote_as_of = str(quote.get("as_of") or "")
         quote_fresh = bool(quote_as_of.startswith(now.strftime("%Y%m%d"))) if quote_as_of else not trading_session
-        state, suggestion = _action_for_position(current, cash_ratio, quote, benchmark, trading_session, quote_fresh)
-        execution_hint = _reduce_execution_hint(current, state)
+        state, suggestion = _action_for_position(current, cash_ratio, quote, benchmark, trading_session, quote_fresh, policy=policy)
+        execution_hint = _reduce_execution_hint(current, state, policy=policy)
         action_level = _action_level(state, trading_session, quote_fresh, execution_hint)
         tracked.append(
             {
@@ -458,6 +466,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         "top1_ratio": _safe_float(risk.get("top1_ratio", decision_plan.get("top1_ratio", 0))),
         "top3_ratio": _safe_float(risk.get("top3_ratio", decision_plan.get("top3_ratio", 0))),
         "risk_flags": risk.get("risk_flags") or decision_plan.get("risk_flags") or [],
+        "advisor_policy": policy,
         "quote_available_count": len(quotes),
         "quote_error": quote_error,
         "benchmarks": {code: quotes.get(_code_key(code), {}) for code in BENCHMARK_CODES},

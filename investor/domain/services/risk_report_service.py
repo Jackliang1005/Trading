@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import db
+from domain.policies.advisor_policy import load_advisor_policy
 from domain.services.report_style_service import join_cn, money, pct, risk_label, source_label
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -339,6 +340,7 @@ def build_risk_report() -> Dict[str, Any]:
     total_mv = sum(_market_value(p) for p in positions)
     total_pnl = sum(_float_profit(p) for p in positions)
     account_metrics = _account_metrics(data, total_mv)
+    policy = load_advisor_policy()
     position_coverage = _position_coverage(positions, account_metrics)
     cash = float(account_metrics["cash"])
     effective_total = float(account_metrics["effective_total"])
@@ -359,9 +361,9 @@ def build_risk_report() -> Dict[str, Any]:
         flags.append("snapshot_date_unknown")
     elif age_days > 3:
         flags.append(f"snapshot_stale_{age_days}d")
-    if top1_ratio >= 0.30:
+    if top1_ratio >= float(policy["single_position_alert_ratio"]):
         flags.append("top1_concentration_high")
-    if top3_ratio >= 0.70:
+    if top3_ratio >= float(policy["top3_position_alert_ratio"]):
         flags.append("top3_concentration_high")
     if not position_coverage["complete"]:
         flags.append("position_coverage_incomplete")
@@ -413,6 +415,7 @@ def build_risk_report() -> Dict[str, Any]:
             for p in sorted_positions[:8]
         ],
         "risk_flags": flags,
+        "advisor_policy": policy,
     }
     report["text"] = format_risk_report(report)
     return report
@@ -446,6 +449,11 @@ def format_risk_report(report: Dict[str, Any]) -> str:
             else f"按已知明细计算第一大持仓 {pct(report.get('top1_ratio', 0) * 100)}、前三大持仓 {pct(report.get('top3_ratio', 0) * 100)}，不视为完整组合比例。"
         ),
     ]
+    policy = report.get("advisor_policy") or {}
+    lines.append(
+        f"- 风险政策：单票预警 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)}，"
+        f"前三持仓预警 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)}。"
+    )
     if not report.get("position_coverage_complete", True):
         lines.append(
             f"- 持仓明细覆盖不完整：账户资产口径市值比明细合计多 {money(report.get('position_market_value_gap'))}；"
@@ -478,11 +486,11 @@ def format_risk_report(report: Dict[str, Any]) -> str:
         sources = join_cn((source_label(source) for source in p.get("sources") or []), source_label(p.get("source")))
         lines.append(f"- **{p['name']}（{p['code']}）**｜仓位 {pct(p['weight']*100)}｜市值 {money(p['market_value'])}｜盈亏 {money(p['pnl'])}｜{sources}")
     lines.extend(["", "**执行原则**"])
-    if report.get("top1_ratio", 0) >= 0.30:
+    if report.get("top1_ratio", 0) >= float(policy.get("single_position_alert_ratio", 0.30)):
         lines.append("- 优先降低单票集中度；弱于所属板块且无放量承接时，不用补仓摊低成本。")
     if report.get("total_unrealized_pnl", 0) < 0:
         lines.append("- 组合浮亏阶段先控制回撤，再考虑新增高波动仓位。")
-    if not any((report.get("top1_ratio", 0) >= 0.30, report.get("total_unrealized_pnl", 0) < 0)):
+    if not any((report.get("top1_ratio", 0) >= float(policy.get("single_position_alert_ratio", 0.30)), report.get("total_unrealized_pnl", 0) < 0)):
         lines.append("- 当前快照未触发主要风险阈值，继续观察集中度与回撤变化。")
     return "\n".join(lines)
 

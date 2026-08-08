@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "profile_status": "system_default",
+  "single_position_alert_ratio": 0.3,
+  "single_position_prepare_ratio": 0.28,
+  "single_position_reduce_target_ratio": 0.25,
+  "loss_position_review_ratio": 0.18,
+  "loss_position_reduce_target_ratio": 0.15,
+  "top3_position_alert_ratio": 0.7,
+  "minimum_cash_ratio": 0.03
+}

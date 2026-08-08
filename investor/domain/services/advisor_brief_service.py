@@ -155,6 +155,7 @@ def build_advisor_brief(now: datetime | None = None, reports_dir: Path = REPORTS
 
 def format_advisor_brief(brief: Dict[str, Any]) -> str:
     risk = brief.get("risk") or {}
+    policy = risk.get("advisor_policy") or {}
     audit = brief.get("audit") or {}
     events = brief.get("events") or {}
     decision = brief.get("decision") or {}
@@ -172,6 +173,16 @@ def format_advisor_brief(brief: Dict[str, Any]) -> str:
         lines.append(f"- 系统能力仍有 {len(blocked)} 项阻断：{join_cn(blocked)}；相关数据按降级口径处理。")
     else:
         lines.append("- 最近能力审计没有阻断项；行情和账户结论仍以各自数据时间为准。")
+    policy_status = {"system_default": "系统默认", "user_confirmed": "用户已确认"}.get(
+        str(policy.get("profile_status") or "system_default"),
+        "自定义",
+    )
+    lines.append(
+        f"- 风险政策：单票 {pct(float(policy.get('single_position_alert_ratio', 0.30)) * 100)} 预警 / "
+        f"{pct(float(policy.get('single_position_reduce_target_ratio', 0.25)) * 100)} 降风险目标，"
+        f"前三持仓 {pct(float(policy.get('top3_position_alert_ratio', 0.70)) * 100)} 预警，"
+        f"最低现金参考 {pct(float(policy.get('minimum_cash_ratio', 0.03)) * 100)}（{policy_status}）。"
+    )
 
     lines.extend(["", "**账户与组合风险**"])
     if risk.get("available"):

@@ -92,6 +92,7 @@ def test_advisor_brief_unifies_risk_events_actions_and_validation(tmp_path, monk
     assert brief["overall_action_level"] == "prepare"
     assert brief["intraday"]["total"] == 2
     assert "当前最高行动层级：**准备**" in brief["text"]
+    assert "单票 30.0% 预警 / 25.0% 降风险目标" in brief["text"]
     assert "双账户持仓与资金读取" in brief["text"]
     assert "可验证现金 1000.00元" in brief["text"]
     assert "伊朗局势变化牵动美国国债收益率" in brief["text"]
