@@ -141,6 +141,14 @@ def _build_actions(risk: Dict[str, Any], decision: Dict[str, Any], events: Dict[
         actions.append({"level": "verify", "text": "重新采集双账户持仓并核对同代码跨账户明细；覆盖完整前不按当前明细计算精确总仓位。"})
     if risk.get("stale_account_sources"):
         actions.append({"level": "verify", "text": "历史账户持仓只用于保持组合连续性；恢复实时接口并逐账户回读后，才能升级到准备层级。"})
+    policy = risk.get("advisor_policy") or {}
+    if policy.get("profile_status") != "user_confirmed":
+        actions.append(
+            {
+                "level": "observe",
+                "text": "个人风险偏好尚未确认；可先用 /风险偏好 预览稳健、均衡或进取档案，明确发送末尾带“确认”的命令后才会写入。",
+            }
+        )
     event_rows = events.get("events") or []
     relevant_event = next((item for item in event_rows if item.get("portfolio_positions")), None)
     if relevant_event:

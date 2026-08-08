@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from domain.policies.advisor_policy import load_advisor_policy
-from domain.services import assistant_menu_service, feishu_query_service
+from domain.services import advisor_brief_service, assistant_menu_service, feishu_query_service
 
 
 def test_profile_preview_never_writes_without_terminal_confirmation(monkeypatch, tmp_path):
@@ -38,3 +38,24 @@ def test_profile_command_is_routed_before_generic_risk_query():
         for item in section["items"]
     ]
     assert "/风险偏好" in asks
+
+
+def test_advisor_actions_invite_preview_but_never_choose_a_profile_for_the_user():
+    actions = advisor_brief_service._build_actions(
+        {"advisor_policy": {"profile_status": "system_default"}},
+        {},
+        {},
+    )
+
+    assert any("个人风险偏好尚未确认" in item["text"] for item in actions)
+    assert any("明确发送末尾带“确认”的命令后才会写入" in item["text"] for item in actions)
+
+
+def test_confirmed_profile_removes_onboarding_prompt():
+    actions = advisor_brief_service._build_actions(
+        {"advisor_policy": {"profile_status": "user_confirmed", "profile_name": "均衡"}},
+        {},
+        {},
+    )
+
+    assert not any("个人风险偏好尚未确认" in item["text"] for item in actions)

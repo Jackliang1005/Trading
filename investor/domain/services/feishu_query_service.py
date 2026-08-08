@@ -20,6 +20,7 @@ from domain.services.assistant_status_service import build_assistant_status
 from domain.services.watchlist_report_service import build_watchlist_report
 from domain.services.report_style_service import money
 from domain.services.delivery_audit_service import format_delivery_audit_text
+from position_pnl import resolve_position_pnl
 
 from domain.services.live_monitor_view_service import format_today_summary_text
 from domain.services.longterm_portfolio_service import (
@@ -176,12 +177,14 @@ def _summarize_positions(items: List[Dict]) -> Tuple[str, List[str]]:
         code = _extract_item_code(item)
         volume = int(_extract_float(item, "volume", "total_volume", "持仓数量"))
         market_value = _extract_float(item, "market_value", "m_dMarketValue", "市值")
-        unrealized = _extract_float(item, "unrealized_pnl", "m_dFloatProfit", "浮动盈亏")
+        pnl_evidence = resolve_position_pnl(item)
+        unrealized = float(pnl_evidence["pnl"])
         total_mv += market_value
         total_pnl += unrealized
         if code:
-            lines.append(f"- {code}：{volume} 股｜市值 {market_value:,.2f} 元｜浮动盈亏 {unrealized:+,.2f} 元")
-    headline = f"持仓 {len(items)} 只｜总市值 {total_mv:,.2f} 元｜浮动盈亏 {total_pnl:+,.2f} 元"
+            conflict = "｜盈亏字段待核验" if pnl_evidence["cumulative_cost_conflict"] else ""
+            lines.append(f"- {code}：{volume} 股｜市值 {market_value:,.2f} 元｜持仓盈亏 {unrealized:+,.2f} 元{conflict}")
+    headline = f"持仓 {len(items)} 只｜总市值 {total_mv:,.2f} 元｜持仓盈亏 {total_pnl:+,.2f} 元"
     return headline, lines
 
 
@@ -504,7 +507,7 @@ def _fallback_positions_from_snapshot(account: str) -> Tuple[List[Dict], str]:
             return False
         volume = _extract_float(item, "volume", "current_volume", "total_volume", "持仓数量")
         market_value = _extract_float(item, "market_value", "m_dMarketValue", "市值")
-        unrealized = _extract_float(item, "unrealized_pnl", "m_dFloatProfit", "profit_loss", "浮动盈亏")
+        unrealized = float(resolve_position_pnl(item)["pnl"])
         return bool(volume > 0 or market_value > 0 or abs(unrealized) > 0)
 
     usable_positions = [item for item in positions if _is_usable_position(item)]
