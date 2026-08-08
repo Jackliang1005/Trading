@@ -332,6 +332,22 @@ def _reduce_execution_hint(position: Dict[str, Any], state: str) -> Dict[str, An
     }
 
 
+def _action_level(
+    state: str,
+    trading_session: bool,
+    quote_fresh: bool,
+    execution_hint: Dict[str, Any],
+) -> str:
+    """Map evidence quality to an explicit advisor action tier."""
+    if not trading_session or state in {"market_closed", "quote_missing", "quote_stale"}:
+        return "observe"
+    if state in {"reduce_priority", "reduce_candidate"}:
+        return "prepare" if quote_fresh and execution_hint.get("actionable") else "verify"
+    if state in {"reduce_candidate_no_intraday_change", "hold_or_reduce_no_intraday_change", "hold_or_reduce"}:
+        return "verify"
+    return "observe"
+
+
 def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
     now = datetime.now()
     closing = _load_latest_closing_payload()
@@ -378,6 +394,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
         quote_fresh = bool(quote_as_of.startswith(now.strftime("%Y%m%d"))) if quote_as_of else not trading_session
         state, suggestion = _action_for_position(current, cash_ratio, quote, benchmark, trading_session, quote_fresh)
         execution_hint = _reduce_execution_hint(current, state)
+        action_level = _action_level(state, trading_session, quote_fresh, execution_hint)
         tracked.append(
             {
                 "code": code,
@@ -391,6 +408,7 @@ def build_decision_monitor(slot: str = "") -> Dict[str, Any]:
                 "benchmark_code": benchmark_code,
                 "relative_change_pct": round(_safe_float(quote.get("change_pct")) - _safe_float(benchmark.get("change_pct")), 3) if quote.get("change_available") and benchmark.get("change_available") else None,
                 "decision_state": state,
+                "action_level": action_level,
                 "suggestion": suggestion,
                 "execution_hint": execution_hint,
             }
@@ -512,7 +530,8 @@ def _format_decision_monitor_text_legacy(slot: str = "", max_opportunities: int 
                     quote_text += f" 持仓盈亏={quote.get('profit_rate', 0) * 100:+.2f}%"
             lines.append(
                 f"- {item.get('code')} {item.get('name')}: {quote_text}; "
-                f"仓位={item.get('weight', 0) * 100:.1f}% 状态={item.get('decision_state')}; {item.get('suggestion')}"
+                f"仓位={item.get('weight', 0) * 100:.1f}% 行动层级={item.get('action_level', 'observe')} "
+                f"状态={item.get('decision_state')}; {item.get('suggestion')}"
             )
             hint = item.get("execution_hint") or {}
             if hint.get("note"):
@@ -554,9 +573,12 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
         "**核心结论**",
     ]
     positions = monitor.get("tracked_positions") or []
-    actionable = [item for item in positions if (item.get("execution_hint") or {}).get("actionable")]
-    if actionable:
-        lines.append(f"- {len(actionable)} 只持仓触发可执行的降风险参考，仍须人工核验实时价格与可用数量。")
+    prepared = [item for item in positions if item.get("action_level") == "prepare"]
+    verify = [item for item in positions if item.get("action_level") == "verify"]
+    if prepared:
+        lines.append(f"- {len(prepared)} 只持仓进入“准备”层级；可生成降风险数量参考，但仍须人工确认后执行。")
+    elif verify:
+        lines.append(f"- {len(verify)} 只持仓进入“核验”层级；证据或可执行数量尚不完整，不生成执行候选。")
     else:
         wait_text = "等待交易时段再核验" if not monitor.get("trading_session") else "继续按盘前纪律观察"
         lines.append(f"- 当前没有持仓触发可执行数量；{wait_text}，不自动下单。")
@@ -583,13 +605,17 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
                 quote_text += f" / 日内 {quote.get('change_pct', 0):+.2f}%"
         else:
             quote_text = "实时行情不可用"
+        level_label = {"observe": "观察", "verify": "核验", "prepare": "准备"}.get(
+            str(item.get("action_level") or "observe"),
+            "观察",
+        )
         lines.append(
-            f"- **{item.get('name')}（{item.get('code')}）**｜仓位 {pct(item.get('weight', 0) * 100)}｜"
+            f"- **{item.get('name')}（{item.get('code')}）**｜行动 {level_label}｜仓位 {pct(item.get('weight', 0) * 100)}｜"
             f"{quote_text}｜{source_label(item.get('source'))}"
         )
         lines.append(f"  建议：{item.get('suggestion') or '等待有效行情后再判断。'}")
         hint = item.get("execution_hint") or {}
-        if hint.get("actionable") and hint.get("note"):
+        if item.get("action_level") == "prepare" and hint.get("actionable") and hint.get("note"):
             lines.append(f"  数量参考：{hint.get('note')}（执行前核对可用股数）")
 
     opportunities = monitor.get("opportunities") or []
@@ -611,5 +637,6 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
             lines.append("- 实时现金读取失败，现金比例退回组合快照口径。")
         else:
             lines.append("- 非交易时段未请求实时现金，现金比例采用最近组合快照。")
+    lines.append("- 行动层级：观察＝等待证据；核验＝补齐行情或数量；准备＝可形成数量参考，仍需人工确认。")
     lines.append("- 本报告只提供监控建议，不会自动下单。")
     return "\n".join(lines)

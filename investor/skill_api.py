@@ -835,7 +835,15 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
         if not monitor.get("trading_session"):
             return {"ok": True, "trading_session": False, "alerts": [], "source": "decision_monitor"}
         alerts = [
-            {"code": item.get("code"), "name": item.get("name"), "state": item.get("decision_state"), "suggestion": item.get("suggestion"), "execution_hint": item.get("execution_hint"), "triggers": ["decision_reduce_priority"]}
+            {
+                "code": item.get("code"),
+                "name": item.get("name"),
+                "state": item.get("decision_state"),
+                "action_level": item.get("action_level", "verify"),
+                "suggestion": item.get("suggestion"),
+                "execution_hint": item.get("execution_hint"),
+                "triggers": ["decision_reduce_priority"],
+            }
             for item in (monitor.get("tracked_positions") or [])
             if item.get("decision_state") == "reduce_priority"
         ]
