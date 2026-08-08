@@ -29,6 +29,9 @@ DEFAULT_STRATEGY_CONFIG = {
     "min_weight": 0.10,
     "max_weight": 0.60,
     "adjust_step": 0.05,
+    "min_evolution_samples": 20,
+    "min_strategy_samples": 5,
+    "min_evolution_strategies": 2,
 }
 
 
@@ -69,6 +72,61 @@ def save_strategy_config(config: Dict):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+def _bounded_normalize(weights: Dict[str, float], min_weight: float, max_weight: float) -> Dict[str, float]:
+    """Project weights onto a bounded simplex without violating limits."""
+    result = {name: max(min_weight, min(max_weight, float(value))) for name, value in weights.items()}
+    for _ in range(20):
+        delta = 1.0 - sum(result.values())
+        if abs(delta) < 1e-9:
+            break
+        eligible = [
+            name
+            for name, value in result.items()
+            if (delta > 0 and value < max_weight - 1e-9) or (delta < 0 and value > min_weight + 1e-9)
+        ]
+        if not eligible:
+            break
+        share = delta / len(eligible)
+        for name in eligible:
+            result[name] = max(min_weight, min(max_weight, result[name] + share))
+    rounded = {name: round(value, 3) for name, value in result.items()}
+    residual = round(1.0 - sum(rounded.values()), 3)
+    if residual:
+        candidates = sorted(
+            rounded,
+            key=lambda name: (max_weight - rounded[name]) if residual > 0 else (rounded[name] - min_weight),
+            reverse=True,
+        )
+        for name in candidates:
+            candidate = round(rounded[name] + residual, 3)
+            if min_weight <= candidate <= max_weight:
+                rounded[name] = candidate
+                break
+    return rounded
+
+
+def _performance_evidence(perf: List[Dict], config: Dict) -> Dict:
+    total = sum(int(item.get("total") or 0) for item in perf)
+    min_total = int(config.get("min_evolution_samples", 20) or 20)
+    min_per_strategy = int(config.get("min_strategy_samples", 5) or 5)
+    min_strategies = int(config.get("min_evolution_strategies", 2) or 2)
+    eligible = [item for item in perf if int(item.get("total") or 0) >= min_per_strategy]
+    reasons = []
+    if total < min_total:
+        reasons.append(f"已验证样本 {total}/{min_total}")
+    if len(eligible) < min_strategies:
+        reasons.append(f"达到单策略样本门槛的维度 {len(eligible)}/{min_strategies}")
+    return {
+        "ready": not reasons,
+        "total": total,
+        "minimum_total": min_total,
+        "minimum_per_strategy": min_per_strategy,
+        "minimum_strategies": min_strategies,
+        "eligible_strategies": [str(item.get("strategy_used") or "") for item in eligible],
+        "reasons": reasons,
+    }
+
+
 def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -77,28 +135,41 @@ def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
     config = load_strategy_config()
     if not config.get("auto_adjust_enabled", True):
         print("  ℹ️ 自动调整已禁用")
-        return config
+        result = dict(config)
+        result["_evolution_evidence"] = {"ready": False, "reasons": ["自动调整已禁用"]}
+        result["_weights_changed"] = False
+        return result
 
     perf = db.get_strategy_performance(start_date, end_date)
-    if not perf:
-        print("  ℹ️ 无足够数据进行调整")
-        return config
+    evidence = _performance_evidence(perf, config)
+    if not evidence["ready"]:
+        print("  ℹ️ 证据不足，保持权重不变：" + "；".join(evidence["reasons"]))
+        result = dict(config)
+        result["_evolution_evidence"] = evidence
+        result["_weights_changed"] = False
+        return result
 
     old_weights = config["weights"].copy()
-    avg_win_rate = sum(p.get("win_rate", 50) or 50 for p in perf) / len(perf) if perf else 50
+    eligible_perf = [p for p in perf if str(p.get("strategy_used") or "") in evidence["eligible_strategies"]]
+    eligible_total = sum(int(p.get("total") or 0) for p in eligible_perf)
+    pooled_win_rate = (
+        sum(int(p.get("correct") or 0) for p in eligible_perf) / eligible_total * 100
+        if eligible_total
+        else 50.0
+    )
 
     step = config.get("adjust_step", 0.05)
     min_w = config.get("min_weight", 0.10)
     max_w = config.get("max_weight", 0.60)
     adjustments = {}
 
-    for p in perf:
+    for p in eligible_perf:
         name = p.get("strategy_used", "")
         win_rate = p.get("win_rate", 50) or 50
         if name in config["weights"]:
-            if win_rate > avg_win_rate + 5:
+            if win_rate > pooled_win_rate + 5:
                 adjustments[name] = step
-            elif win_rate < avg_win_rate - 5:
+            elif win_rate < pooled_win_rate - 5:
                 adjustments[name] = -step
             else:
                 adjustments[name] = 0
@@ -107,14 +178,15 @@ def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
         new_weight = config["weights"].get(name, 0.33) + adj
         config["weights"][name] = max(min_w, min(max_w, new_weight))
 
-    total = sum(config["weights"].values())
-    if total > 0:
-        config["weights"] = {k: round(v / total, 3) for k, v in config["weights"].items()}
+    config["weights"] = _bounded_normalize(config["weights"], min_w, max_w)
 
     # 权重无实质变化时跳过写入，避免 weight_history 膨胀
     if old_weights == config["weights"]:
         print("  ℹ️ 权重无变化，跳过记录")
-        return config
+        result = dict(config)
+        result["_evolution_evidence"] = evidence
+        result["_weights_changed"] = False
+        return result
 
     config.setdefault("weight_history", []).append(
         {
@@ -134,7 +206,10 @@ def adjust_strategy_weights(lookback_days: int = 14) -> Dict:
     print(f"  旧权重: {old_weights}")
     print(f"  新权重: {config['weights']}")
     print(f"  调整: {adjustments}")
-    return config
+    result = dict(config)
+    result["_evolution_evidence"] = evidence
+    result["_weights_changed"] = True
+    return result
 
 
 def _normalize_rule_signature(rule_text: str) -> str:
@@ -431,9 +506,45 @@ def evolve() -> Dict:
     prompt = generate_system_prompt()
     print(f"  ✅ Prompt 已更新 ({len(prompt)} 字符)")
     print("\n🧬 进化流程完成")
+    evidence = config.get("_evolution_evidence", {}) or {}
+    weights_changed = bool(config.get("_weights_changed"))
+    material_change = bool(weights_changed or new_rules or fewshot_result.get("added") or fewshot_result.get("removed"))
+    if material_change:
+        conclusion = "本次已形成有验证证据的策略更新。"
+    elif not evidence.get("ready"):
+        conclusion = "本次仅完成策略审计，不构成策略进化；验证样本不足，权重、规则与案例库保持不变。"
+    else:
+        conclusion = "验证证据已达到门槛，但未发现足以改变权重、规则或案例库的新信息。"
+    evidence_reason = "；".join(evidence.get("reasons") or []) or (
+        f"已验证样本 {evidence.get('total', 0)} 条，达到调整门槛" if evidence else "证据状态未知"
+    )
+    text = "\n".join(
+        [
+            "🧬 OpenClaw 策略审计与进化结果",
+            "",
+            "**结论**",
+            f"- {conclusion}",
+            f"- 证据：{evidence_reason}。",
+            "",
+            "**变更结果**",
+            f"- 策略权重：{'已调整' if weights_changed else '未调整'}。",
+            f"- 新增规则：{len(new_rules)} 条。",
+            f"- Few-shot 案例：新增 {fewshot_result.get('added', 0)} 条，移除 {fewshot_result.get('removed', 0)} 条。",
+            "",
+            "**当前权重**",
+            "- " + "；".join(f"{name} {weight:.1%}" for name, weight in config.get("weights", {}).items()),
+            "",
+            "**边界**",
+            "- 只有完成回测验证的预测才进入权重、规则和案例更新；零样本不会被解释为 0% 胜率。",
+        ]
+    )
     return {
         "weights": config.get("weights", {}),
+        "weights_changed": weights_changed,
         "new_rules": len(new_rules),
         "fewshot": fewshot_result,
         "prompt_length": len(prompt),
+        "evidence": evidence,
+        "material_change": material_change,
+        "text": text,
     }

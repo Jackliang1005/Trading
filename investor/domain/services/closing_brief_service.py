@@ -184,6 +184,7 @@ def _next_session_opportunity_lines(payload: Dict[str, Any], limit: int = 6) -> 
     impact = payload.get("global_impact") or {}
     risk = payload.get("risk") or {}
     cash_ratio = float(risk.get("cash_ratio") or 0)
+    cash_complete = bool(risk.get("cash_complete", True))
     themes = set(_theme_names(payload))
     review = payload.get("market_review") or {}
     risk_flags = set(risk.get("risk_flags") or [])
@@ -208,7 +209,7 @@ def _next_session_opportunity_lines(payload: Dict[str, Any], limit: int = 6) -> 
         stance = "只观察，不追高"
         if risk_off:
             stance = "仅观察；市场或组合风险未解除前不新增仓位"
-        elif cash_ratio < 0.03:
+        elif cash_complete and cash_ratio < 0.03:
             stance = "现金不足，必须先换仓/减仓才可参与"
         else:
             stance = "列入动量候选；仅在概念板块与个股同步放量、且未明显高开时再评估"
@@ -247,6 +248,7 @@ def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any]) -> Lis
     if not positions:
         return ["- 当前没有可处理持仓。"]
     cash_ratio = float(risk.get("cash_ratio") or 0)
+    cash_complete = bool(risk.get("cash_complete", True))
     themes = _theme_names(payload)
     lines: List[str] = []
     for p in positions[:8]:
@@ -273,7 +275,7 @@ def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any]) -> Lis
             action = "先等止跌确认，不用摊低成本替代风控。"
         else:
             action = "维持观察，除非出现明确板块催化和量能确认。"
-        if cash_ratio < 0.03:
+        if cash_complete and cash_ratio < 0.03:
             action += " 当前现金几乎为 0，任何新机会都必须来自减仓腾挪。"
         source_name = {"main": "国金", "trade": "东莞"}.get(source, source)
         lines.extend([
@@ -285,6 +287,7 @@ def _position_action_lines(risk: Dict[str, Any], payload: Dict[str, Any]) -> Lis
 
 def _next_session_trigger_lines(risk: Dict[str, Any]) -> List[str]:
     cash_ratio = float(risk.get("cash_ratio") or 0)
+    cash_complete = bool(risk.get("cash_complete", True))
     top1 = float(risk.get("top1_ratio") or 0)
     top3 = float(risk.get("top3_ratio") or 0)
     lines = [
@@ -292,7 +295,7 @@ def _next_session_trigger_lines(risk: Dict[str, Any]) -> List[str]:
         "- **09:35**｜持仓弱于板块且没有放量承接时，先处理风险仓，不开新仓。",
         "- **10:30**｜只保留强于板块且量能修复的持仓；弱反弹视为减仓窗口。",
     ]
-    if cash_ratio < 0.03:
+    if cash_complete and cash_ratio < 0.03:
         lines.append("- **现金约束**｜默认不新增标的，除非先卖出低优先级仓位腾出现金。")
     if top1 >= 0.30 or top3 >= 0.70:
         lines.append(f"- **组合约束**｜单票 {top1*100:.1f}%、前三大 {top3*100:.1f}%；首要目标是降集中度。")
@@ -386,8 +389,13 @@ def format_closing_brief(payload: Dict[str, Any]) -> str:
 
     lines.extend(["", "**💼 组合风险**"])
     if risk.get("available"):
+        cash_text = (
+            f"现金 **{float(risk.get('cash') or 0):,.0f}**（{float(risk.get('cash_ratio') or 0)*100:.1f}%）"
+            if risk.get("cash_complete", True)
+            else f"可验证现金 **{float(risk.get('cash') or 0):,.0f}**（完整占比不可用）"
+        )
         lines.extend([
-            f"- 市值 **{float(risk.get('total_market_value') or 0):,.0f}**｜现金 **{float(risk.get('cash') or 0):,.0f}**（{float(risk.get('cash_ratio') or 0)*100:.1f}%）",
+            f"- 市值 **{float(risk.get('total_market_value') or 0):,.0f}**｜{cash_text}",
             f"- 浮动盈亏 **{float(risk.get('total_unrealized_pnl') or 0):+,.0f}**｜快照 {risk.get('as_of')}（{risk.get('snapshot_age_days')} 天）",
         ])
     else:
@@ -438,6 +446,8 @@ def format_closing_brief(payload: Dict[str, Any]) -> str:
         f"- {concept_quality} 概念/动量：概念数据日 {_display_date(concept.get('concept_date'))}｜动量数据日 {_display_date(concept.get('momentum_date'))}｜通过筛选 {len(concept.get('candidates') or [])} 只",
         f"- 🟢 持仓快照：数据日 {risk.get('as_of', '未取得')}｜账户 {join_cn((source_label(item) for item in sorted((risk.get('by_source') or {}).keys())), '未知')}",
     ])
+    if risk.get("available") and not risk.get("cash_complete", True):
+        lines.append("- 🟠 账户资产：部分账户现金或总资产未通过合理性校验；不据此判断完整现金仓位。")
     if audit.get("blocked") or audit.get("warning"):
         blocked_items = audit.get("blocked") or []
         warning_items = audit.get("warning") or []

@@ -16,7 +16,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 INVESTOR_DIR = WORKSPACE / "investor"
@@ -218,15 +218,101 @@ def collect_health(timeout: float = 3.0) -> Dict[str, Any]:
         issues.append(f"concept_db:{concept_db.get('issue', 'invalid_counts')}")
     for alert in trade_risk.get("alerts", []):
         qty = int(alert.get("suggested_qty") or 0)
+        change_pct = float(alert.get("change_pct") or 0)
+        relative_change_pct = float(alert.get("relative_change_pct") or 0)
+        # A zero-sized recommendation with no observable move is not an
+        # actionable risk signal.  Treating it as an incident caused the same
+        # holdings to generate a fresh red card every health-check cycle.
+        if qty <= 0 and abs(change_pct) < 0.01 and abs(relative_change_pct) < 0.01:
+            continue
         triggers = ",".join(alert.get("triggers") or []) or "decision_reduce_priority"
         issues.append(
-            f"trade_risk_reduce_priority:{alert.get('code')} change={float(alert.get('change_pct') or 0):+.2f}% "
-            f"relative={float(alert.get('relative_change_pct') or 0):+.2f}pct suggested_qty={qty} triggers={triggers}"
+            f"trade_risk_reduce_priority:{alert.get('code')} change={change_pct:+.2f}% "
+            f"relative={relative_change_pct:+.2f}pct suggested_qty={qty} triggers={triggers}"
         )
 
-    fingerprint_payload = {"issues": sorted(set(issues))}
+    incident_keys = sorted({_issue_identity(issue) for issue in issues})
+    fingerprint_payload = {"incident_keys": incident_keys}
     fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-    return {"ok": not issues, "generated_at": datetime.now().strftime("%F %T %Z"), "issues": sorted(set(issues)), "fingerprint": fingerprint, "qmt": qmt, "concept_db": concept_db, "intraday_process_count": intraday_count, "trade_risk": trade_risk}
+    return {
+        "ok": not issues,
+        "generated_at": datetime.now().strftime("%F %T %Z"),
+        "issues": sorted(set(issues)),
+        "incident_keys": incident_keys,
+        "fingerprint": fingerprint,
+        "qmt": qmt,
+        "concept_db": concept_db,
+        "intraday_process_count": intraday_count,
+        "trade_risk": trade_risk,
+    }
+
+
+def _issue_identity(issue: str) -> str:
+    """Return a stable incident identity while preserving detailed diagnostics.
+
+    Network error text, HTTP status, price changes and quantities can vary on
+    every poll.  Those details belong in the card body, but must not make a
+    continuing incident look new and bypass the cooldown.
+    """
+    text = str(issue or "").strip()
+    if "_failed(" in text:
+        return text.split("(", 1)[0]
+    if text.startswith("trade_risk_reduce_priority:"):
+        head = text.split(" ", 1)[0]
+        triggers = text.split(" triggers=", 1)[1] if " triggers=" in text else "decision_reduce_priority"
+        return f"{head} triggers={triggers}"
+    return text
+
+
+def _health_transition(
+    health: Dict[str, Any],
+    state: Dict[str, Any],
+    *,
+    now: int,
+    cooldown: int,
+    recovery_confirmations: int,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Apply incident hysteresis and return the next notification state."""
+    incident_open = bool(state.get("incident_open", not bool(state.get("last_ok", True))))
+    known_keys: Set[str] = {str(item) for item in (state.get("incident_keys") or []) if item}
+    current_keys: Set[str] = {
+        str(item)
+        for item in (health.get("incident_keys") or [_issue_identity(issue) for issue in health.get("issues", [])])
+        if item
+    }
+    last_sent_at = int(state.get("last_sent_at", 0) or 0)
+
+    if health.get("ok"):
+        consecutive_ok = int(state.get("consecutive_ok", 0) or 0) + 1
+        recovered = bool(incident_open and consecutive_ok >= max(1, recovery_confirmations))
+        return {
+            "should_send": recovered,
+            "recovered": recovered,
+            "incident_open": False if recovered else incident_open,
+            "incident_keys": [] if recovered else sorted(known_keys),
+            "consecutive_ok": consecutive_ok,
+            "new_incident_keys": [],
+        }
+
+    new_keys = current_keys - known_keys
+    should_send = bool(
+        force
+        or not incident_open
+        or new_keys
+        or (last_sent_at and now - last_sent_at >= max(1, cooldown))
+    )
+    return {
+        "should_send": should_send,
+        "recovered": False,
+        "incident_open": True,
+        # Retain every identity seen during the incident.  A temporarily
+        # disappearing endpoint must not become a "new" incident when it
+        # flaps back on the next poll.
+        "incident_keys": sorted(known_keys | current_keys),
+        "consecutive_ok": 0,
+        "new_incident_keys": sorted(new_keys),
+    }
 
 
 def _format_message(health: Dict[str, Any], recovered: bool = False) -> str:
@@ -305,6 +391,12 @@ def main() -> int:
     parser.add_argument("--target", default="", help="Feishu target, user:<id> or chat:<id>")
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("INVESTOR_HEALTH_ALERT_TIMEOUT", "3")))
     parser.add_argument("--cooldown", type=int, default=int(os.environ.get("INVESTOR_HEALTH_ALERT_COOLDOWN", "10800")))
+    parser.add_argument(
+        "--recovery-confirmations",
+        type=int,
+        default=int(os.environ.get("INVESTOR_HEALTH_RECOVERY_CONFIRMATIONS", "2")),
+        help="consecutive healthy checks required before sending a recovery card",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -312,24 +404,40 @@ def main() -> int:
     now = int(time.time())
     health = collect_health(timeout=args.timeout)
     state = _load_state()
-    previous_ok = bool(state.get("last_ok", True))
-    last_fingerprint = str(state.get("last_fingerprint", ""))
-    last_sent_at = int(state.get("last_sent_at", 0) or 0)
-
-    recovered = bool(health["ok"] and not previous_ok)
-    if health["ok"]:
-        should_send = recovered
-    else:
-        should_send = args.force or health["fingerprint"] != last_fingerprint or (now - last_sent_at) >= args.cooldown
+    transition = _health_transition(
+        health,
+        state,
+        now=now,
+        cooldown=args.cooldown,
+        recovery_confirmations=args.recovery_confirmations,
+        force=args.force,
+    )
+    recovered = bool(transition["recovered"])
+    should_send = bool(transition["should_send"])
 
     push_result = {"pushed": False, "reason": "not_needed"}
     if should_send and not args.dry_run:
         push_result = _send_feishu(_format_message(health, recovered=recovered), args.target)
 
-    state.update({"last_checked_at": now, "last_ok": bool(health["ok"]), "last_fingerprint": health["fingerprint"], "last_issue_count": len(health.get("issues", [])), "last_push_result": push_result})
+    state.update(
+        {
+            "last_checked_at": now,
+            "last_ok": bool(health["ok"]),
+            "last_fingerprint": str(health.get("fingerprint") or ""),
+            "last_issue_count": len(health.get("issues", [])),
+            "last_push_result": push_result,
+            "incident_open": transition["incident_open"],
+            "incident_keys": transition["incident_keys"],
+            "consecutive_ok": transition["consecutive_ok"],
+        }
+    )
     if should_send and not args.dry_run:
         state["last_sent_at"] = now
-    _save_state(state)
+    # Audits and previews must be observational.  Persisting a dry-run would
+    # consume a new incident or a recovery confirmation and could suppress the
+    # next real Feishu notification.
+    if not args.dry_run:
+        _save_state(state)
 
     result = {"ok": health["ok"], "should_send": should_send, "recovered": recovered, "push_result": push_result, "health": health}
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
