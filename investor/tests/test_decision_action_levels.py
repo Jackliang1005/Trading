@@ -99,3 +99,75 @@ def test_verify_level_does_not_expose_an_execution_quantity():
     assert "进入“核验”层级" in text
     assert "行动 核验" in text
     assert "数量参考：建议减仓 100 股" not in text
+
+
+def test_market_closed_keeps_severe_drawdown_review_visible_without_quantity():
+    position = {
+        "weight": 0.05,
+        "market_value": 70000,
+        "cost_value": 100000,
+        "pnl": -30000,
+        "pnl_ratio": -0.30,
+        "source": "trade",
+    }
+
+    state, suggestion = service._action_for_position(
+        position=position,
+        cash_ratio=None,
+        quote={},
+        benchmark={},
+        trading_session=False,
+        quote_fresh=False,
+    )
+
+    assert state == "market_closed_loss_review"
+    assert "累计回撤 30.0% 已达到复核门槛" in suggestion
+    assert "不生成卖出数量" in suggestion
+
+
+def test_market_closed_report_prioritizes_loss_review_and_shows_cost_risk():
+    monitor = {
+        "available": True,
+        "generated_at": "2026-08-08 18:20:00",
+        "trading_session": False,
+        "cash": 100,
+        "cash_ratio": None,
+        "cash_complete": False,
+        "top1_ratio": 0.62,
+        "top3_ratio": 0.90,
+        "risk_flags": [],
+        "tracked_positions": [
+            {
+                "name": "示例股份",
+                "code": "600000.SH",
+                "source": "trade",
+                "weight": 0.05,
+                "action_level": "observe",
+                "suggestion": "非交易时段：累计回撤 30.0% 已达到复核门槛；当前不生成卖出数量。",
+                "quote": {"available": False},
+                "loss_review": {"required": True, "pnl_ratio": -0.30},
+                "execution_hint": {"actionable": False, "note": ""},
+            },
+            {
+                "name": "示例ETF",
+                "code": "510000.SH",
+                "source": "main",
+                "weight": 0.20,
+                "action_level": "observe",
+                "suggestion": "非交易时段：保留复盘计划。",
+                "quote": {"available": False},
+                "loss_review": {"required": False, "pnl_ratio": -0.0001, "severity": "noise"},
+                "execution_hint": {"actionable": False, "note": ""},
+            },
+        ],
+        "opportunities": [],
+    }
+
+    with patch.object(service, "build_decision_monitor", return_value=monitor):
+        text = service.format_decision_monitor_text(slot="Feishu 查询")
+
+    assert "1 只持仓的累计回撤达到复核门槛" in text
+    assert "累计盈亏 -30.0%｜下次复核 优先" in text
+    assert "累计盈亏 -0.01%（成本噪声）｜下次复核 常规" in text
+    assert "盘外不生成价格触发或卖出数量" in text
+    assert "数量参考：" not in text

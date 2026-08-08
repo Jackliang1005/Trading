@@ -291,8 +291,15 @@ def _action_for_position(
     loss_label = f"{abs(float(loss_ratio)) * 100:.1f}%" if loss_ratio is not None else "待核验"
     source = str(position.get("source") or "")
     if not trading_session:
-        action = "非交易时段：保留复盘计划，开盘后再按实时行情确认，不执行盘外价格判断。"
-        state = "market_closed"
+        if loss_evidence["required"]:
+            action = (
+                f"非交易时段：累计回撤 {loss_label} 已达到复核门槛；下个交易时段优先核验承接与相对强弱，"
+                "当前不执行盘外价格判断，也不生成卖出数量。"
+            )
+            state = "market_closed_loss_review"
+        else:
+            action = "非交易时段：保留复盘计划，开盘后再按实时行情确认，不执行盘外价格判断。"
+            state = "market_closed"
     elif not quote.get("available"):
         action = "实时行情不可用：不生成价格触发结论，先核验 qmt2http 行情后再操作。"
         state = "quote_missing"
@@ -701,10 +708,16 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
     positions = monitor.get("tracked_positions") or []
     prepared = [item for item in positions if item.get("action_level") == "prepare"]
     verify = [item for item in positions if item.get("action_level") == "verify"]
+    loss_review_positions = [item for item in positions if (item.get("loss_review") or {}).get("required")]
     if prepared:
         lines.append(f"- {len(prepared)} 只持仓进入“准备”层级；可生成降风险数量参考，但仍须人工确认后执行。")
     elif verify:
         lines.append(f"- {len(verify)} 只持仓进入“核验”层级；证据或可执行数量尚不完整，不生成执行候选。")
+    elif not monitor.get("trading_session") and loss_review_positions:
+        lines.append(
+            f"- {len(loss_review_positions)} 只持仓的累计回撤达到复核门槛；已列为下个交易时段优先核验，"
+            "当前盘外不生成价格触发或卖出数量。"
+        )
     else:
         wait_text = "等待交易时段再核验" if not monitor.get("trading_session") else "继续按盘前纪律观察"
         lines.append(f"- 当前没有持仓触发可执行数量；{wait_text}，不自动下单。")
@@ -739,6 +752,14 @@ def format_decision_monitor_text(slot: str = "", max_opportunities: int = 3, max
             f"- **{item.get('name')}（{item.get('code')}）**｜行动 {level_label}｜仓位 {pct(item.get('weight', 0) * 100)}｜"
             f"{quote_text}｜{source_label(item.get('source'))}"
         )
+        loss_review = item.get("loss_review") or {}
+        pnl_ratio = loss_review.get("pnl_ratio")
+        if pnl_ratio is not None:
+            review_label = "优先" if loss_review.get("required") else "常规"
+            pnl_pct = float(pnl_ratio) * 100
+            pnl_text = pct(pnl_pct, digits=2 if abs(pnl_pct) < 0.1 else 1, signed=True)
+            severity_note = "（成本噪声）" if loss_review.get("severity") == "noise" else ""
+            lines.append(f"  成本风险：累计盈亏 {pnl_text}{severity_note}｜下次复核 {review_label}。")
         lines.append(f"  建议：{item.get('suggestion') or '等待有效行情后再判断。'}")
         hint = item.get("execution_hint") or {}
         if item.get("action_level") == "prepare" and hint.get("actionable") and hint.get("note"):
